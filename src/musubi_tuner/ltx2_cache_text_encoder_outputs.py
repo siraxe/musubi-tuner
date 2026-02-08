@@ -23,6 +23,7 @@ from musubi_tuner.dataset.image_video_dataset import (
     save_text_encoder_output_cache_ltx2_official,
 )
 from musubi_tuner.ltx_2.env import apply_ltx2_tweaks
+import musubi_tuner.ltx2_cache_image_encoder as image_encoder
 
 
 logger = logging.getLogger(__name__)
@@ -108,6 +109,7 @@ def _precache_sample_prompts(
     *,
     datasets: list,
     text_encoder,
+    vae=None,
     audio_video: bool,
     ltx_mode: str,
     autocast_dtype: torch.dtype | None,
@@ -123,6 +125,29 @@ def _precache_sample_prompts(
         raise ValueError(f"No prompts found in {args.sample_prompts}")
 
     cache_path = args.sample_prompts_cache or _resolve_default_sample_prompts_cache(datasets)
+
+    # Check if cache_i2v is enabled and if any prompts have start_images or image_path (--i flag)
+    cache_i2v_enabled = getattr(args, "cache_i2v", False)
+    has_start_images = any(
+        (p.get("start_images") and p.get("start_images") != "none") or
+        (p.get("image_path") and p.get("image_path") != "none")
+        for p in prompts
+    )
+    logger.info("Cache I2V enabled: %s, Has start images: %s", cache_i2v_enabled, has_start_images)
+
+    # Load VAE encoder if we need to cache start_images
+    vae_encoder = None
+    vae_dtype = None
+    if cache_i2v_enabled and has_start_images:
+        from musubi_tuner.utils import model_utils
+
+        # Get VAE dtype from args, default to float16 if not specified
+        vae_dtype_arg = getattr(args, "vae_dtype", None)
+        vae_dtype = torch.float16 if vae_dtype_arg is None else model_utils.str_to_dtype(vae_dtype_arg)
+        # Get VAE path from args, default to ltx2_checkpoint if not specified
+        vae_path = getattr(args, "vae", None) or getattr(args, "ltx2_checkpoint", None)
+
+        vae_encoder = image_encoder.load_vae_encoder(vae_path, device, vae_dtype)
 
     prompt_cache: list[dict] = []
     for prompt_dict in prompts:
@@ -156,7 +181,20 @@ def _precache_sample_prompts(
             cache_entry["negative_prompt_embeds"] = neg_embeds
             cache_entry["negative_prompt_attention_mask"] = neg_mask
 
+        # Cache start_images latents if cache_i2v is enabled
+        if cache_i2v_enabled and vae_encoder is not None:
+            i2v_result = image_encoder.encode_prompt_images(
+                param, vae_encoder, device, vae_dtype
+            )
+            if i2v_result is not None:
+                cache_entry.update(i2v_result)
+
         prompt_cache.append(cache_entry)
+
+    # Cleanup VAE encoder if it was loaded
+    if vae_encoder is not None:
+        del vae_encoder
+        logger.info("Unloaded VAE encoder after caching start_images latents")
 
     payload = {
         "version": 2,
@@ -166,6 +204,92 @@ def _precache_sample_prompts(
     }
     torch.save(payload, cache_path)
     logger.info("Saved precached sample prompts to %s", cache_path)
+
+    # Also save I2V latents to separate visible files and decode for verification
+    cache_dir = os.path.dirname(cache_path)
+
+    # Load VAE decoder for verification (only if we have I2V latents to verify)
+    vae_decoder = None
+    has_i2v_latents = any(cache_entry.get("start_images_latents") is not None for cache_entry in prompt_cache)
+
+    if has_i2v_latents:
+        logger.info("Loading VAE decoder for I2V latent verification...")
+        try:
+            from musubi_tuner.utils import model_utils
+            from musubi_tuner.ltx_2.loader.single_gpu_model_builder import SingleGPUModelBuilder
+            from musubi_tuner.ltx_2.model.video_vae.model_configurator import (
+                VideoDecoderConfigurator,
+                VAE_DECODER_COMFY_KEYS_FILTER,
+            )
+
+            # CRITICAL: Use bfloat16 for VAE decoder to match encoder and ltx-trainer
+            vae_dtype = torch.bfloat16
+            # Get VAE path from args, default to ltx2_checkpoint if not specified
+            vae_path = getattr(args, "vae", None) or getattr(args, "ltx2_checkpoint", None)
+
+            vae_decoder = SingleGPUModelBuilder(
+                model_path=str(vae_path),
+                model_class_configurator=VideoDecoderConfigurator,
+                model_sd_ops=VAE_DECODER_COMFY_KEYS_FILTER,
+            ).build(device=device, dtype=vae_dtype)
+            vae_decoder.eval()
+            vae_decoder.requires_grad_(False)
+            logger.info("Loaded VAE decoder for verification (dtype=%s)", vae_dtype)
+        except Exception as e:
+            logger.warning("Failed to load VAE decoder for verification: %s", e)
+
+    for idx, cache_entry in enumerate(prompt_cache):
+        if cache_entry.get("start_images_latents") is not None:
+            i2v_cache_path = os.path.join(cache_dir, f"start_images_latents_{idx}.pt")
+            torch.save(cache_entry["start_images_latents"], i2v_cache_path)
+            logger.info("Saved I2V latents to %s (shape: %s)", i2v_cache_path, list(cache_entry["start_images_latents"].shape))
+
+            # Decode verification: decode latents back to image and save for visual verification
+            if vae_decoder is not None:
+                try:
+                    from PIL import Image
+                    import torchvision.transforms as T
+
+                    # CRITICAL: Preserve the encoded dtype (bfloat16), don't convert to float16
+                    latents = cache_entry["start_images_latents"].to(device=device)
+                    logger.info("Decoding I2V latents for verification (shape: %s, dtype: %s)...", list(latents.shape), latents.dtype)
+
+                    with torch.no_grad():
+                        # Decode latents to pixel space
+                        # The musubi-tuner VAE decoder returns different shapes depending on the input:
+                        # - Single frame [1, C, 1, H, W] -> [1, 3, H, W] or [1, 3, 1, H, W]
+                        decoded = vae_decoder(latents)
+                        logger.info("Decoded output shape: %s, dtype: %s", list(decoded.shape), decoded.dtype)
+
+                    # Convert to [0, 1] range
+                    decoded = ((decoded + 1.0) / 2.0).clamp(0.0, 1.0)
+
+                    # Handle different output formats from the VAE decoder
+                    # Expected: [1, 3, H, W] or [1, 3, 1, H, W] -> convert to [3, H, W] for PIL
+                    if decoded.dim() == 4:
+                        # [1, 3, H, W] -> [3, H, W]
+                        decoded_image = decoded[0].cpu().float()
+                    elif decoded.dim() == 5:
+                        # [1, 3, 1, H, W] -> [3, H, W]
+                        decoded_image = decoded[0, :, 0].cpu().float()
+                    else:
+                        raise ValueError(f"Unexpected decoded shape: {decoded.shape}, expected 4D or 5D tensor")
+
+                    # Convert to PIL Image (expects [C, H, W] in float32)
+                    to_pil = T.ToPILImage()
+                    pil_image = to_pil(decoded_image)
+
+                    # Save verification image
+                    verify_path = os.path.join(cache_dir, f"start_images_decoded_verify_{idx}.png")
+                    pil_image.save(verify_path)
+                    logger.info("Saved decoded verification image to %s", verify_path)
+                except Exception as e:
+                    logger.warning("Failed to decode verification image for prompt %d: %s", idx, e)
+
+    # Cleanup VAE decoder if it was loaded
+    if vae_decoder is not None:
+        del vae_decoder
+        logger.info("Unloaded VAE decoder after verification")
 
 
 def main() -> None:
@@ -311,6 +435,9 @@ def main() -> None:
             autocast_dtype=autocast_dtype,
             device=device,
         )
+        # When only precaching sample prompts, skip dataset item caching
+        logger.info("Sample prompts precaching complete. Skipping dataset item caching.")
+        return
 
     cache_text_encoder_outputs.process_text_encoder_batches(
         num_workers,
@@ -410,6 +537,26 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         default="auto",
         choices=["auto", "fp16", "bf16", "fp32"],
         help="Compute dtype for 4-bit (auto uses --mixed_precision dtype)",
+    )
+    parser.add_argument(
+        "--cache_i2v",
+        action="store_true",
+        default=False,
+        help="Cache start_images latents for image-to-video mode. When enabled and start_images are provided "
+             "in sample parameters, the images are encoded to latents and saved in the cache file.",
+    )
+    parser.add_argument(
+        "--vae",
+        type=str,
+        default=None,
+        help="Path to VAE checkpoint for image encoder caching (defaults to --ltx2_checkpoint).",
+    )
+    parser.add_argument(
+        "--vae_dtype",
+        type=str,
+        default=None,
+        choices=["float32", "float16", "bfloat16"],
+        help="Data type for VAE encoder when caching start_images latents.",
     )
     return parser
 

@@ -375,6 +375,17 @@ def line_to_prompt_dict(line: str) -> dict:
                 prompt_dict["one_frame"] = m.group(1).strip()
                 continue
 
+            m = re.match(r"video_dims (.+)", parg, re.IGNORECASE)
+            if m:  # video dimensions for I2V (width, height, num_frames)
+                dims_str = m.group(1).strip()
+                try:
+                    dims = [int(x.strip()) for x in dims_str.split(",")]
+                    if len(dims) == 3:
+                        prompt_dict["video_dims"] = dims_str
+                except ValueError:
+                    pass
+                continue
+
         except ValueError as ex:
             logger.error(f"Exception in parsing / 解析エラー: {parg}")
             logger.error(ex)

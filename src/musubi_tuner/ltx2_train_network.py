@@ -1982,6 +1982,11 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 param["negative_prompt_embeds"] = cache_entry["negative_prompt_embeds"]
                 param["negative_prompt_attention_mask"] = cache_entry["negative_prompt_attention_mask"]
 
+            # Load start_images_latents if available in cache
+            if cache_entry.get("start_images_latents") is not None:
+                param["start_images_latents"] = cache_entry["start_images_latents"]
+                logger.info("Loaded cached start_images_latents for prompt %d: %s", idx, param.get("prompt", "")[:50])
+
         return sample_params
 
     def _resolve_default_sample_prompts_cache(self, args: argparse.Namespace) -> str:
@@ -2198,6 +2203,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
             sample_parameter.pop("prompt_attention_mask", None)
             sample_parameter.pop("negative_prompt_embeds", None)
             sample_parameter.pop("negative_prompt_attention_mask", None)
+            sample_parameter.pop("start_images_latents", None)
 
         def prepare_all_embeddings_batch(sample_params_list: List[Dict]) -> None:
             """Load text encoder once and encode ALL prompts before unloading."""
@@ -2224,8 +2230,12 @@ class LTX2NetworkTrainer(NetworkTrainer):
                     sample_parameter["negative_prompt_embeds"] = neg_embeds
                     sample_parameter["negative_prompt_attention_mask"] = neg_mask
 
-            self._cleanup_text_encoder(accelerator)
-            logger.info("Sampling batch: unloaded text encoder after encoding all prompts")
+            # Cleanup text encoder only if cache_te is disabled
+            if not getattr(args, "cache_te", False):
+                self._cleanup_text_encoder(accelerator)
+                logger.info("Sampling batch: unloaded text encoder after encoding all prompts")
+            else:
+                logger.info("Sampling batch: keeping text encoder cached (cache_te enabled)")
             self._cleanup_cuda(accelerator.device)
 
         # Check if using precached prompts (don't cleanup precached embeddings - they're reused)
@@ -2533,22 +2543,24 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 audio_only=audio_only_preview,
             )
         else:
-            video, audio_waveform = self.do_inference(
-                accelerator,
-                args,
-                sample_parameter,
-                vae,
-                dit_dtype,
-                transformer,
-                discrete_flow_shift,
-                sample_steps,
-                width,
-                height,
-                frame_count,
-                generator,
-                do_classifier_free_guidance,
-                guidance_scale,
-                cfg_scale,
+            # Use the LTX-2 default sampler (Rectified Flow from LTX-2)
+            # Uses musubi-tuner's LTXModel API with Modality objects
+            logger.info("Using default sampler (Rectified Flow from LTX-2)")
+            video, audio_waveform = self.do_inference_default_sampler(
+                accelerator=accelerator,
+                args=args,
+                sample_parameter=sample_parameter,
+                vae=vae,
+                dit_dtype=dit_dtype,
+                transformer=transformer,
+                sample_steps=sample_steps,
+                width=width,
+                height=height,
+                frame_count=frame_count,
+                guidance_scale=guidance_scale,
+                cfg_scale=cfg_scale,
+                seed=seed,
+                generator=generator,
                 audio_decoder=audio_decoder,
                 vocoder=vocoder,
                 offload_transformer_for_decode=bool(getattr(args, "sample_with_offloading", False)),
@@ -2608,7 +2620,9 @@ class LTX2NetworkTrainer(NetworkTrainer):
             sample_parameter.pop("prompt_attention_mask", None)
             sample_parameter.pop("negative_prompt_embeds", None)
             sample_parameter.pop("negative_prompt_attention_mask", None)
-            self._cleanup_text_encoder(accelerator)
+            # Only cleanup text encoder if cache_te is disabled
+            if not getattr(args, "cache_te", False):
+                self._cleanup_text_encoder(accelerator)
         if loaded_vae:
             vae.to_device("cpu")
             clean_memory_on_device(device)
@@ -3007,6 +3021,98 @@ class LTX2NetworkTrainer(NetworkTrainer):
 
         return video, audio_waveform
 
+    def do_inference_default_sampler(
+        self,
+        accelerator: Accelerator,
+        args: argparse.Namespace,
+        sample_parameter: Dict,
+        vae,
+        dit_dtype: torch.dtype,
+        transformer,
+        sample_steps: int,
+        width: int,
+        height: int,
+        frame_count: int,
+        guidance_scale: float,
+        cfg_scale: Optional[float],
+        seed: Optional[int],
+        generator: torch.Generator,
+        audio_decoder=None,
+        vocoder=None,
+        offload_transformer_for_decode: bool = False,
+        transformer_offload_device: Optional[torch.device] = None,
+        restore_transformer_device: bool = True,
+        audio_output_path: Optional[str] = None,
+        use_audio_subprocess: bool = False,
+        enable_audio_preview: bool = False,
+        decode_video: bool = True,
+        audio_only: bool = False,
+    ):
+        """Generate sample video using DefaultSampler.generate_from_sample_param().
+
+        This is a thin wrapper that handles training-specific concerns (device state
+        management, audio hooks) and delegates the actual generation to DefaultSampler.
+        """
+        from musubi_tuner.ltx_2.default_sampler import (
+            DefaultSampler,
+            RectifiedFlowScheduler,
+        )
+        from musubi_tuner.ltx_2.components.patchifiers import VideoLatentPatchifier
+
+        transformer_device = next(transformer.parameters()).device
+        original_vae_device = getattr(vae, "device", torch.device("cpu"))
+        original_vae_dtype = getattr(vae, "dtype", torch.float32)
+        vae.to_device(transformer_device)
+        vae.to_dtype(original_vae_dtype)
+
+        # For LTX2Wrapper, use the raw transformer model directly
+        raw_transformer = transformer.model if hasattr(transformer, 'model') else transformer
+
+        # Create scheduler with default settings (SD3 shifting, Uniform sampler)
+        scheduler = RectifiedFlowScheduler(
+            shifting="SD3",
+            sampler="Uniform",
+            shift=None,
+            target_shift_terminal=0.1,
+        )
+
+        # Create patchifier
+        patchifier = VideoLatentPatchifier(patch_size=1)
+
+        # Create the default sampler
+        sampler = DefaultSampler(
+            transformer=raw_transformer,
+            vae=vae,
+            scheduler=scheduler,
+            patchifier=patchifier,
+        )
+
+        # Generate video using the new method
+        video = sampler.generate_from_sample_param(
+            sample_parameter=sample_parameter,
+            vae_path=args.vae,
+            width=width,
+            height=height,
+            frame_count=frame_count,
+            sample_steps=sample_steps,
+            guidance_scale=guidance_scale,
+            cfg_scale=cfg_scale,
+            seed=seed,
+            offload_model_for_decode=offload_transformer_for_decode,
+        )
+
+        # Restore device states (training-specific)
+        if offload_transformer_for_decode and restore_transformer_device:
+            transformer.to(transformer_device)
+
+        vae.to_device(original_vae_device)
+        vae.to_dtype(original_vae_dtype)
+
+        # TODO: Add audio support similar to do_inference method
+        audio_waveform = None
+
+        return video, audio_waveform
+
     def do_inference_two_stage(
         self,
         accelerator: Accelerator,
@@ -3390,6 +3496,27 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         default=True,
         help="Disable automatic conversion of saved LoRA to ComfyUI format. "
              "By default, a *_comfy.safetensors file is created alongside the original.",
+    )
+
+    parser.add_argument(
+        "--use_default_sampler",
+        action="store_true",
+        default=True,
+        help="Use the default sampler (Rectified Flow from LTX-2). This is now the default sampling method.",
+    )
+    parser.add_argument(
+        "--cache_te",
+        action="store_true",
+        default=False,
+        help="Cache text encoder embeddings in memory during sampling. Reduces redundant encoding but uses more RAM. "
+             "When enabled, text encoder stays loaded across all sampling batches.",
+    )
+    parser.add_argument(
+        "--cache_i2v",
+        action="store_true",
+        default=False,
+        help="Cache start_images latents in memory for image-to-video mode. When enabled and start_images are provided "
+             "in sample parameters, the images are encoded to latents once and reused across all sampling steps.",
     )
 
     return parser
