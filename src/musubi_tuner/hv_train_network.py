@@ -561,6 +561,9 @@ class NetworkTrainer:
                 if "effective_lr" in optimizer.param_groups[i]:
                     logs[f"lr/d*eff_lr/{lr_desc}"] = optimizer.param_groups[i]["d"] * optimizer.param_groups[i]["effective_lr"]
 
+            if args.optimizer_type.lower() == "automagic" and optimizer is not None:
+                logs[f"lr/automagic_avg"] = optimizer.get_avg_learning_rate()
+
         return logs
 
     def get_optimizer(self, args, trainable_params: list[torch.nn.Parameter]) -> tuple[str, str, torch.optim.Optimizer]:
@@ -643,6 +646,12 @@ class NetworkTrainer:
             optimizer_class = torch.optim.AdamW
             optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
 
+        elif optimizer_type == "automagic":
+            from musubi_tuner.optimizers.automagic import Automagic
+            logger.info(f"use Automagic optimizer | lr={lr} | {optimizer_kwargs}")
+            optimizer_class = Automagic
+            optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
+
         if optimizer is None:
             # 任意のoptimizerを使う
             case_sensitive_optimizer_type = args.optimizer_type  # not lower
@@ -673,7 +682,17 @@ class NetworkTrainer:
         return optimizer_name, optimizer_args, optimizer, train_fn, eval_fn
 
     def is_schedulefree_optimizer(self, optimizer: torch.optim.Optimizer, args: argparse.Namespace) -> bool:
-        return args.optimizer_type.lower().endswith("schedulefree".lower())  # or args.optimizer_schedulefree_wrapper
+        return args.optimizer_type.lower().endswith("schedulefree".lower()) or args.optimizer_type.lower() == "automagic"
+
+    # -- Preservation / regularization base-class no-ops --
+    def pre_train_hook(self, args, accelerator):
+        pass
+
+    def compute_prior_divergence_addition(self, args, accelerator, transformer, network, video_pred, network_dtype):
+        return None
+
+    def preservation_backward(self, args, accelerator, transformer, network, network_dtype):
+        return {}
 
     def get_dummy_scheduler(self, optimizer: torch.optim.Optimizer) -> Any:
         # dummy scheduler for schedulefree optimizer. supports only empty step(), get_last_lr() and optimizers.
@@ -2623,6 +2642,8 @@ class NetworkTrainer:
 
         clean_memory_on_device(accelerator.device)
 
+        self.pre_train_hook(args, accelerator)
+
         optimizer_train_fn()  # Set training mode
 
         for epoch in range(epoch_to_start, num_train_epochs):
@@ -2777,12 +2798,24 @@ class NetworkTrainer:
                     if not dict_output:
                         loss = loss.mean()  # mean loss over all elements in batch
 
+                    _prior_div_value = None
+                    if dict_output:
+                        _prior_div = self.compute_prior_divergence_addition(
+                            args, accelerator, transformer, network, video_pred, network_dtype)
+                        if _prior_div is not None:
+                            _prior_div_value = _prior_div.detach().item()
+                            loss = loss + _prior_div
+
                     if _is_first_step:
                         _log_vram("FIRST_ITER: BEFORE backward", logger)
                     accelerator.backward(loss)
                     if _is_first_step:
                         _log_vram("FIRST_ITER: AFTER backward", logger)
-                    
+
+                    pres_losses = self.preservation_backward(args, accelerator, transformer, network, network_dtype)
+                    if _prior_div_value is not None:
+                        pres_losses["loss/prior_div"] = _prior_div_value
+
                     # DEBUG: Check if LoRA parameters have gradients (requires LTX2_DEBUG env var)
                     if os.environ.get("LTX2_DEBUG", "0") == "1":
                         unwrapped_net = accelerator.unwrap_model(network)
@@ -2906,6 +2939,8 @@ class NetworkTrainer:
                         args, current_loss, avr_loss, lr_scheduler, lr_descriptions, optimizer, keys_scaled, mean_norm, maximum_norm,
                         video_loss=video_loss_value, audio_loss=audio_loss_value,
                     )
+                    if pres_losses:
+                        logs.update(pres_losses)
                     accelerator.log(logs, step=global_step)
 
                 if (
