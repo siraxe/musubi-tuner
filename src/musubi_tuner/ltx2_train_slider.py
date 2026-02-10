@@ -808,6 +808,7 @@ class LTX2SliderTrainer:
         )
 
         global_step = 0
+        current_epoch = 0
         loss_recorder = train_utils.LossRecorder()
 
         clean_memory_on_device(accelerator.device)
@@ -823,9 +824,12 @@ class LTX2SliderTrainer:
             logger.info("  latent_frames: %d", getattr(args, "latent_frames", 1))
             logger.info("  latent_height: %d", getattr(args, "latent_height", 512))
             logger.info("  latent_width: %d", getattr(args, "latent_width", 768))
+        elif self.slider_config.mode == "reference":
+            logger.info("  dataset size: %d", len(ref_dataloader.dataset))
+            logger.info("  save_every_n_epochs: %s", getattr(args, "save_every_n_epochs", "disabled"))
 
         # Sample at first if requested
-        if should_sample_images(args, 0, epoch=0):
+        if should_sample_images(args, 0, epoch=current_epoch):
             optimizer_eval_fn()
             self._sample_slider(accelerator, args, transformer, vae, accelerator.unwrap_model(network), sample_parameters, dit_dtype, 0)
             optimizer_train_fn()
@@ -834,8 +838,35 @@ class LTX2SliderTrainer:
         if ref_dataloader is not None:
             ref_iter = iter(ref_dataloader)
 
+        # Track steps in current epoch for reference mode
+        steps_in_current_epoch = 0
+        dataset_size = len(ref_dataloader.dataset) if ref_dataloader is not None else 0
+
+        # Flag to track if we need to save at epoch boundary
+        epoch_to_save = None
+
         while global_step < args.max_train_steps:
             accelerator.unwrap_model(network).on_step_start()
+
+            # Save at epoch boundary if needed (outside of accumulate block)
+            if epoch_to_save is not None:
+                optimizer_eval_fn()
+                accelerator.wait_for_everyone()
+                if accelerator.is_main_process:
+                    logger.info("Saving checkpoint at epoch %d", epoch_to_save)
+                    ckpt_name = train_utils.get_epoch_ckpt_name(args.output_name, epoch_to_save)
+                    save_model(ckpt_name, accelerator.unwrap_model(network), global_step, epoch_to_save)
+
+                    if getattr(args, "save_state", False):
+                        train_utils.save_and_remove_state_stepwise(args, accelerator, global_step)
+
+                    remove_step_no = train_utils.get_remove_step_no(args, global_step)
+                    if remove_step_no is not None:
+                        remove_ckpt_name = train_utils.get_step_ckpt_name(args.output_name, remove_step_no)
+                        remove_model(remove_ckpt_name)
+
+                optimizer_train_fn()
+                epoch_to_save = None
 
             with accelerator.accumulate(network):
                 if self.slider_config.mode == "text":
@@ -845,9 +876,25 @@ class LTX2SliderTrainer:
                     try:
                         batch = next(ref_iter)
                     except StopIteration:
+                        # Completed one epoch
+                        epoch_completed = current_epoch
+                        current_epoch += 1
+                        steps_in_current_epoch = 0
+                        logger.info("Completed epoch %d, starting epoch %d", epoch_completed, current_epoch)
+
+                        # Check if we should save after completing this epoch
+                        if (getattr(args, "save_every_n_epochs", None) is not None
+                                and epoch_completed > 0
+                                and epoch_completed % args.save_every_n_epochs == 0):
+                            # Mark for saving after exiting accumulate block
+                            epoch_to_save = epoch_completed
+
+                        # Restart iterator for next epoch
                         ref_iter = iter(ref_dataloader)
                         batch = next(ref_iter)
+
                     loss = self._reference_slider_step(transformer, network, batch, accelerator, args, dit_dtype)
+                    steps_in_current_epoch += 1
 
                 # Gradient clipping
                 if accelerator.sync_gradients and getattr(args, "max_grad_norm", 0.0) != 0.0:
@@ -867,7 +914,7 @@ class LTX2SliderTrainer:
             progress_bar.update(1)
             global_step += 1
 
-            loss_recorder.add(epoch=0, step=global_step - 1, loss=loss)
+            loss_recorder.add(epoch=current_epoch, step=global_step - 1, loss=loss)
             avr_loss = loss_recorder.moving_average
             progress_bar.set_postfix(avr_loss=f"{avr_loss:.4f}", loss=f"{loss:.4f}")
 
@@ -881,13 +928,14 @@ class LTX2SliderTrainer:
                 accelerator.log(logs, step=global_step)
 
             # Sampling
-            should_sampling = should_sample_images(args, global_step, epoch=None)
-            should_saving = (
+            should_sampling = should_sample_images(args, global_step, epoch=current_epoch)
+            should_saving_steps = (
                 getattr(args, "save_every_n_steps", None) is not None
                 and global_step % args.save_every_n_steps == 0
             )
+            # Note: epoch-based saving is handled inside the training loop when dataloader is exhausted
 
-            if should_sampling or should_saving:
+            if should_sampling or should_saving_steps:
                 optimizer_eval_fn()
 
                 if should_sampling:
@@ -896,11 +944,11 @@ class LTX2SliderTrainer:
                         accelerator.unwrap_model(network), sample_parameters, dit_dtype, global_step,
                     )
 
-                if should_saving:
+                if should_saving_steps:
                     accelerator.wait_for_everyone()
                     if accelerator.is_main_process:
                         ckpt_name = train_utils.get_step_ckpt_name(args.output_name, global_step)
-                        save_model(ckpt_name, accelerator.unwrap_model(network), global_step, 0)
+                        save_model(ckpt_name, accelerator.unwrap_model(network), global_step, current_epoch)
 
                         if getattr(args, "save_state", False):
                             train_utils.save_and_remove_state_stepwise(args, accelerator, global_step)
@@ -921,7 +969,7 @@ class LTX2SliderTrainer:
 
         if is_main_process:
             ckpt_name = train_utils.get_last_ckpt_name(args.output_name)
-            save_model(ckpt_name, accelerator.unwrap_model(network), global_step, 0, force_sync_upload=True)
+            save_model(ckpt_name, accelerator.unwrap_model(network), global_step, current_epoch, force_sync_upload=True)
             logger.info("Slider training complete. Model saved.")
 
 
