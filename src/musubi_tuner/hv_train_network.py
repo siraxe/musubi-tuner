@@ -685,7 +685,7 @@ class NetworkTrainer:
         return args.optimizer_type.lower().endswith("schedulefree".lower()) or args.optimizer_type.lower() == "automagic"
 
     # -- Preservation / regularization base-class no-ops --
-    def pre_train_hook(self, args, accelerator):
+    def pre_train_hook(self, args, accelerator, transformer=None, network=None):
         pass
 
     def compute_prior_divergence_addition(self, args, accelerator, transformer, network, video_pred, network_dtype):
@@ -2120,6 +2120,7 @@ class NetworkTrainer:
         accelerator.print("prepare optimizer, data loader etc.")
 
         trainable_params, lr_descriptions = network.prepare_optimizer_params(unet_lr=args.learning_rate)
+
         optimizer_name, optimizer_args, optimizer, optimizer_train_fn, optimizer_eval_fn = self.get_optimizer(
             args, trainable_params
         )
@@ -2642,7 +2643,23 @@ class NetworkTrainer:
 
         clean_memory_on_device(accelerator.device)
 
-        self.pre_train_hook(args, accelerator)
+        self.pre_train_hook(args, accelerator, transformer=transformer, network=network)
+
+        # CREPA projector params → add to existing optimizer
+        if hasattr(self, '_crepa') and self._crepa is not None:
+            crepa_params = self._crepa.get_trainable_params()
+            if crepa_params:
+                optimizer.add_param_group({"params": crepa_params, "lr": args.learning_rate})
+                accelerator.print(f"CREPA: added {sum(p.numel() for p in crepa_params):,} projector params to optimizer")
+
+        # GUI dashboard
+        gui_metrics = None
+        if getattr(args, "gui", False) and accelerator.is_main_process:
+            from musubi_tuner.gui_dashboard import create_metrics_writer, start_gui_server
+
+            gui_metrics = create_metrics_writer(args.output_dir)
+            gui_metrics.update_status(step=0, max_steps=args.max_train_steps, epoch=0, max_epochs=num_train_epochs, status="starting")
+            start_gui_server(args.output_dir, host=getattr(args, "gui_host", "0.0.0.0"), port=getattr(args, "gui_port", 7860))
 
         optimizer_train_fn()  # Set training mode
 
@@ -2655,6 +2672,7 @@ class NetworkTrainer:
             accelerator.unwrap_model(network).on_epoch_start(transformer)
 
             for step, batch in enumerate(train_dataloader):
+                _step_start_time = time.perf_counter()
                 # VRAM spike tracing for first iteration
                 _is_first_step = (epoch == epoch_to_start and step == 0)
                 if _is_first_step:
@@ -2806,6 +2824,18 @@ class NetworkTrainer:
                             _prior_div_value = _prior_div.detach().item()
                             loss = loss + _prior_div
 
+                    # CREPA loss — must be added before backward (shares computation graph)
+                    _crepa_value = None
+                    if hasattr(self, '_crepa') and self._crepa is not None:
+                        self._crepa.on_step(global_step)
+                        num_latent_frames = latents_tensor.shape[2]
+                        dino_features = batch.get("conditions", {}).get("dino_features", None)
+                        crepa_loss = self._crepa.compute_loss(num_latent_frames, dino_features=dino_features)
+                        if crepa_loss is not None:
+                            _crepa_value = crepa_loss.detach().item()
+                            loss = loss + crepa_loss
+                        self._crepa.cleanup_step()
+
                     if _is_first_step:
                         _log_vram("FIRST_ITER: BEFORE backward", logger)
                     accelerator.backward(loss)
@@ -2815,6 +2845,8 @@ class NetworkTrainer:
                     pres_losses = self.preservation_backward(args, accelerator, transformer, network, network_dtype)
                     if _prior_div_value is not None:
                         pres_losses["loss/prior_div"] = _prior_div_value
+                    if _crepa_value is not None:
+                        pres_losses["loss/crepa"] = _crepa_value
 
                     # DEBUG: Check if LoRA parameters have gradients (requires LTX2_DEBUG env var)
                     if os.environ.get("LTX2_DEBUG", "0") == "1":
@@ -2863,7 +2895,9 @@ class NetworkTrainer:
                                     param.grad = accelerator.reduce(param.grad, reduction="mean")
 
                         if args.max_grad_norm != 0.0:
-                            params_to_clip = accelerator.unwrap_model(network).get_trainable_params()
+                            params_to_clip = list(accelerator.unwrap_model(network).get_trainable_params())
+                            if hasattr(self, '_crepa') and self._crepa is not None:
+                                params_to_clip.extend(self._crepa.get_trainable_params())
                             accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
 
                     if _is_first_step:
@@ -2906,6 +2940,8 @@ class NetworkTrainer:
                         optimizer_eval_fn()
                         if should_sampling:
                             self.sample_images(accelerator, args, None, global_step, vae, transformer, sample_parameters, dit_dtype)
+                            if gui_metrics is not None:
+                                gui_metrics.log_event("sample", global_step)
 
                         if should_saving:
                             accelerator.wait_for_everyone()
@@ -2942,6 +2978,18 @@ class NetworkTrainer:
                     if pres_losses:
                         logs.update(pres_losses)
                     accelerator.log(logs, step=global_step)
+
+                if gui_metrics is not None:
+                    _step_elapsed = time.perf_counter() - _step_start_time
+                    gui_metrics.log(
+                        step=global_step, epoch=epoch, loss=current_loss, avr_loss=avr_loss,
+                        loss_v=video_loss_value, loss_a=audio_loss_value,
+                        lr=lr_scheduler.get_last_lr()[0], step_time=_step_elapsed,
+                    )
+                    gui_metrics.update_status(
+                        step=global_step, max_steps=args.max_train_steps,
+                        epoch=epoch + 1, max_epochs=num_train_epochs, status="training",
+                    )
 
                 if (
                     validation_dataloader is not None
@@ -2983,12 +3031,18 @@ class NetworkTrainer:
                         train_utils.save_and_remove_state_on_epoch_end(args, accelerator, epoch + 1)
 
             self.sample_images(accelerator, args, epoch + 1, global_step, vae, transformer, sample_parameters, dit_dtype)
+            if gui_metrics is not None:
+                gui_metrics.log_event("epoch_sample", global_step)
             optimizer_train_fn()
 
             # end of epoch
 
         # metadata["ss_epoch"] = str(num_train_epochs)
         metadata["ss_training_finished_at"] = str(time.time())
+
+        if gui_metrics is not None:
+            gui_metrics.update_status(step=global_step, max_steps=args.max_train_steps, status="completed")
+            gui_metrics.close()
 
         if is_main_process:
             network = accelerator.unwrap_model(network)
@@ -3705,6 +3759,11 @@ def setup_parser_common() -> argparse.ArgumentParser:
     parser.add_argument("--dit", type=str, help="DiT checkpoint path / DiTのチェックポイントのパス")
     parser.add_argument("--vae", type=str, help="VAE checkpoint path / VAEのチェックポイントのパス")
     parser.add_argument("--vae_dtype", type=str, default=None, help="data type for VAE, default is float16")
+
+    # GUI dashboard
+    parser.add_argument("--gui", action="store_true", help="enable live web training dashboard / ウェブ学習ダッシュボードを有効にする")
+    parser.add_argument("--gui_port", type=int, default=7860, help="dashboard port (default: 7860)")
+    parser.add_argument("--gui_host", type=str, default="0.0.0.0", help="dashboard host (default: 0.0.0.0)")
 
     return parser
 
