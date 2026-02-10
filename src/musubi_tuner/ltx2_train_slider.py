@@ -68,9 +68,11 @@ class SliderConfig:
     guidance_strength: float = 1.0
     frame_rate: int = 25
     sample_slider_range: List[float] = field(default_factory=lambda: [-2.0, -1.0, 0.0, 1.0, 2.0])
-    pos_cache_dir: Optional[str] = None
-    neg_cache_dir: Optional[str] = None
-    text_cache_dir: Optional[str] = None  # defaults to pos_cache_dir if not set
+    batch_size: int = 1
+    # Multiple directories support (required for reference mode)
+    pos_cache_dirs: List[str] = field(default_factory=list)
+    neg_cache_dirs: List[str] = field(default_factory=list)
+    text_cache_dirs: List[str] = field(default_factory=list)
 
 
 def load_slider_config(path: str) -> SliderConfig:
@@ -82,6 +84,7 @@ def load_slider_config(path: str) -> SliderConfig:
     guidance_strength = float(raw.get("guidance_strength", 1.0))
     frame_rate = int(raw.get("frame_rate", 25))
     sample_slider_range = raw.get("sample_slider_range", [-2.0, -1.0, 0.0, 1.0, 2.0])
+    batch_size = int(raw.get("batch_size", 1))
 
     targets = []
     for t in raw.get("targets", []):
@@ -94,9 +97,10 @@ def load_slider_config(path: str) -> SliderConfig:
             )
         )
 
-    pos_cache_dir = raw.get("pos_cache_dir", None)
-    neg_cache_dir = raw.get("neg_cache_dir", None)
-    text_cache_dir = raw.get("text_cache_dir", None) or pos_cache_dir
+    # Load multi-dataset directories
+    pos_cache_dirs = raw.get("pos_cache_dirs", [])
+    neg_cache_dirs = raw.get("neg_cache_dirs", [])
+    text_cache_dirs = raw.get("text_cache_dirs", pos_cache_dirs)  # Default to pos_cache_dirs
 
     return SliderConfig(
         mode=mode,
@@ -104,9 +108,10 @@ def load_slider_config(path: str) -> SliderConfig:
         guidance_strength=guidance_strength,
         frame_rate=frame_rate,
         sample_slider_range=[float(v) for v in sample_slider_range],
-        pos_cache_dir=pos_cache_dir,
-        neg_cache_dir=neg_cache_dir,
-        text_cache_dir=text_cache_dir,
+        batch_size=batch_size,
+        pos_cache_dirs=pos_cache_dirs,
+        neg_cache_dirs=neg_cache_dirs,
+        text_cache_dirs=text_cache_dirs,
     )
 
 
@@ -180,48 +185,83 @@ _LATENT_BASENAME_RE = re.compile(r"^(.+)_\d{4}x\d{4}_ltx2\.safetensors$")
 
 
 class PairedSliderDataset(torch.utils.data.Dataset):
-    """Loads matched positive/negative latent pairs from cache directories."""
+    """Loads matched positive/negative latent pairs from multiple cache directories."""
 
-    def __init__(self, pos_cache_dir: str, neg_cache_dir: str, text_cache_dir: Optional[str] = None):
-        self.text_cache_dir = text_cache_dir or pos_cache_dir
+    def __init__(self, pos_cache_dirs: List[str], neg_cache_dirs: List[str],
+                 text_cache_dirs: Optional[List[str]] = None):
+        if not pos_cache_dirs:
+            raise ValueError("pos_cache_dirs cannot be empty")
+        if not neg_cache_dirs:
+            raise ValueError("neg_cache_dirs cannot be empty")
 
-        # Find latent cache files in pos_cache_dir
-        pos_files = sorted(glob.glob(os.path.join(pos_cache_dir, "*_ltx2.safetensors")))
-        # Exclude text encoder caches (*_te.safetensors) and audio (*_audio.safetensors)
-        pos_files = [f for f in pos_files if not f.endswith("_te.safetensors") and not f.endswith("_audio.safetensors")]
+        self.pos_cache_dirs = pos_cache_dirs
+        self.neg_cache_dirs = neg_cache_dirs
+        self.text_cache_dirs = text_cache_dirs if text_cache_dirs else pos_cache_dirs
+
+        # Ensure all lists have the same length
+        n_dirs = len(self.pos_cache_dirs)
+        if len(self.neg_cache_dirs) != n_dirs:
+            raise ValueError(f"pos_cache_dirs has {n_dirs} entries but neg_cache_dirs has {len(self.neg_cache_dirs)}")
+        if len(self.text_cache_dirs) != n_dirs:
+            raise ValueError(f"pos_cache_dirs has {n_dirs} entries but text_cache_dirs has {len(self.text_cache_dirs)}")
 
         self.pairs = []
-        for pos_path in pos_files:
-            basename = os.path.basename(pos_path)
-            neg_path = os.path.join(neg_cache_dir, basename)
-            if not os.path.exists(neg_path):
-                logger.warning("No negative match for %s, skipping", basename)
-                continue
+        # Store pairs with their shapes for bucket batching: (shape_key, pos_path, neg_path, te_path)
+        self.buckets = {}  # shape -> list of indices
 
-            # Text cache uses stem without WxH dimensions:
-            #   latent: {stem}_{W:04d}x{H:04d}_ltx2.safetensors
-            #   text:   {stem}_ltx2_te.safetensors
-            m = _LATENT_BASENAME_RE.match(basename)
-            if not m:
-                logger.warning("Cannot parse latent filename %s, skipping", basename)
-                continue
-            te_basename = f"{m.group(1)}_ltx2_te.safetensors"
-            te_path = os.path.join(self.text_cache_dir, te_basename)
-            if not os.path.exists(te_path):
-                logger.warning("No text cache for %s, skipping", basename)
-                continue
+        for i, (pos_dir, neg_dir, text_dir) in enumerate(zip(self.pos_cache_dirs, self.neg_cache_dirs, self.text_cache_dirs)):
+            # Find latent cache files in pos_cache_dir
+            pos_files = sorted(glob.glob(os.path.join(pos_dir, "*_ltx2.safetensors")))
+            # Exclude text encoder caches (*_te.safetensors) and audio (*_audio.safetensors)
+            pos_files = [f for f in pos_files if not f.endswith("_te.safetensors") and not f.endswith("_audio.safetensors")]
 
-            self.pairs.append((pos_path, neg_path, te_path))
+            for pos_path in pos_files:
+                basename = os.path.basename(pos_path)
+                neg_path = os.path.join(neg_dir, basename)
+                if not os.path.exists(neg_path):
+                    logger.warning("No negative match for %s in %s, skipping", basename, neg_dir)
+                    continue
+
+                # Text cache uses stem without WxH dimensions:
+                #   latent: {stem}_{W:04d}x{H:04d}_ltx2.safetensors
+                #   text:   {stem}_ltx2_te.safetensors
+                m = _LATENT_BASENAME_RE.match(basename)
+                if not m:
+                    logger.warning("Cannot parse latent filename %s, skipping", basename)
+                    continue
+                te_basename = f"{m.group(1)}_ltx2_te.safetensors"
+                te_path = os.path.join(text_dir, te_basename)
+                if not os.path.exists(te_path):
+                    logger.warning("No text cache for %s in %s, skipping", basename, text_dir)
+                    continue
+
+                # Get the shape of this pair for bucketing
+                # Load just the metadata to get shape without loading full tensor
+                pos_sd = load_file(pos_path)
+                pos_latents = _find_latent_tensor(pos_sd)
+                shape = pos_latents.shape  # (C, F, H, W)
+                shape_key = shape  # Use full shape as bucket key
+
+                idx = len(self.pairs)
+                self.pairs.append((shape_key, pos_path, neg_path, te_path))
+
+                if shape_key not in self.buckets:
+                    self.buckets[shape_key] = []
+                self.buckets[shape_key].append(idx)
 
         if len(self.pairs) == 0:
-            raise ValueError(f"No matched pairs found in {pos_cache_dir} and {neg_cache_dir}")
-        logger.info("PairedSliderDataset: found %d matched pairs", len(self.pairs))
+            raise ValueError(f"No matched pairs found in the provided cache directories")
+        logger.info("PairedSliderDataset: found %d matched pairs from %d dataset(s) in %d shape buckets",
+                   len(self.pairs), n_dirs, len(self.buckets))
+        # Log bucket info
+        for shape, indices in sorted(self.buckets.items()):
+            logger.info("  Bucket shape %s: %d items", shape, len(indices))
 
     def __len__(self):
         return len(self.pairs)
 
     def __getitem__(self, idx):
-        pos_path, neg_path, te_path = self.pairs[idx]
+        shape_key, pos_path, neg_path, te_path = self.pairs[idx]
 
         pos_sd = load_file(pos_path)
         neg_sd = load_file(neg_path)
@@ -243,6 +283,77 @@ class PairedSliderDataset(torch.utils.data.Dataset):
             "text_embeds": text_embeds,
             "text_mask": text_mask,
         }
+
+
+class SliderBucketBatchSampler:
+    """Sampler that groups batches by latent shape to enable true batching."""
+
+    def __init__(self, dataset: PairedSliderDataset, batch_size: int, shuffle: bool = True):
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+
+        # Build batch indices for each bucket
+        self.bucket_batches = []  # list of (shape, [indices])
+
+        for shape, indices in dataset.buckets.items():
+            # Create batches within this bucket
+            for i in range(0, len(indices), batch_size):
+                batch_indices = indices[i:i + batch_size]
+                self.bucket_batches.append((shape, batch_indices))
+
+        if shuffle:
+            import random
+            random.shuffle(self.bucket_batches)
+
+    def __iter__(self):
+        for shape, indices in self.bucket_batches:
+            yield indices
+
+    def __len__(self):
+        return len(self.bucket_batches)
+
+
+def _slider_collate_fn(batch):
+    """Collate function that stacks tensors from the same shape bucket."""
+    # batch is a list of dicts with pos_latents, neg_latents, text_embeds, text_mask
+    # All items in the batch have the same latent shape (due to bucketing)
+
+    pos_latents = torch.stack([item["pos_latents"] for item in batch])  # [B, C, F, H, W]
+    neg_latents = torch.stack([item["neg_latents"] for item in batch])  # [B, C, F, H, W]
+
+    # Text embeddings may have different seq lengths, so pad them
+    text_embeds_list = [item["text_embeds"] for item in batch]
+    text_mask_list = [item["text_mask"] for item in batch]
+
+    # Find max seq length
+    max_seq_len = max(embed.shape[0] for embed in text_embeds_list)
+
+    # Pad to max length
+    padded_embeds = []
+    padded_masks = []
+    for embed, mask in zip(text_embeds_list, text_mask_list):
+        seq_len = embed.shape[0]
+        if seq_len < max_seq_len:
+            # Pad with zeros
+            pad_size = max_seq_len - seq_len
+            embed_pad = torch.nn.functional.pad(embed, (0, 0, 0, pad_size))
+            mask_pad = torch.nn.functional.pad(mask, (0, pad_size))
+            padded_embeds.append(embed_pad)
+            padded_masks.append(mask_pad)
+        else:
+            padded_embeds.append(embed)
+            padded_masks.append(mask)
+
+    text_embeds = torch.stack(padded_embeds)  # [B, seq_len, dim]
+    text_mask = torch.stack(padded_masks)  # [B, seq_len]
+
+    return {
+        "pos_latents": pos_latents,
+        "neg_latents": neg_latents,
+        "text_embeds": text_embeds,
+        "text_mask": text_mask,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -400,32 +511,44 @@ class LTX2SliderTrainer:
         args: argparse.Namespace,
         dit_dtype: torch.dtype,
     ) -> float:
-        """One training step for reference-based slider mode."""
+        """One training step for reference-based slider mode.
+
+        Supports batched training with multiple positive/negative pairs per batch.
+        """
         device = accelerator.device
 
-        pos_latents = batch["pos_latents"].to(device=device, dtype=torch.float32)  # [1, 128, F, H, W]
+        pos_latents = batch["pos_latents"].to(device=device, dtype=torch.float32)  # [B, 128, F, H, W]
         neg_latents = batch["neg_latents"].to(device=device, dtype=torch.float32)
         text_embeds = batch["text_embeds"].to(device=device, dtype=dit_dtype)
         text_mask = batch["text_mask"].to(device=device, dtype=torch.int64)
 
-        if text_embeds.dim() == 2:
-            text_embeds = text_embeds.unsqueeze(0)
-        if text_mask.dim() == 1:
-            text_mask = text_mask.unsqueeze(0)
+        batch_size = pos_latents.shape[0]
 
-        # Same noise for both
+        # Handle text embeddings: could be [seq_len, dim] or [B, seq_len, dim]
+        if text_embeds.dim() == 2:
+            text_embeds = text_embeds.unsqueeze(0).expand(batch_size, -1, -1)
+        elif text_embeds.shape[0] != batch_size:
+            text_embeds = text_embeds.expand(batch_size, -1, -1)
+
+        # Handle text mask similarly
+        if text_mask.dim() == 1:
+            text_mask = text_mask.unsqueeze(0).expand(batch_size, -1)
+        elif text_mask.shape[0] != batch_size:
+            text_mask = text_mask.expand(batch_size, -1)
+
+        # Same noise for both, per batch element
         noise = torch.randn_like(pos_latents)
 
-        # Sample sigma
+        # Sample sigma per batch element
         seq_len = pos_latents.shape[2] * pos_latents.shape[3] * pos_latents.shape[4]
         shift = LTX2NetworkTrainer._shifted_logit_normal_shift_for_sequence_length(seq_len)
-        sigma = torch.sigmoid(torch.randn(1, device=device) + shift)
-        sigma_exp = sigma.view(1, 1, 1, 1, 1)
+        sigma = torch.sigmoid(torch.randn(batch_size, device=device) + shift)  # [B]
+        sigma_exp = sigma.view(batch_size, 1, 1, 1, 1)  # [B, 1, 1, 1, 1]
 
         # Create noisy versions (flow matching interpolation)
         noisy_pos = ((1.0 - sigma_exp) * pos_latents + sigma_exp * noise).to(dtype=dit_dtype)
         noisy_neg = ((1.0 - sigma_exp) * neg_latents + sigma_exp * noise).to(dtype=dit_dtype)
-        model_ts = sigma.unsqueeze(1)
+        model_ts = sigma.unsqueeze(1)  # [B, 1]
 
         # Flow matching velocity targets
         target_pos = (noise - pos_latents).to(dtype=dit_dtype)
@@ -514,15 +637,45 @@ class LTX2SliderTrainer:
         Loads matched positive/negative latent pairs from pre-cached directories.
         """
         cfg = self.slider_config
-        dataset = PairedSliderDataset(cfg.pos_cache_dir, cfg.neg_cache_dir, cfg.text_cache_dir)
-        num_workers = min(getattr(args, "max_data_loader_n_workers", 2), os.cpu_count() or 1)
-        dataloader = torch.utils.data.DataLoader(
-            dataset,
-            batch_size=1,
-            shuffle=True,
-            num_workers=num_workers,
-            persistent_workers=num_workers > 0 and getattr(args, "persistent_data_loader_workers", False),
+        dataset = PairedSliderDataset(
+            pos_cache_dirs=cfg.pos_cache_dirs,
+            neg_cache_dirs=cfg.neg_cache_dirs,
+            text_cache_dirs=cfg.text_cache_dirs,
         )
+        num_workers = min(getattr(args, "max_data_loader_n_workers", 2), os.cpu_count() or 1)
+
+        # Use batch_size from slider config for bucket batching
+        # If batch_size > 1, use bucket sampler to group same-shape items together
+        batch_size = cfg.batch_size
+        use_bucket_batching = batch_size > 1
+
+        if use_bucket_batching:
+            # Check if we have enough items per bucket for the requested batch_size
+            min_bucket_size = min(len(indices) for indices in dataset.buckets.values())
+            if min_bucket_size < batch_size:
+                logger.warning(
+                    f"Requested batch_size={batch_size} but smallest bucket only has {min_bucket_size} items. "
+                    f"Reducing effective batch_size for small buckets. Use batch_size=1 or gradient_accumulation_steps for consistent batching."
+                )
+
+            # Use bucket sampler for true batching within each shape group
+            batch_sampler = SliderBucketBatchSampler(dataset, batch_size=batch_size, shuffle=True)
+            dataloader = torch.utils.data.DataLoader(
+                dataset,
+                batch_sampler=batch_sampler,
+                collate_fn=_slider_collate_fn,
+                num_workers=num_workers,
+                persistent_workers=num_workers > 0 and getattr(args, "persistent_data_loader_workers", False),
+            )
+        else:
+            # batch_size=1: use simple dataloader without bucketing
+            dataloader = torch.utils.data.DataLoader(
+                dataset,
+                batch_size=1,
+                shuffle=True,
+                num_workers=num_workers,
+                persistent_workers=num_workers > 0 and getattr(args, "persistent_data_loader_workers", False),
+            )
         return dataloader
 
     # -- Main training entry --------------------------------------------------
@@ -556,8 +709,9 @@ class LTX2SliderTrainer:
         if self.slider_config.mode == "text" and len(self.slider_config.targets) == 0:
             raise ValueError("Text-only slider mode requires at least one target in slider config")
         if self.slider_config.mode == "reference":
-            if not self.slider_config.pos_cache_dir or not self.slider_config.neg_cache_dir:
-                raise ValueError("Reference slider mode requires pos_cache_dir and neg_cache_dir in slider config")
+            # Check for multi-dataset lists
+            if not self.slider_config.pos_cache_dirs or not self.slider_config.neg_cache_dirs:
+                raise ValueError("Reference slider mode requires pos_cache_dirs and neg_cache_dirs in slider config")
 
         # Seed
         if args.seed is None:
@@ -826,6 +980,10 @@ class LTX2SliderTrainer:
             logger.info("  latent_width: %d", getattr(args, "latent_width", 768))
         elif self.slider_config.mode == "reference":
             logger.info("  dataset size: %d", len(ref_dataloader.dataset))
+            batch_size = self.slider_config.batch_size
+            grad_accum = getattr(args, "gradient_accumulation_steps", 1)
+            logger.info("  batch_size: %d (gradient_accumulation_steps: %d, effective_batch_size: %d)",
+                       batch_size, grad_accum, batch_size * grad_accum)
             logger.info("  save_every_n_epochs: %s", getattr(args, "save_every_n_epochs", "disabled"))
 
         # Sample at first if requested

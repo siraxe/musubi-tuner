@@ -1501,9 +1501,12 @@ class ImageDirectoryDatasource(ImageDatasource):
 
     def get_caption(self, idx: int) -> tuple[str, str]:
         image_path = self.image_paths[idx]
-        caption_path = os.path.splitext(image_path)[0] + self.caption_extension if self.caption_extension else ""
-        with open(caption_path, "r", encoding="utf-8") as f:
-            caption = f.read().strip()
+        if self.caption_extension:
+            caption_path = os.path.splitext(image_path)[0] + self.caption_extension
+            with open(caption_path, "r", encoding="utf-8") as f:
+                caption = f.read().strip()
+        else:
+            caption = ""  # No caption extension means no captions needed (e.g., control images for slider training)
         return image_path, caption
 
     def __iter__(self):
@@ -1685,9 +1688,12 @@ class AudioDirectoryDatasource(AudioDatasource):
 
     def get_audio_data(self, idx: int) -> tuple[str, str]:
         audio_path = self.audio_paths[idx]
-        caption_path = os.path.splitext(audio_path)[0] + (self.caption_extension or "")
-        with open(caption_path, "r", encoding="utf-8") as f:
-            caption = f.read().strip()
+        if self.caption_extension:
+            caption_path = os.path.splitext(audio_path)[0] + self.caption_extension
+            with open(caption_path, "r", encoding="utf-8") as f:
+                caption = f.read().strip()
+        else:
+            caption = ""  # No caption extension means no captions needed
         return audio_path, caption
 
     def get_caption(self, idx: int) -> tuple[str, str]:
@@ -1924,9 +1930,12 @@ class VideoDirectoryDatasource(VideoDatasource):
 
     def get_caption(self, idx: int) -> tuple[str, str]:
         video_path = self.video_paths[idx]
-        caption_path = os.path.splitext(video_path)[0] + self.caption_extension if self.caption_extension else ""
-        with open(caption_path, "r", encoding="utf-8") as f:
-            caption = f.read().strip()
+        if self.caption_extension:
+            caption_path = os.path.splitext(video_path)[0] + self.caption_extension
+            with open(caption_path, "r", encoding="utf-8") as f:
+                caption = f.read().strip()
+        else:
+            caption = ""  # No caption extension means no captions needed
         return video_path, caption
 
     def __iter__(self):
