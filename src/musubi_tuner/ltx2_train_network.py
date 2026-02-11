@@ -3779,6 +3779,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
         enable_audio_preview: bool = False,
         decode_video: bool = True,
         audio_only: bool = False,
+        conditioning_latent: Optional[torch.Tensor] = None,
     ):
         """Generate sample video using DefaultSampler.generate_from_sample_param().
 
@@ -3818,6 +3819,11 @@ class LTX2NetworkTrainer(NetworkTrainer):
             scheduler=scheduler,
             patchifier=patchifier,
         )
+
+        # Add conditioning_latent to sample_parameter for I2V
+        if conditioning_latent is not None:
+            sample_parameter["start_images_latents"] = conditioning_latent
+            logger.info(f"I2V: Added conditioning_latent to sample_parameter for default sampler (shape: {conditioning_latent.shape})")
 
         # Generate video using the new method
         video = sampler.generate_from_sample_param(
