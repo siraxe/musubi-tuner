@@ -23,6 +23,7 @@ import av
 
 from musubi_tuner.utils import safetensors_utils
 from musubi_tuner.utils.model_utils import dtype_to_str
+from musubi_tuner.dataset.ar_bucket_utils import ARBucketSelector, generate_ar_buckets
 
 import logging
 
@@ -704,11 +705,21 @@ class BucketSelector:
     }
 
     def __init__(
-        self, resolution: Tuple[int, int], enable_bucket: bool = True, no_upscale: bool = False, architecture: str = "no_default"
+        self,
+        resolution: Tuple[int, int],
+        enable_bucket: bool = True,
+        no_upscale: bool = False,
+        architecture: str = "no_default",
+        enable_ar_bucket: bool = False,
+        min_ar: float = 0.5,
+        max_ar: float = 2.0,
+        num_ar_buckets: int = 2,
     ):
+        logger.info(f"BucketSelector.__init__: enable_bucket={enable_bucket}, enable_ar_bucket={enable_ar_bucket}, min_ar={min_ar}, max_ar={max_ar}, num_ar_buckets={num_ar_buckets}")
         self.resolution = resolution
         self.bucket_area = resolution[0] * resolution[1]
         self.architecture = architecture
+        self.enable_ar_bucket = enable_ar_bucket
 
         if architecture in BucketSelector.ARCHITECTURE_STEPS_MAP:
             self.reso_steps = BucketSelector.ARCHITECTURE_STEPS_MAP[architecture]
@@ -721,8 +732,21 @@ class BucketSelector:
                 raise ValueError(f"resolution must be divisible by {self.reso_steps} for architecture={architecture}: {resolution}")
             self.bucket_resolutions = [resolution]
             self.no_upscale = False
+            logger.info(f"BucketSelector: Using single bucket (no bucketing): {self.bucket_resolutions}")
+        elif enable_ar_bucket:
+            # Use AR bucketing with min/max AR and num buckets
+            self.no_upscale = no_upscale
+            self.bucket_resolutions = generate_ar_buckets(
+                resolution=resolution,
+                min_ar=min_ar,
+                max_ar=max_ar,
+                num_ar_buckets=num_ar_buckets,
+                reso_steps=self.reso_steps,
+            )
+            logger.info(f"Using AR bucketing: min_ar={min_ar}, max_ar={max_ar}, num_ar_buckets={num_ar_buckets}")
+            logger.info(f"Generated {len(self.bucket_resolutions)} bucket resolutions: {self.bucket_resolutions}")
         else:
-            # prepare bucket resolution
+            # prepare bucket resolution (original method)
             self.no_upscale = no_upscale
             sqrt_size = int(math.sqrt(self.bucket_area))
             min_size = divisible_by(sqrt_size // 2, self.reso_steps)
@@ -734,6 +758,7 @@ class BucketSelector:
 
             self.bucket_resolutions = list(set(self.bucket_resolutions))
             self.bucket_resolutions.sort()
+            logger.info(f"BucketSelector: Using original bucketing method, {len(self.bucket_resolutions)} buckets: {self.bucket_resolutions}")
 
         # calculate aspect ratio to find the nearest resolution
         self.aspect_ratios = np.array([w / h for w, h in self.bucket_resolutions])
@@ -2061,24 +2086,37 @@ class BaseDataset(torch.utils.data.Dataset):
         separate_audio_buckets: bool = False,
         debug_dataset: bool = False,
         architecture: str = "no_default",
+        enable_ar_bucket: bool = False,
+        min_ar: float = 0.5,
+        max_ar: float = 2.0,
+        num_ar_buckets: int = 2,
     ):
         self.resolution = resolution
         self.caption_extension = caption_extension
         self.batch_size = batch_size
         self.num_repeats = num_repeats
-        self.enable_bucket = enable_bucket
         self.bucket_no_upscale = bucket_no_upscale
         self.cache_directory = cache_directory
         self.reference_cache_directory = reference_cache_directory
         self.separate_audio_buckets = separate_audio_buckets
         self.debug_dataset = debug_dataset
         self.architecture = architecture
+        self.enable_ar_bucket = enable_ar_bucket
+        self.min_ar = min_ar
+        self.max_ar = max_ar
+        self.num_ar_buckets = num_ar_buckets
         self.seed = None
         self.current_epoch = 0
         self.shared_epoch = None
 
+        # If AR bucketing is enabled, automatically enable bucketing
+        if self.enable_ar_bucket:
+            self.enable_bucket = True
+
         if not self.enable_bucket:
             self.bucket_no_upscale = False
+        if not self.enable_bucket:
+            self.enable_ar_bucket = False
 
     def get_metadata(self) -> dict:
         metadata = {
@@ -2089,6 +2127,10 @@ class BaseDataset(torch.utils.data.Dataset):
             "enable_bucket": bool(self.enable_bucket),
             "bucket_no_upscale": bool(self.bucket_no_upscale),
             "separate_audio_buckets": bool(self.separate_audio_buckets),
+            "enable_ar_bucket": bool(self.enable_ar_bucket),
+            "min_ar": self.min_ar,
+            "max_ar": self.max_ar,
+            "num_ar_buckets": self.num_ar_buckets,
         }
         return metadata
 
@@ -2282,6 +2324,10 @@ class ImageDataset(BaseDataset):
         control_resolution: Optional[Tuple[int, int]] = None,
         debug_dataset: bool = False,
         architecture: str = "no_default",
+        enable_ar_bucket: bool = False,
+        min_ar: float = 0.5,
+        max_ar: float = 2.0,
+        num_ar_buckets: int = 2,
     ):
         super(ImageDataset, self).__init__(
             resolution,
@@ -2295,6 +2341,10 @@ class ImageDataset(BaseDataset):
             separate_audio_buckets,
             debug_dataset,
             architecture,
+            enable_ar_bucket,
+            min_ar,
+            max_ar,
+            num_ar_buckets,
         )
         self.image_directory = image_directory
         self.image_jsonl_file = image_jsonl_file
@@ -2355,7 +2405,16 @@ class ImageDataset(BaseDataset):
         return len(self.datasource) if self.datasource.is_indexable() else None
 
     def retrieve_latent_cache_batches(self, num_workers: int):
-        bucket_selector = BucketSelector(self.resolution, self.enable_bucket, self.bucket_no_upscale, self.architecture)
+        bucket_selector = BucketSelector(
+            self.resolution,
+            self.enable_bucket,
+            self.bucket_no_upscale,
+            self.architecture,
+            self.enable_ar_bucket,
+            self.min_ar,
+            self.max_ar,
+            self.num_ar_buckets,
+        )
         executor = ThreadPoolExecutor(max_workers=num_workers)
 
         batches: dict[tuple[int, int], list[ItemInfo]] = {}  # (width, height) -> [ItemInfo]
@@ -2497,7 +2556,16 @@ class ImageDataset(BaseDataset):
         return self._default_retrieve_text_encoder_output_cache_batches(self.datasource, self.batch_size, num_workers)
 
     def prepare_for_training(self, num_timestep_buckets: Optional[int] = None):
-        bucket_selector = BucketSelector(self.resolution, self.enable_bucket, self.bucket_no_upscale, self.architecture)
+        bucket_selector = BucketSelector(
+            self.resolution,
+            self.enable_bucket,
+            self.bucket_no_upscale,
+            self.architecture,
+            self.enable_ar_bucket,
+            self.min_ar,
+            self.max_ar,
+            self.num_ar_buckets,
+        )
 
         # glob cache files
         latent_cache_files = glob.glob(os.path.join(self.cache_directory, f"*_{self.architecture}.safetensors"))
@@ -2782,6 +2850,10 @@ class VideoDataset(BaseDataset):
         fp_latent_window_size: Optional[int] = 9,
         debug_dataset: bool = False,
         architecture: str = "no_default",
+        enable_ar_bucket: bool = False,
+        min_ar: float = 0.5,
+        max_ar: float = 2.0,
+        num_ar_buckets: int = 2,
     ):
         super(VideoDataset, self).__init__(
             resolution,
@@ -2795,6 +2867,10 @@ class VideoDataset(BaseDataset):
             separate_audio_buckets,
             debug_dataset,
             architecture,
+            enable_ar_bucket,
+            min_ar,
+            max_ar,
+            num_ar_buckets,
         )
         self.video_directory = video_directory
         self.video_jsonl_file = video_jsonl_file
@@ -2878,7 +2954,16 @@ class VideoDataset(BaseDataset):
         return metadata
 
     def retrieve_latent_cache_batches(self, num_workers: int):
-        buckset_selector = BucketSelector(self.resolution, architecture=self.architecture)
+        buckset_selector = BucketSelector(
+            self.resolution,
+            enable_bucket=self.enable_bucket,
+            no_upscale=self.bucket_no_upscale,
+            architecture=self.architecture,
+            enable_ar_bucket=self.enable_ar_bucket,
+            min_ar=self.min_ar,
+            max_ar=self.max_ar,
+            num_ar_buckets=self.num_ar_buckets,
+        )
         self.datasource.set_bucket_selector(buckset_selector)
         self.datasource.set_source_and_target_fps(self.source_fps, self.target_fps)
 
@@ -3042,7 +3127,16 @@ class VideoDataset(BaseDataset):
         return self._default_retrieve_text_encoder_output_cache_batches(self.datasource, self.batch_size, num_workers)
 
     def prepare_for_training(self, num_timestep_buckets: Optional[int] = None):
-        bucket_selector = BucketSelector(self.resolution, self.enable_bucket, self.bucket_no_upscale, self.architecture)
+        bucket_selector = BucketSelector(
+            self.resolution,
+            self.enable_bucket,
+            self.bucket_no_upscale,
+            self.architecture,
+            self.enable_ar_bucket,
+            self.min_ar,
+            self.max_ar,
+            self.num_ar_buckets,
+        )
 
         # glob cache files
         latent_cache_files = glob.glob(os.path.join(self.cache_directory, f"*_{self.architecture}.safetensors"))

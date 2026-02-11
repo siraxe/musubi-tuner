@@ -42,6 +42,11 @@ class BaseDatasetParams:
     separate_audio_buckets: bool = False
     debug_dataset: bool = False
     architecture: str = "no_default"  # short style like "hv" or "wan"
+    # Aspect ratio bucketing parameters
+    enable_ar_bucket: bool = False
+    min_ar: float = 0.5
+    max_ar: float = 2.0
+    num_ar_buckets: int = 2
 
 
 @dataclass
@@ -128,6 +133,10 @@ class ConfigSanitizer:
         "cache_directory": str,
         "reference_cache_directory": str,
         "separate_audio_buckets": bool,
+        "enable_ar_bucket": bool,
+        "min_ar": float,
+        "max_ar": float,
+        "num_ar_buckets": int,
     }
     IMAGE_DATASET_DISTINCT_SCHEMA = {
         "image_directory": str,
@@ -337,6 +346,10 @@ def generate_dataset_group_by_blueprint(
         enable_bucket: {dataset.enable_bucket}
         bucket_no_upscale: {dataset.bucket_no_upscale}
         separate_audio_buckets: {getattr(dataset, "separate_audio_buckets", False)}
+        enable_ar_bucket: {dataset.enable_ar_bucket}
+        min_ar: {dataset.min_ar}
+        max_ar: {dataset.max_ar}
+        num_ar_buckets: {dataset.num_ar_buckets}
         cache_directory: "{dataset.cache_directory}"
         debug_dataset: {dataset.debug_dataset}
     """
