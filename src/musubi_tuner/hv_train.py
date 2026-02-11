@@ -44,6 +44,13 @@ import logging
 
 from musubi_tuner.utils import huggingface_utils, model_utils, train_utils, sai_model_spec
 
+# Import utility for parsing optimizer args
+try:
+    from scripts.musubi_utils import parse_optimizer_args_list
+except ImportError:
+    # Fallback if not available (e.g., different import path)
+    parse_optimizer_args_list = None
+
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
@@ -355,18 +362,13 @@ class FineTuningTrainer:
 
         return sample_parameters
 
-    def get_optimizer(self, args, trainable_params: list[torch.nn.Parameter]) -> tuple[str, str, torch.optim.Optimizer]:
+    def get_optimizer(self, args, trainable_params: list[torch.nn.Parameter], optimizer_kwargs: dict | None = None) -> tuple[str, str, torch.optim.Optimizer]:
         # adamw, adamw8bit, adafactor
 
         optimizer_type = args.optimizer_type.lower()
 
-        # split optimizer_type and optimizer_args
-        optimizer_kwargs = {}
-        if args.optimizer_args is not None and len(args.optimizer_args) > 0:
-            for arg in args.optimizer_args:
-                key, value = arg.split("=")
-                value = ast.literal_eval(value)
-                optimizer_kwargs[key] = value
+        # Use pre-parsed optimizer_kwargs from caller (parse_optimizer_args_list)
+        optimizer_kwargs = optimizer_kwargs or {}
 
         lr = args.learning_rate
         optimizer = None
@@ -831,8 +833,14 @@ class FineTuningTrainer:
         logger.info(
             f"number of trainable parameters: {sum(p.numel() for p in trainable_params) / 1e6} M, total paramters: {sum(p.numel() for p in total_params) / 1e6} M"
         )
+
+        # Parse optimizer args using utility function
+        optimizer_kwargs = {}
+        if parse_optimizer_args_list is not None and args.optimizer_args is not None:
+            optimizer_kwargs = parse_optimizer_args_list(args.optimizer_args)
+
         optimizer_name, optimizer_args, optimizer, optimizer_train_fn, optimizer_eval_fn = self.get_optimizer(
-            args, trainable_params
+            args, trainable_params, optimizer_kwargs=optimizer_kwargs
         )
 
         # prepare dataloader
