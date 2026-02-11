@@ -605,6 +605,7 @@ class LTX2SliderTrainer:
         sample_parameters,
         dit_dtype: torch.dtype,
         global_step: int,
+        epoch: int = 0,
     ) -> None:
         """Generate preview samples at multiple slider strengths."""
         if sample_parameters is None:
@@ -621,7 +622,7 @@ class LTX2SliderTrainer:
             args.output_name = f"{original_name}_mult{mult:+.1f}"
 
             self._net_trainer.sample_images(
-                accelerator, args, None, global_step, vae, transformer, sample_parameters, dit_dtype
+                accelerator, args, epoch, global_step, vae, transformer, sample_parameters, dit_dtype
             )
 
             args.output_name = original_name
@@ -989,7 +990,7 @@ class LTX2SliderTrainer:
         # Sample at first if requested
         if should_sample_images(args, 0, epoch=current_epoch):
             optimizer_eval_fn()
-            self._sample_slider(accelerator, args, transformer, vae, accelerator.unwrap_model(network), sample_parameters, dit_dtype, 0)
+            self._sample_slider(accelerator, args, transformer, vae, accelerator.unwrap_model(network), sample_parameters, dit_dtype, 0, current_epoch)
             optimizer_train_fn()
 
         ref_iter = None
@@ -1039,6 +1040,11 @@ class LTX2SliderTrainer:
                         current_epoch += 1
                         steps_in_current_epoch = 0
                         logger.info("Completed epoch %d, starting epoch %d", epoch_completed, current_epoch)
+
+                        # Log epoch-level metrics to tensorboard
+                        if len(accelerator.trackers) > 0:
+                            logs = {"loss/epoch": loss_recorder.moving_average}
+                            accelerator.log(logs, step=epoch_completed + 1)
 
                         # Check if we should save after completing this epoch
                         if (getattr(args, "save_every_n_epochs", None) is not None
@@ -1099,7 +1105,7 @@ class LTX2SliderTrainer:
                 if should_sampling:
                     self._sample_slider(
                         accelerator, args, transformer, vae,
-                        accelerator.unwrap_model(network), sample_parameters, dit_dtype, global_step,
+                        accelerator.unwrap_model(network), sample_parameters, dit_dtype, global_step, current_epoch,
                     )
 
                 if should_saving_steps:
