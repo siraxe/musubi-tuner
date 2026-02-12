@@ -547,7 +547,7 @@ class NetworkTrainer:
 
         lrs = lr_scheduler.get_last_lr()
         for i, lr in enumerate(lrs):
-            if lr_descriptions is not None:
+            if lr_descriptions is not None and i < len(lr_descriptions):
                 lr_desc = lr_descriptions[i]
             else:
                 idx = i - (0 if network_train_unet_only else 1)
@@ -578,6 +578,11 @@ class NetworkTrainer:
                 actual_optimizer = optimizer.optimizer if hasattr(optimizer, "optimizer") else optimizer
                 if hasattr(actual_optimizer, "get_avg_learning_rate"):
                     logs[f"lr/automagic_avg"] = actual_optimizer.get_avg_learning_rate()
+                lr_tensor = actual_optimizer.get_lr_tensor()
+                if lr_tensor is not None and len(lr_tensor) > 1:
+                    logs["lr/automagic_min"] = float(lr_tensor.min())
+                    logs["lr/automagic_max"] = float(lr_tensor.max())
+                    logs["lr/automagic_std"] = float(lr_tensor.std())
 
         return logs
 
@@ -3049,6 +3054,19 @@ class NetworkTrainer:
                     if pres_losses:
                         logs.update(pres_losses)
                     accelerator.log(logs, step=global_step)
+
+                    # Log automagic LR histogram directly to tracker
+                    if args.optimizer_type.lower() == "automagic" and optimizer is not None:
+                        actual_optimizer = optimizer.optimizer if hasattr(optimizer, "optimizer") else optimizer
+                        if hasattr(actual_optimizer, "get_lr_tensor"):
+                            lr_tensor = actual_optimizer.get_lr_tensor()
+                            if lr_tensor is not None and lr_tensor.mean() > 0:
+                                for tracker in accelerator.trackers:
+                                    if tracker.name == "tensorboard":
+                                        tracker.writer.add_histogram("lr/automagic_lrs", lr_tensor, global_step)
+                                    elif tracker.name == "wandb":
+                                        import wandb
+                                        tracker.log({"lr/automagic_lrs": wandb.Histogram(lr_tensor.cpu().numpy())}, step=global_step)
 
                 if gui_metrics is not None:
                     _step_elapsed = time.perf_counter() - _step_start_time
