@@ -2485,6 +2485,13 @@ class NetworkTrainer:
             # Call post-save hook for architecture-specific processing
             self.post_save_checkpoint_hook(args, ckpt_file, ckpt_name, accelerator, force_sync_upload)
 
+            # Dynamic state saving: check for save_state.txt indicator file
+            save_state_indicator = os.path.join(args.output_dir, "save_state.txt")
+            if os.path.exists(save_state_indicator):
+                state_dir = os.path.join(args.output_dir, f"{args.output_name}-step{steps:08d}-state")
+                accelerator.print(f"save_state.txt found - saving full state to: {state_dir}")
+                accelerator.save_state(state_dir)
+
             if args.huggingface_repo_id is not None:
                 huggingface_utils.upload(args, ckpt_file, "/" + ckpt_name, force_sync_upload=force_sync_upload)
 
