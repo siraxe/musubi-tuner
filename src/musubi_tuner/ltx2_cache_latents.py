@@ -106,10 +106,19 @@ def encode_and_save_batch(vae, batch: List[ItemInfo], tiling_config=None) -> Non
             latents = vae.tiled_encode(contents, tiling_config)
         else:
             latents = vae(contents)
-        latents = latents.to(device=device, dtype=vae_dtype)
+        # Move to CPU immediately to free GPU memory
+        latents = latents.cpu().to(dtype=vae_dtype)
+
+    # Free GPU memory from input tensor
+    del contents
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
 
     for idx, item in enumerate(batch):
         save_latent_cache_ltx2(item, latents[idx])
+
+    # Free CPU latent tensor after saving
+    del latents
 
 
 def save_dummy_latent_cache_ltx2(item: ItemInfo, *, channels: int, dtype: torch.dtype) -> None:

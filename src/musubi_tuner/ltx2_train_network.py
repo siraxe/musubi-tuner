@@ -1911,17 +1911,29 @@ class LTX2NetworkTrainer(NetworkTrainer):
             sigma_audio = sigma.view(-1, 1, 1, 1)
             noisy_audio = (1.0 - sigma_audio) * audio_latents + sigma_audio * audio_noise
 
-            dummy_video = torch.zeros(
-                (latents.shape[0], latents.shape[1], 1, 1, 1),
-                device=accelerator.device,
-                dtype=network_dtype,
+            # Check if real video latents are available (not dummy 1x1x1 or all zeros)
+            # If available, use them to train video_to_audio_attn cross-attention
+            has_real_video = (
+                latents.shape[2] > 1 or  # T > 1
+                latents.shape[3] > 1 or  # H > 1
+                latents.shape[4] > 1     # W > 1
             )
+            if has_real_video:
+                video_latents_for_audio = latents.to(device=accelerator.device, dtype=network_dtype)
+                print("\033[92m[Audio Mode] Using real video latents for cross-attention training (video_to_audio_attn)\033[0m")
+            else:
+                # Fall back to dummy zeros if no real video latents
+                video_latents_for_audio = torch.zeros(
+                    (latents.shape[0], latents.shape[1], 1, 1, 1),
+                    device=accelerator.device,
+                    dtype=network_dtype,
+                )
 
             if getattr(args, "fp8_base", False) or getattr(args, "fp8_scaled", False):
                 self._ensure_fp8_buffers_on_device(transformer)
             with accelerator.autocast():
                 model_pred = transformer(
-                    [dummy_video, noisy_audio],
+                    [video_latents_for_audio, noisy_audio],
                     timestep=model_timesteps,
                     context=text_embeds,
                     attention_mask=text_mask,
