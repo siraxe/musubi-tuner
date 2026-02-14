@@ -82,6 +82,10 @@ class VideoDatasetParams(BaseDatasetParams):
     # FramePack dependent parameters
     fp_latent_window_size: Optional[int] = 9
 
+    # Spatial ROI masking parameters
+    enable_mask: bool = False                     # Enable spatial ROI masking
+    default_mask_file: Optional[str] = None      # Fallback mask file for missing masks (auto-detects mask/ subdirectory if not set)
+
 
 @dataclass
 class AudioDatasetParams(BaseDatasetParams):
@@ -166,6 +170,8 @@ class ConfigSanitizer:
         "source_fps": float,
         "target_fps": float,
         "fp_latent_window_size": int,
+        "enable_mask": bool,
+        "default_mask_file": str,
     }
 
     # options handled by argparse but not handled by user config
@@ -403,6 +409,19 @@ def generate_dataset_group_by_blueprint(
                 "    ",
             )
     logger.info(f"{info}")
+
+    # Log mask information for video datasets
+    total_masked = 0
+    for dataset in datasets:
+        if isinstance(dataset, VideoDataset):
+            if hasattr(dataset, 'datasource') and hasattr(dataset.datasource, 'has_mask'):
+                if dataset.datasource.has_mask:
+                    mask_count = len(dataset.datasource.mask_paths)
+                    total_masked += mask_count
+
+    if total_masked > 0:
+        from loguru import logger as loguru_logger
+        loguru_logger.success(f"[Spatial Masking] {total_masked} video(s) will use spatial ROI masks from mask/ directory")
 
     # make buckets first because it determines the length of dataset
     # and set the same seed for all datasets

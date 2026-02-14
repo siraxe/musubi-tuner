@@ -223,6 +223,10 @@ class ItemInfo:
         self.fp_1f_target_index: Optional[int] = None  # target index for 1f clean latents
         self.fp_1f_no_post: Optional[bool] = None  # whether to add zero values as clean latent post
 
+        # Spatial ROI masking
+        self.mask_path: Optional[str] = None  # Path to mask file for this item
+        self.mask_cache_path: Optional[str] = None  # Path to cached preprocessed mask
+
     def __str__(self) -> str:
         return (
             f"ItemInfo(item_key={self.item_key}, caption={self.caption}, "
@@ -289,6 +293,72 @@ def save_latent_cache_ltx2(item_info: ItemInfo, latent: torch.Tensor):
     dtype_str = dtype_to_str(latent.dtype)
     sd = {f"latents_{F}x{H}x{W}_{dtype_str}": latent.detach().cpu().contiguous()}
 
+    save_latent_cache_common(item_info, sd, ARCHITECTURE_LTX2_FULL)
+
+
+def preprocess_mask(
+    mask_path: str,
+    latent_shape: tuple[int, ...],  # (C, F, H, W) or (F, H, W) or (H, W)
+    target_dtype: torch.dtype = torch.float16,
+) -> torch.Tensor:
+    """
+    Preprocess a mask image for spatial ROI masking.
+
+    Args:
+        mask_path: Path to mask image file
+        latent_shape: Target shape in latent space (will be resized to match spatial dimensions)
+        target_dtype: Target dtype for the mask tensor
+
+    Returns:
+        Preprocessed mask tensor in latent space
+    """
+    from PIL import Image
+    import torchvision.transforms.functional as TF
+
+    # Load mask image
+    mask_img = Image.open(mask_path).convert('RGB')
+
+    # Get target spatial dimensions from latent shape
+    if len(latent_shape) == 4:  # (C, F, H, W)
+        _, _, latent_h, latent_w = latent_shape
+    elif len(latent_shape) == 3:  # (F, H, W)
+        _, latent_h, latent_w = latent_shape
+    elif len(latent_shape) == 2:  # (H, W)
+        latent_h, latent_w = latent_shape
+    else:
+        raise ValueError(f"Unsupported latent shape: {latent_shape}")
+
+    # Resize mask to latent spatial dimensions using bicubic interpolation
+    # LTX VAE typically has 8x spatial compression
+    mask_resized = TF.resize(mask_img, [latent_h * 8, latent_w * 8], interpolation=TF.InterpolationMode.BICUBIC)
+
+    # Convert to tensor and take first channel (RGB -> single channel)
+    mask_tensor = TF.to_tensor(mask_resized)[0].to(target_dtype)  # (H * 8, W * 8)
+
+    # Downsample to latent dimensions using averaging
+    # This matches the VAE's spatial compression
+    mask_tensor = mask_tensor.view(1, 1, latent_h * 8, latent_w * 8)
+    mask_tensor = torch.nn.functional.avg_pool2d(mask_tensor, kernel_size=8, stride=8)
+    mask_tensor = mask_tensor.squeeze()  # (latent_h, latent_w)
+
+    return mask_tensor
+
+
+def save_mask_cache(item_info: ItemInfo, mask: torch.Tensor):
+    """
+    Save preprocessed mask to cache.
+
+    Args:
+        item_info: ItemInfo object containing metadata
+        mask: Preprocessed mask tensor (H, W) in latent space
+    """
+    assert mask.dim() == 2, f"mask should be 2D tensor (H, W), got shape {mask.shape}"
+
+    H, W = mask.shape
+    dtype_str = dtype_to_str(mask.dtype)
+    sd = {f"mask_{H}x{W}_{dtype_str}": mask.detach().cpu().contiguous()}
+
+    # Use the same cache path format as latents but with _mask suffix
     save_latent_cache_common(item_info, sd, ARCHITECTURE_LTX2_FULL)
 
 
@@ -844,7 +914,8 @@ def load_video(
                 detected = stream.average_rate or stream.base_rate
                 if detected and float(detected) > 0:
                     source_fps = float(detected)
-                    logger.info(f"Auto-detected source FPS: {source_fps:.2f} for {os.path.basename(video_path)}")
+                    # Keep this at debug level to avoid per-file log spam.
+                    logger.debug(f"Auto-detected source FPS: {source_fps:.2f} for {os.path.basename(video_path)}")
         except Exception:
             pass  # detection failed, fall through to no-conversion branch
 
@@ -975,7 +1046,7 @@ class BucketBatchManager:
         batch_size: int,
         num_timestep_buckets: Optional[int] = None,
         architecture: Optional[str] = None,
-        target_fps: float = 24.0,
+        target_fps: float = 25.0,
     ):
         self.batch_size = batch_size
         self.buckets = bucketed_item_info
@@ -1063,6 +1134,7 @@ class BucketBatchManager:
         latent_cache_paths = []
         audio_cache_paths = []
         text_cache_paths = []
+        spatial_masks = []  # List to hold masks for each item
         for item_info in bucket[start:end]:
             sd_latent = load_file(item_info.latent_cache_path)
             audio_latent_cache_path = getattr(item_info, "audio_latent_cache_path", None)
@@ -1092,6 +1164,36 @@ class BucketBatchManager:
 
             sd_te = load_file(item_info.text_encoder_output_cache_path)
             sd = {**sd_latent, **sd_te}
+
+            # Load or preprocess spatial mask
+            item_mask = None
+            if getattr(item_info, "mask_path", None) is not None:
+                # Try to load from cache first
+                mask_cache_path = getattr(item_info, "mask_cache_path", None)
+                if mask_cache_path is not None and os.path.exists(mask_cache_path):
+                    sd_mask = load_file(mask_cache_path)
+                    # Find the mask tensor (keys are like "mask_HxW_float16")
+                    mask_key = next((k for k in sd_mask.keys() if k.startswith("mask_")), None)
+                    if mask_key is not None:
+                        item_mask = sd_mask[mask_key]
+                else:
+                    # Preprocess mask on-the-fly and cache it
+                    try:
+                        from .image_video_dataset import preprocess_mask, save_mask_cache
+                        # Get latent shape from sd_latent
+                        latent_key = next((k for k in sd_latent.keys() if k.startswith("latents_")), None)
+                        if latent_key is not None:
+                            latent = sd_latent[latent_key]
+                            # Preprocess mask to match latent spatial dimensions
+                            item_mask = preprocess_mask(item_info.mask_path, latent.shape)
+                            # Cache the preprocessed mask
+                            item_info.mask_cache_path = item_info.latent_cache_path.replace(f"_{self.architecture}.safetensors", f"_mask_{self.architecture}.safetensors")
+                            save_mask_cache(item_info, item_mask)
+                    except Exception as e:
+                        logger.warning(f"Failed to load or preprocess mask for {item_info.item_key}: {e}")
+                        item_mask = None
+
+            spatial_masks.append(item_mask)
 
             item_audio_latents = None
             item_audio_lengths = None
@@ -1201,6 +1303,16 @@ class BucketBatchManager:
             else:
                 # Skip allocating placeholder audio tensors when the batch has no audio.
                 pass
+
+        # Add spatial masks to batch
+        # Stack masks if any exist in the batch
+        valid_masks = [m for m in spatial_masks if m is not None]
+        if valid_masks:
+            # All masks should have the same shape (H, W)
+            batch_tensor_data["spatial_mask"] = torch.stack(valid_masks)
+        else:
+            # No masks in this batch
+            batch_tensor_data["spatial_mask"] = None
 
         if self.timestep_pool is not None:
             batch_tensor_data["timesteps"] = self.timestep_pool[idx][: end - start]  # use the pre-generated timesteps
@@ -1876,11 +1988,20 @@ class VideoDatasource(ContentDatasource):
 
 
 class VideoDirectoryDatasource(VideoDatasource):
-    def __init__(self, video_directory: str, caption_extension: Optional[str] = None, control_directory: Optional[str] = None):
+    def __init__(
+        self,
+        video_directory: str,
+        caption_extension: Optional[str] = None,
+        control_directory: Optional[str] = None,
+        enable_mask: bool = False,
+        default_mask_file: Optional[str] = None,
+    ):
         super().__init__()
         self.video_directory = video_directory
         self.caption_extension = caption_extension
         self.control_directory = control_directory  # 新しく追加: コントロール画像ディレクトリ
+        self.enable_mask = enable_mask
+        self.default_mask_file = default_mask_file
         self.current_idx = 0
 
         # glob videos
@@ -1928,6 +2049,59 @@ class VideoDirectoryDatasource(VideoDatasource):
                 )
                 raise ValueError(f"Could not find matching control videos/images for {missing_controls} videos")
 
+        # Spatial ROI masking: auto-detect mask/ subdirectory
+        self.mask_directory = None
+        self.mask_paths = {}
+        self.has_mask = False
+
+        # Check for mask subdirectory in video directory
+        potential_mask_dir = os.path.join(self.video_directory, "mask")
+        if os.path.isdir(potential_mask_dir):
+            self.mask_directory = potential_mask_dir
+            logger.info(f"Found mask subdirectory: {self.mask_directory}")
+        elif self.default_mask_file and os.path.exists(self.default_mask_file):
+            # Use default mask file as fallback
+            self.mask_directory = os.path.dirname(self.default_mask_file)
+            logger.info(f"Using default_mask_file directory: {self.mask_directory}")
+
+        # Always enable masking if mask/ subdirectory was auto-detected
+        # (training controls whether to actually use the masks via --ltx2_enable_mask)
+        if self.mask_directory is not None:
+            self.has_mask = True
+            self.mask_paths = {}
+
+            if self.mask_directory is not None:
+                # Glob mask files (PNG, JPG, etc.)
+                mask_extensions = ['.png', '.jpg', '.jpeg', '.PNG', '.JPG', '.JPEG']
+                for video_path in self.video_paths:
+                    video_stem = os.path.splitext(os.path.basename(video_path))[0]
+                    mask_path = None
+
+                    # Try to find mask with same stem
+                    for ext in mask_extensions:
+                        potential_mask = os.path.join(self.mask_directory, video_stem + ext)
+                        if os.path.exists(potential_mask):
+                            mask_path = potential_mask
+                            break
+
+                    if mask_path:
+                        self.mask_paths[video_path] = mask_path
+
+                logger.info(f"Found {len(self.mask_paths)} matching mask files")
+
+                # If default_mask_file is provided, use it for videos without specific masks
+                if self.default_mask_file and os.path.exists(self.default_mask_file):
+                    videos_without_masks = [vp for vp in self.video_paths if vp not in self.mask_paths]
+                    for video_path in videos_without_masks:
+                        self.mask_paths[video_path] = self.default_mask_file
+                    logger.info(f"Using default_mask_file for {len(videos_without_masks)} videos")
+
+            elif self.default_mask_file and os.path.exists(self.default_mask_file):
+                # Only default_mask_file provided, use it for all videos
+                for video_path in self.video_paths:
+                    self.mask_paths[video_path] = self.default_mask_file
+                logger.info(f"Using default_mask_file for all {len(self.video_paths)} videos")
+
     def is_indexable(self):
         return True
 
@@ -1940,7 +2114,7 @@ class VideoDirectoryDatasource(VideoDatasource):
         start_frame: Optional[int] = None,
         end_frame: Optional[int] = None,
         bucket_selector: Optional[BucketSelector] = None,
-    ) -> tuple[str, list[Image.Image], str, Optional[list[Image.Image]]]:
+    ) -> tuple[str, list[Image.Image], str, Optional[list[Image.Image]], Optional[str]]:
         video_path = self.video_paths[idx]
         video = self.get_video_data_from_path(video_path, start_frame, end_frame, bucket_selector)
 
@@ -1951,7 +2125,10 @@ class VideoDirectoryDatasource(VideoDatasource):
             control_path = self.control_paths[video_path]
             control = self.get_control_data_from_path(control_path, start_frame, end_frame, bucket_selector)
 
-        return video_path, video, caption, control
+        # Get mask path if available
+        mask_path = self.mask_paths.get(video_path) if self.has_mask else None
+
+        return video_path, video, caption, control, mask_path
 
     def get_caption(self, idx: int) -> tuple[str, str]:
         video_path = self.video_paths[idx]
@@ -2821,7 +2998,7 @@ class AudioDataset(BaseDataset):
 class VideoDataset(BaseDataset):
     TARGET_FPS_HUNYUAN = 24.0
     TARGET_FPS_WAN = 16.0
-    TARGET_FPS_LTX2 = 24.0
+    TARGET_FPS_LTX2 = 25.0
     TARGET_FPS_FRAMEPACK = 30.0
     TARGET_FPS_FLUX_KONTEXT = 1.0  # VideoDataset is not used for Flux Kontext, but this is a placeholder
     TARGET_FPS_HUNYUAN_VIDEO_1_5 = 24.0
@@ -2854,6 +3031,8 @@ class VideoDataset(BaseDataset):
         min_ar: float = 0.5,
         max_ar: float = 2.0,
         num_ar_buckets: int = 2,
+        enable_mask: bool = False,
+        default_mask_file: Optional[str] = None,
     ):
         super(VideoDataset, self).__init__(
             resolution,
@@ -2881,6 +3060,8 @@ class VideoDataset(BaseDataset):
         self.max_frames = max_frames
         self.source_fps = source_fps
         self.fp_latent_window_size = fp_latent_window_size
+        self.enable_mask = enable_mask
+        self.default_mask_file = default_mask_file
 
         self.vae_frame_stride = 4  # all architectures require frames to be divisible by 4
         if self.architecture == ARCHITECTURE_HUNYUAN_VIDEO:
@@ -2918,7 +3099,7 @@ class VideoDataset(BaseDataset):
         self.target_frames = target_frames
 
         if video_directory is not None:
-            self.datasource = VideoDirectoryDatasource(video_directory, caption_extension, control_directory)
+            self.datasource = VideoDirectoryDatasource(video_directory, caption_extension, control_directory, enable_mask, default_mask_file)
         elif video_jsonl_file is not None:
             self.datasource = VideoJsonlDatasource(video_jsonl_file)
 
@@ -2935,6 +3116,7 @@ class VideoDataset(BaseDataset):
         self.batch_manager = None
         self.num_train_items = 0
         self.has_control = self.datasource.has_control
+        self.has_mask = getattr(self.datasource, "has_mask", False)
 
     def get_metadata(self):
         metadata = super().get_metadata()
@@ -2951,6 +3133,9 @@ class VideoDataset(BaseDataset):
         metadata["max_frames"] = self.max_frames
         metadata["source_fps"] = self.source_fps
         metadata["has_control"] = self.has_control
+        metadata["has_mask"] = self.has_mask
+        metadata["enable_mask"] = self.enable_mask
+        metadata["default_mask_file"] = self.default_mask_file
         return metadata
 
     def retrieve_latent_cache_batches(self, num_workers: int):
@@ -2984,7 +3169,7 @@ class VideoDataset(BaseDataset):
                         break  # submit batch if possible
 
                 for future in completed_futures:
-                    original_frame_size, video_key, video, caption, control = future.result()
+                    original_frame_size, video_key, video, caption, control, mask_path = future.result()
 
                     frame_count = len(video)
                     video = np.stack(video, axis=0)
@@ -3058,6 +3243,7 @@ class VideoDataset(BaseDataset):
                         item_info.chunk_start_frame = crop_pos
                         item_info.chunk_num_frames = target_frame
                         item_info.latent_cache_path = self.get_latent_cache_path(item_info)
+                        item_info.mask_path = mask_path  # Spatial ROI mask path
 
                         if self.reference_cache_directory is not None:
                             item_info.reference_latent_cache_path = self.get_reference_latent_cache_path(item_info)
@@ -3083,14 +3269,18 @@ class VideoDataset(BaseDataset):
 
         for operator in self.datasource:
 
-            def fetch_and_resize(op: callable) -> tuple[tuple[int, int], str, list[np.ndarray], str, Optional[list[np.ndarray]]]:
+            def fetch_and_resize(op: callable) -> tuple[tuple[int, int], str, list[np.ndarray], str, Optional[list[np.ndarray]], Optional[str]]:
                 result = op()
 
                 if len(result) == 3:  # for backward compatibility TODO remove this in the future
                     video_key, video, caption = result
                     control = None
-                else:
+                    mask_path = None
+                elif len(result) == 4:
                     video_key, video, caption, control = result
+                    mask_path = None
+                else:
+                    video_key, video, caption, control, mask_path = result
 
                 video: list[np.ndarray]
                 frame_size = (video[0].shape[1], video[0].shape[0])
@@ -3103,7 +3293,7 @@ class VideoDataset(BaseDataset):
                 if control is not None:
                     control = [resize_image_to_bucket(frame, bucket_reso) for frame in control]
 
-                return frame_size, video_key, video, caption, control
+                return frame_size, video_key, video, caption, control, mask_path
 
             future = executor.submit(fetch_and_resize, operator)
             futures.append(future)

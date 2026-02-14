@@ -6,9 +6,10 @@ import json
 import math
 import os
 import random
+import re
 import time
 from multiprocessing import Value
-from typing import Optional
+from typing import Any, Optional
 
 import toml
 import torch
@@ -40,6 +41,14 @@ import logging
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
+
+
+def _is_attention_geometry_param(param_name: str) -> bool:
+    # Attention geometry parameters most tied to motion priors.
+    return re.search(
+        r"(?:^|\.)(?:attn\d+|audio_attn\d+|audio_to_video_attn|video_to_audio_attn)\.(?:to_q|to_k|q_norm|k_norm)\.",
+        param_name,
+    ) is not None
 
 
 class EMAModel:
@@ -194,6 +203,220 @@ def _masked_mse(
     return (per_elem * mask_f).div(denom).mean()
 
 
+def _clone_to_cpu(value: Any) -> Any:
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().clone()
+    if isinstance(value, dict):
+        return {k: _clone_to_cpu(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_clone_to_cpu(v) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_clone_to_cpu(v) for v in value)
+    return copy.deepcopy(value)
+
+
+def _move_to_device(value: Any, device: torch.device, *, dtype: Optional[torch.dtype] = None) -> Any:
+    if isinstance(value, torch.Tensor):
+        out = value.to(device=device)
+        if dtype is not None and out.dtype.is_floating_point:
+            out = out.to(dtype=dtype)
+        return out
+    if isinstance(value, dict):
+        return {k: _move_to_device(v, device, dtype=dtype) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_move_to_device(v, device, dtype=dtype) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_move_to_device(v, device, dtype=dtype) for v in value)
+    return value
+
+
+def _fused_step_pending_grads(
+    optimizer: Any,
+    accelerator: Accelerator,
+    max_grad_norm: float,
+) -> None:
+    """Run one fused-style parameter step for any pending grads.
+
+    Used when fused backward hooks defer stepping on the first backward pass
+    and no second backward pass happens.
+    """
+    for param_group in optimizer.param_groups:
+        for parameter in param_group.get("params", []):
+            if parameter is None or parameter.grad is None:
+                continue
+            if accelerator.sync_gradients and max_grad_norm != 0.0:
+                accelerator.clip_grad_norm_(parameter, max_grad_norm)
+            optimizer.step_param(parameter, param_group)
+            parameter.grad = None
+
+
+def _parse_block_index_spec(spec: Optional[str]) -> set[int]:
+    if not spec:
+        return set()
+
+    out: set[int] = set()
+    for raw in spec.split(","):
+        token = raw.strip()
+        if not token:
+            continue
+        if "-" in token:
+            start_s, end_s = token.split("-", 1)
+            start = int(start_s.strip())
+            end = int(end_s.strip())
+            if end < start:
+                raise ValueError(f"Invalid block range in freeze_block_indices: {token!r}")
+            out.update(range(start, end + 1))
+        else:
+            out.add(int(token))
+    return out
+
+
+def _parse_block_lr_rules(specs: Optional[list[str]]) -> list[tuple[int, Optional[int], float]]:
+    if not specs:
+        return []
+
+    rules: list[tuple[int, Optional[int], float]] = []
+    for raw in specs:
+        text = raw.strip()
+        if not text:
+            continue
+        if ":" not in text:
+            raise ValueError(f"Invalid block_lr_scales entry {text!r}. Expected format like 0-11:0.1")
+
+        range_part, scale_part = text.split(":", 1)
+        scale = float(scale_part.strip())
+        if scale < 0.0:
+            raise ValueError(f"block_lr_scales must use non-negative scales, got {scale} in {text!r}")
+
+        range_part = range_part.strip()
+        if "-" in range_part:
+            start_s, end_s = range_part.split("-", 1)
+            start = int(start_s.strip())
+            end_raw = end_s.strip()
+            end: Optional[int] = None if end_raw == "" else int(end_raw)
+            if end is not None and end < start:
+                raise ValueError(f"Invalid block_lr_scales range {range_part!r} in {text!r}")
+            rules.append((start, end, scale))
+        else:
+            idx = int(range_part)
+            rules.append((idx, idx, scale))
+    return rules
+
+
+def _extract_transformer_block_index(param_name: str) -> Optional[int]:
+    # Works for both "transformer_blocks.X.*" and "model.transformer_blocks.X.*".
+    match = re.search(r"(?:^|\.)(?:model\.)?transformer_blocks\.(\d+)\.", param_name)
+    if match is None:
+        return None
+    return int(match.group(1))
+
+
+def _resolve_block_lr_scale(block_index: int, rules: list[tuple[int, Optional[int], float]]) -> Optional[float]:
+    for start, end, scale in rules:
+        if end is None:
+            if block_index >= start:
+                return scale
+        elif start <= block_index <= end:
+            return scale
+    return None
+
+
+def _build_full_ft_param_groups(
+    transformer: torch.nn.Module,
+    base_lr: float,
+    *,
+    freeze_early_blocks: int,
+    freeze_block_indices_spec: Optional[str],
+    block_lr_scales_spec: Optional[list[str]],
+    non_block_lr_scale: float,
+    attn_geometry_lr_scale: float,
+    freeze_attn_geometry: bool,
+) -> tuple[list[dict[str, Any]], list[list[str]], dict[str, Any]]:
+    if base_lr <= 0:
+        raise ValueError(f"learning_rate must be > 0 for full fine-tune, got {base_lr}")
+    if freeze_early_blocks < 0:
+        raise ValueError("freeze_early_blocks must be >= 0")
+    if non_block_lr_scale < 0.0:
+        raise ValueError("non_block_lr_scale must be >= 0")
+    if attn_geometry_lr_scale < 0.0:
+        raise ValueError("attn_geometry_lr_scale must be >= 0")
+
+    block_lr_rules = _parse_block_lr_rules(block_lr_scales_spec)
+    frozen_blocks = set(range(freeze_early_blocks))
+    frozen_blocks.update(_parse_block_index_spec(freeze_block_indices_spec))
+
+    grouped_params: dict[float, list[torch.nn.Parameter]] = {}
+    grouped_names: dict[float, list[str]] = {}
+    frozen_param_count = 0
+    trainable_param_count = 0
+    frozen_attn_geometry_count = 0
+    trainable_attn_geometry_count = 0
+    trainable_by_block: dict[str, int] = {}
+
+    for name, param in transformer.named_parameters():
+        if not param.requires_grad:
+            continue
+
+        block_index = _extract_transformer_block_index(name)
+        if block_index is not None and block_index in frozen_blocks:
+            param.requires_grad_(False)
+            frozen_param_count += 1
+            if _is_attention_geometry_param(name):
+                frozen_attn_geometry_count += 1
+            continue
+
+        if block_index is None:
+            scale = float(non_block_lr_scale)
+        else:
+            scale = _resolve_block_lr_scale(block_index, block_lr_rules)
+            if scale is None:
+                scale = 1.0
+            trainable_by_block[str(block_index)] = trainable_by_block.get(str(block_index), 0) + 1
+
+        is_attn_geometry = _is_attention_geometry_param(name)
+        if is_attn_geometry:
+            if freeze_attn_geometry:
+                param.requires_grad_(False)
+                frozen_param_count += 1
+                frozen_attn_geometry_count += 1
+                continue
+            scale *= float(attn_geometry_lr_scale)
+
+        if scale <= 0.0:
+            param.requires_grad_(False)
+            frozen_param_count += 1
+            if is_attn_geometry:
+                frozen_attn_geometry_count += 1
+            continue
+
+        grouped_params.setdefault(scale, []).append(param)
+        grouped_names.setdefault(scale, []).append(name)
+        trainable_param_count += 1
+        if is_attn_geometry:
+            trainable_attn_geometry_count += 1
+
+    if trainable_param_count == 0:
+        raise ValueError("No trainable parameters remain after freeze/lr-scale settings.")
+
+    # Keep order deterministic by scale value.
+    scales = sorted(grouped_params.keys())
+    param_groups = [{"params": grouped_params[s], "lr": base_lr * s} for s in scales]
+    param_name_groups = [grouped_names[s] for s in scales]
+
+    stats = {
+        "frozen_param_count": frozen_param_count,
+        "trainable_param_count": trainable_param_count,
+        "num_lr_groups": len(scales),
+        "lr_scales": scales,
+        "frozen_blocks": sorted(frozen_blocks),
+        "block_lr_rules": block_lr_rules,
+        "trainable_by_block": trainable_by_block,
+        "frozen_attn_geometry_count": frozen_attn_geometry_count,
+        "trainable_attn_geometry_count": trainable_attn_geometry_count,
+    }
+    return param_groups, param_name_groups, stats
+
+
 def ltx2_finetune_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     parser.add_argument(
         "--fused_backward_pass",
@@ -267,6 +490,47 @@ def ltx2_finetune_setup_parser(parser: argparse.ArgumentParser) -> argparse.Argu
         default=None,
         help="Number of validation batches to use (None = all)",
     )
+    parser.add_argument(
+        "--freeze_early_blocks",
+        type=int,
+        default=0,
+        help="Freeze transformer blocks [0, N) during full fine-tuning to protect base motion priors.",
+    )
+    parser.add_argument(
+        "--freeze_block_indices",
+        type=str,
+        default=None,
+        help="Additional comma-separated block indices/ranges to freeze, e.g. 0-7,10,12-15.",
+    )
+    parser.add_argument(
+        "--block_lr_scales",
+        type=str,
+        nargs="*",
+        default=None,
+        help=(
+            "Per-block LR scale rules for full fine-tuning. "
+            "Format: start-end:scale, start-:scale, or idx:scale. "
+            "Examples: 0-11:0.1 12-23:0.4 24-:1.0"
+        ),
+    )
+    parser.add_argument(
+        "--non_block_lr_scale",
+        type=float,
+        default=1.0,
+        help="LR scale for non-transformer-block parameters in full fine-tuning.",
+    )
+    parser.add_argument(
+        "--attn_geometry_lr_scale",
+        type=float,
+        default=1.0,
+        help="Additional LR scale for attention geometry params (to_q/to_k/q_norm/k_norm).",
+    )
+    parser.add_argument(
+        "--freeze_attn_geometry",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Freeze attention geometry params (to_q/to_k/q_norm/k_norm) during full fine-tuning.",
+    )
     return parser
 
 
@@ -300,6 +564,13 @@ def main() -> None:
         args.vae_dtype = "bfloat16"
 
     trainer.handle_model_specific_args(args)
+
+    if int(getattr(args, "freeze_early_blocks", 0) or 0) < 0:
+        raise ValueError("freeze_early_blocks must be >= 0")
+    if float(getattr(args, "non_block_lr_scale", 1.0) or 0.0) < 0.0:
+        raise ValueError("non_block_lr_scale must be >= 0")
+    if float(getattr(args, "attn_geometry_lr_scale", 1.0) or 0.0) < 0.0:
+        raise ValueError("attn_geometry_lr_scale must be >= 0")
 
     if args.seed is None:
         args.seed = random.randint(0, 2**32)
@@ -448,9 +719,35 @@ def main() -> None:
             )
 
     # optimizer
-    name_and_params = list(transformer.named_parameters())
-    params_to_optimize = [{"params": [p for _, p in name_and_params], "lr": args.learning_rate}]
-    param_names = [[n for n, _ in name_and_params]]
+    params_to_optimize, param_names, ft_group_stats = _build_full_ft_param_groups(
+        transformer,
+        args.learning_rate,
+        freeze_early_blocks=int(getattr(args, "freeze_early_blocks", 0) or 0),
+        freeze_block_indices_spec=getattr(args, "freeze_block_indices", None),
+        block_lr_scales_spec=getattr(args, "block_lr_scales", None),
+        non_block_lr_scale=float(getattr(args, "non_block_lr_scale", 1.0) or 0.0),
+        attn_geometry_lr_scale=float(getattr(args, "attn_geometry_lr_scale", 1.0) or 0.0),
+        freeze_attn_geometry=bool(getattr(args, "freeze_attn_geometry", False)),
+    )
+    logger.info(
+        "Full-FT parameter groups: trainable=%d frozen=%d groups=%d scales=%s",
+        ft_group_stats["trainable_param_count"],
+        ft_group_stats["frozen_param_count"],
+        ft_group_stats["num_lr_groups"],
+        ft_group_stats["lr_scales"],
+    )
+    if ft_group_stats["frozen_blocks"]:
+        logger.info("Full-FT frozen blocks: %s", ft_group_stats["frozen_blocks"])
+    if ft_group_stats["block_lr_rules"]:
+        logger.info("Full-FT block LR rules: %s", ft_group_stats["block_lr_rules"])
+    if bool(getattr(args, "freeze_attn_geometry", False)) or float(getattr(args, "attn_geometry_lr_scale", 1.0)) != 1.0:
+        logger.info(
+            "Attention geometry protection: freeze=%s lr_scale=%.4f trainable=%d frozen=%d",
+            bool(getattr(args, "freeze_attn_geometry", False)),
+            float(getattr(args, "attn_geometry_lr_scale", 1.0)),
+            int(ft_group_stats.get("trainable_attn_geometry_count", 0)),
+            int(ft_group_stats.get("frozen_attn_geometry_count", 0)),
+        )
     optimizer_name, optimizer_args, optimizer, optimizer_train_fn, optimizer_eval_fn = trainer.get_optimizer(
         args, params_to_optimize
     )
@@ -507,10 +804,12 @@ def main() -> None:
             ema_model.load_state_dict(ema_state)
             logger.info("EMA state loaded (step=%d)", ema_model.step)
 
+    fused_step_state: dict[str, bool] | None = None
     if args.fused_backward_pass:
         import musubi_tuner.modules.adafactor_fused as adafactor_fused
 
         adafactor_fused.patch_adafactor_fused(optimizer)
+        fused_step_state = {"defer_step": False}
 
         for param_group, param_name_group in zip(optimizer.param_groups, param_names):
             for parameter, param_name in zip(param_group["params"], param_name_group):
@@ -518,6 +817,8 @@ def main() -> None:
 
                     def create_grad_hook(p_name, p_group):
                         def grad_hook(tensor: torch.Tensor):
+                            if fused_step_state is not None and fused_step_state.get("defer_step", False):
+                                return
                             if accelerator.sync_gradients and args.max_grad_norm != 0.0:
                                 accelerator.clip_grad_norm_(tensor, args.max_grad_norm)
                             optimizer.step_param(tensor, p_group)
@@ -568,6 +869,14 @@ def main() -> None:
         "ss_audio_loss_weight": args.audio_loss_weight,
         "ss_use_ema": args.use_ema,
         "ss_ema_decay": args.ema_decay if args.use_ema else None,
+        "ss_freeze_early_blocks": getattr(args, "freeze_early_blocks", 0),
+        "ss_freeze_block_indices": getattr(args, "freeze_block_indices", None),
+        "ss_block_lr_scales": getattr(args, "block_lr_scales", None),
+        "ss_non_block_lr_scale": getattr(args, "non_block_lr_scale", 1.0),
+        "ss_attn_geometry_lr_scale": getattr(args, "attn_geometry_lr_scale", 1.0),
+        "ss_freeze_attn_geometry": bool(getattr(args, "freeze_attn_geometry", False)),
+        "ss_full_ft_lr_group_scales": ft_group_stats.get("lr_scales"),
+        "ss_full_ft_frozen_blocks_applied": ft_group_stats.get("frozen_blocks"),
     }
 
     datasets_metadata = []
@@ -608,6 +917,24 @@ def main() -> None:
             config=train_utils.get_sanitized_config_or_none(args),
             init_kwargs=init_kwargs,
         )
+
+    # Log full-FT block-level LR setup once so TensorBoard has explicit
+    # traces of configured scales/groups even before the first optimizer step.
+    setup_logs: dict[str, float] = {
+        "setup/frozen_param_count": float(ft_group_stats.get("frozen_param_count", 0)),
+        "setup/trainable_param_count": float(ft_group_stats.get("trainable_param_count", 0)),
+        "setup/num_lr_groups": float(ft_group_stats.get("num_lr_groups", 0)),
+        "setup/frozen_attn_geometry_count": float(ft_group_stats.get("frozen_attn_geometry_count", 0)),
+        "setup/trainable_attn_geometry_count": float(ft_group_stats.get("trainable_attn_geometry_count", 0)),
+        "setup/attn_geometry_lr_scale": float(getattr(args, "attn_geometry_lr_scale", 1.0)),
+    }
+    for i, scale in enumerate(ft_group_stats.get("lr_scales", [])):
+        setup_logs[f"setup/lr_scale/group_{i}"] = float(scale)
+    for i, group in enumerate(params_to_optimize):
+        params = list(group.get("params", []))
+        setup_logs[f"setup/group_{i}_param_count"] = float(len(params))
+        setup_logs[f"setup/group_{i}_param_numel"] = float(sum(int(p.numel()) for p in params))
+    accelerator.log(setup_logs, step=0)
 
     progress_bar = tqdm(range(args.max_train_steps), smoothing=0, disable=not accelerator.is_local_main_process, desc="steps")
 
@@ -968,6 +1295,7 @@ def main() -> None:
                     loss = loss.mean()
 
                 accelerator.backward(loss)
+                loss_for_step = loss.detach()
                 if not args.fused_backward_pass:
                     if accelerator.sync_gradients and args.max_grad_norm != 0.0:
                         accelerator.clip_grad_norm_(transformer.parameters(), args.max_grad_norm)
@@ -980,7 +1308,7 @@ def main() -> None:
             if accelerator.sync_gradients:
                 progress_bar.update(1)
                 global_step += 1
-                current_loss = loss.item()
+                current_loss = loss_for_step.item()
                 loss_recorder.add(epoch=epoch, step=step, loss=current_loss)
 
                 # Update EMA weights
@@ -990,11 +1318,21 @@ def main() -> None:
                 # Update progress bar with current metrics
                 current_lr = lr_scheduler.get_last_lr()[0] if hasattr(lr_scheduler, "get_last_lr") else args.learning_rate
                 logs = {"loss": current_loss, "lr": current_lr}
+                lr_scales = ft_group_stats.get("lr_scales", [])
+                for i, param_group in enumerate(optimizer.param_groups):
+                    lr_value = param_group.get("lr", current_lr)
+                    logs[f"lr/group_{i}"] = float(lr_value)
+                    if i < len(lr_scales):
+                        logs[f"lr_scale/group_{i}"] = float(lr_scales[i])
                 if dict_output:
                     if "video_pred" in out:
                         logs["v_loss"] = video_loss.item()
                     if audio_pred is not None:
                         logs["a_loss"] = audio_loss.item()
+                if motion_pres_loss is not None:
+                    logs["motion_pres"] = motion_pres_loss.detach().item()
+                if attn_pres_loss is not None:
+                    logs["attn_pres"] = attn_pres_loss.detach().item()
                 progress_bar.set_postfix(**logs)
                 accelerator.log(logs, step=global_step)
 

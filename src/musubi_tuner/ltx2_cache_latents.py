@@ -207,7 +207,7 @@ def encode_and_save_audio_cache(
     *,
     audio_path: str,
     dtype: torch.dtype,
-    target_fps: float = 24.0,
+    target_fps: float = 25.0,
 ) -> None:
     try:
         import torchaudio
@@ -531,11 +531,11 @@ def main() -> None:
 
     device = torch.device(args.device) if args.device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Handle I2V sample latent precaching if requested
+    # Handle I2V sample latent precaching if requested.
+    # This is additive: continue with normal dataset latent caching afterward.
     if getattr(args, "precache_sample_latents", False):
         _precache_sample_latents(args, device)
-        logger.info("I2V sample latent precaching complete")
-        return  # Exit after precaching
+        logger.info("I2V sample latent precaching complete; continuing with dataset latent caching")
 
     datasets = _load_datasets(args)
 
@@ -729,7 +729,7 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
     parser.add_argument(
         "--precache_sample_latents",
         action="store_true",
-        help="Cache I2V conditioning image latents for sample prompts.",
+        help="Cache I2V conditioning image latents for sample prompts, then continue normal dataset latent caching.",
     )
     parser.add_argument(
         "--sample_prompts",
