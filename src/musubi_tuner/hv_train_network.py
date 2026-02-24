@@ -45,6 +45,12 @@ from musubi_tuner.dataset.audio_quota_sampler import (
     split_concat_indices_by_audio,
     sync_dataset_group_epoch_without_loading,
 )
+from musubi_tuner.audio_loss_balance import (
+    compute_ema_magnitude_audio_weight,
+    compute_inverse_frequency_audio_weight,
+    update_loss_ema,
+    update_audio_presence_ema,
+)
 from musubi_tuner.modules.lr_schedulers import RexLR
 from musubi_tuner.modules.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
 import musubi_tuner.networks.lora as lora_module
@@ -515,6 +521,7 @@ class NetworkTrainer:
         self.num_timestep_buckets: Optional[int] = None  # for get_bucketed_timestep()
         self.vae_frame_stride = 4  # all architectures require frames to be divisible by 4, except Qwen-Image-Layered
         self.default_discrete_flow_shift = 14.5  # default value for discrete flow shift for all models TODO may be None is better
+        self._current_batch_latents_info: Optional[dict[str, Any]] = None
 
     # TODO 他のスクリプトと共通化する
     def generate_step_logs(
@@ -967,6 +974,12 @@ class NetworkTrainer:
         # print(f"timestep_range_pool: {self.timestep_range_pool}")
         a, b = self.timestep_range_pool.pop()
         return random.uniform(a, b)
+
+    def set_current_batch_latents_info(self, latents_info: Optional[dict[str, Any]]) -> None:
+        self._current_batch_latents_info = latents_info
+
+    def get_current_batch_latents_info(self) -> Optional[dict[str, Any]]:
+        return self._current_batch_latents_info
 
     def get_noisy_model_input_and_timesteps(
         self,
@@ -1861,8 +1874,8 @@ class NetworkTrainer:
                 logger.info("Enabled cuDNN benchmark / cuDNNベンチマークを有効化しました")
 
         # check required arguments
-        if args.dataset_config is None:
-            raise ValueError("dataset_config is required / dataset_configが必要です")
+        if args.dataset_config is None and getattr(args, "dataset_manifest", None) is None:
+            raise ValueError("dataset_config or dataset_manifest is required / dataset_configまたはdataset_manifestが必要です")
         if args.dit is None:
             raise ValueError("path to DiT model is required / DiTモデルのパスが必要です")
         assert not args.fp8_scaled or args.fp8_base, "fp8_scaled requires fp8_base / fp8_scaledはfp8_baseが必要です"
@@ -1897,6 +1910,35 @@ class NetworkTrainer:
 
         loss_diag_enabled = os.getenv("LTX2_LOSS_DIAG", "0") == "1"
         loss_diag_every = int(os.getenv("LTX2_LOSS_DIAG_EVERY", "10"))
+        audio_loss_balance_mode = str(getattr(args, "audio_loss_balance_mode", "none") or "none").lower()
+        audio_loss_balance_beta = float(getattr(args, "audio_loss_balance_beta", 0.01))
+        audio_loss_balance_eps = float(getattr(args, "audio_loss_balance_eps", 0.05))
+        audio_loss_balance_min = float(getattr(args, "audio_loss_balance_min", 1.0))
+        audio_loss_balance_max = float(getattr(args, "audio_loss_balance_max", 4.0))
+        audio_presence_ema = float(getattr(args, "audio_loss_balance_ema_init", 1.0))
+        audio_presence_ema = min(max(audio_presence_ema, 1e-6), 1.0)
+        audio_loss_balance_target_ratio = float(getattr(args, "audio_loss_balance_target_ratio", 0.33))
+        audio_loss_balance_ema_decay = float(getattr(args, "audio_loss_balance_ema_decay", 0.99))
+        audio_loss_ema = max(float(getattr(args, "audio_loss_balance_ema_init", 1.0)), 1e-6)
+        video_loss_ema = max(float(getattr(args, "audio_loss_balance_ema_init", 1.0)), 1e-6)
+        if audio_loss_balance_mode == "inv_freq":
+            logger.info(
+                "Audio inverse-frequency weighting enabled: beta=%.4f eps=%.4f min=%.4f max=%.4f ema_init=%.4f",
+                audio_loss_balance_beta,
+                audio_loss_balance_eps,
+                audio_loss_balance_min,
+                audio_loss_balance_max,
+                audio_presence_ema,
+            )
+        elif audio_loss_balance_mode == "ema_mag":
+            logger.info(
+                "Audio EMA-magnitude balancing enabled: target_ratio=%.4f ema_decay=%.4f min=%.4f max=%.4f ema_init=%.4f",
+                audio_loss_balance_target_ratio,
+                audio_loss_balance_ema_decay,
+                audio_loss_balance_min,
+                audio_loss_balance_max,
+                audio_loss_ema,
+            )
 
         # Load dataset config
         if args.num_timestep_buckets is not None:
@@ -1905,30 +1947,57 @@ class NetworkTrainer:
 
         current_epoch = Value("i", 0)  # shared between processes
 
-        blueprint_generator = BlueprintGenerator(ConfigSanitizer())
-        logger.info(f"Load dataset config from {args.dataset_config}")
-        user_config = config_utils.load_user_config(args.dataset_config)
-        blueprint = blueprint_generator.generate(user_config, args, architecture=self.architecture)
-        train_dataset_group = config_utils.generate_dataset_group_by_blueprint(
-            blueprint.dataset_group, training=True, num_timestep_buckets=self.num_timestep_buckets, shared_epoch=current_epoch
-        )
         validation_dataset_group = None
         validation_dataloader = None
-        if user_config.get("validation_datasets"):
-            logger.info("Load validation datasets from dataset config")
-            validation_user_config = {
-                "general": user_config.get("general", {}),
-                "datasets": user_config.get("validation_datasets", []),
-            }
-            validation_blueprint = blueprint_generator.generate(
-                validation_user_config, args, architecture=self.architecture
-            )
-            validation_dataset_group = config_utils.generate_dataset_group_by_blueprint(
-                validation_blueprint.dataset_group,
+        if getattr(args, "dataset_manifest", None) is not None:
+            logger.info("Load dataset manifest from %s", args.dataset_manifest)
+            dataset_manifest = config_utils.load_dataset_manifest(args.dataset_manifest)
+            manifest_architecture = dataset_manifest.get("architecture")
+            if manifest_architecture is not None and manifest_architecture != self.architecture:
+                raise ValueError(
+                    f"dataset manifest architecture mismatch: expected '{self.architecture}', got '{manifest_architecture}'"
+                )
+
+            train_dataset_group = config_utils.generate_dataset_group_by_manifest(
+                dataset_manifest,
+                split="train",
                 training=True,
                 num_timestep_buckets=self.num_timestep_buckets,
                 shared_epoch=current_epoch,
             )
+            if train_dataset_group is None:
+                raise ValueError("dataset manifest contains no training datasets")
+
+            validation_dataset_group = config_utils.generate_dataset_group_by_manifest(
+                dataset_manifest,
+                split="validation",
+                training=True,
+                num_timestep_buckets=self.num_timestep_buckets,
+                shared_epoch=current_epoch,
+            )
+        else:
+            blueprint_generator = BlueprintGenerator(ConfigSanitizer())
+            logger.info(f"Load dataset config from {args.dataset_config}")
+            user_config = config_utils.load_user_config(args.dataset_config)
+            blueprint = blueprint_generator.generate(user_config, args, architecture=self.architecture)
+            train_dataset_group = config_utils.generate_dataset_group_by_blueprint(
+                blueprint.dataset_group, training=True, num_timestep_buckets=self.num_timestep_buckets, shared_epoch=current_epoch
+            )
+            if user_config.get("validation_datasets"):
+                logger.info("Load validation datasets from dataset config")
+                validation_user_config = {
+                    "general": user_config.get("general", {}),
+                    "datasets": user_config.get("validation_datasets", []),
+                }
+                validation_blueprint = blueprint_generator.generate(
+                    validation_user_config, args, architecture=self.architecture
+                )
+                validation_dataset_group = config_utils.generate_dataset_group_by_blueprint(
+                    validation_blueprint.dataset_group,
+                    training=True,
+                    num_timestep_buckets=self.num_timestep_buckets,
+                    shared_epoch=current_epoch,
+                )
 
         if train_dataset_group.num_train_items == 0:
             raise ValueError(
@@ -2161,7 +2230,6 @@ class NetworkTrainer:
         optimizer_kwargs = {}
         if parse_optimizer_args_list is not None and args.optimizer_args is not None:
             optimizer_kwargs = parse_optimizer_args_list(args.optimizer_args)
-
         optimizer_name, optimizer_args, optimizer, optimizer_train_fn, optimizer_eval_fn = self.get_optimizer(
             args, trainable_params, optimizer_kwargs=optimizer_kwargs
         )
@@ -2243,8 +2311,8 @@ class NetworkTrainer:
         # prepare training model. accelerator does some magic here
 
         # experimental feature: train the model with gradients in fp16/bf16
+        # Stochastic rounding is now supported via copy_stochastic in optimizer_utils.py
         network_dtype = torch.float32
-        args.full_fp16 = args.full_bf16 = False  # temporary disabled because stochastic rounding is not supported yet
         if args.full_fp16:
             assert args.mixed_precision == "fp16", (
                 "full_fp16 requires mixed precision='fp16' / full_fp16を使う場合はmixed_precision='fp16'を指定してください。"
@@ -2552,8 +2620,10 @@ class NetworkTrainer:
                     if isinstance(latents, dict):
                         if "latents" not in latents:
                             raise ValueError("batch['latents'] is a dict but missing key 'latents'")
+                        self.set_current_batch_latents_info(latents)
                         latents_tensor = latents["latents"]
                     else:
+                        self.set_current_batch_latents_info(None)
                         latents_tensor = latents
 
                     latents_tensor = self.scale_shift_latents(latents_tensor)
@@ -2745,7 +2815,6 @@ class NetworkTrainer:
             gui_metrics = create_metrics_writer(args.output_dir)
             gui_metrics.update_status(step=0, max_steps=args.max_train_steps, epoch=0, max_epochs=num_train_epochs, status="starting")
             start_gui_server(args.output_dir, host=getattr(args, "gui_host", "0.0.0.0"), port=getattr(args, "gui_port", 7860))
-
         optimizer_train_fn()  # Set training mode
 
         for epoch in range(epoch_to_start, num_train_epochs):
@@ -2789,8 +2858,10 @@ class NetworkTrainer:
                 if isinstance(latents, dict):
                     if "latents" not in latents:
                         raise ValueError("batch['latents'] is a dict but missing key 'latents'")
+                    self.set_current_batch_latents_info(latents)
                     latents_tensor = latents["latents"]
                 else:
+                    self.set_current_batch_latents_info(None)
                     latents_tensor = latents
                 latents_shape = tuple(latents_tensor.shape)
 
@@ -2835,6 +2906,10 @@ class NetworkTrainer:
                     dict_output = isinstance(model_pred, dict)
                     video_loss_value = None  # For tracking in wandb/tensorboard
                     audio_loss_value = None  # For tracking in wandb/tensorboard
+                    audio_weight_effective_value = None
+                    audio_presence_ema_value = None
+                    audio_loss_ema_value = None
+                    video_loss_ema_value = None
                     if dict_output:
                         out = model_pred
 
@@ -2883,6 +2958,14 @@ class NetworkTrainer:
                         video_loss = _masked_mse(video_pred, video_target, video_loss_mask)
                         video_weight = float(out.get("video_loss_weight", 1.0))
                         loss = video_loss * video_weight
+                        if audio_loss_balance_mode == "ema_mag":
+                            video_loss_item = max(float(video_loss.detach().item()), 1e-12)
+                            video_loss_ema = update_loss_ema(
+                                loss_ema=video_loss_ema,
+                                loss_value=video_loss_item,
+                                ema_decay=audio_loss_balance_ema_decay,
+                            )
+                            video_loss_ema_value = video_loss_ema
                         # Capture video loss for logging (only if weight > 0)
                         if video_weight > 0:
                             video_loss_value = video_loss.detach().item()
@@ -2890,9 +2973,42 @@ class NetworkTrainer:
                         audio_pred = out.get("audio_pred")
                         audio_target = out.get("audio_target")
                         audio_loss_mask = out.get("audio_loss_mask")
-                        if audio_pred is not None and audio_target is not None:
+                        has_audio_loss = audio_pred is not None and audio_target is not None
+                        if audio_loss_balance_mode == "inv_freq":
+                            audio_presence_ema = update_audio_presence_ema(
+                                audio_presence_ema=audio_presence_ema,
+                                balance_beta=audio_loss_balance_beta,
+                                has_audio_loss=has_audio_loss,
+                            )
+                            audio_presence_ema_value = audio_presence_ema
+                        if has_audio_loss:
                             audio_loss = _masked_mse(audio_pred, audio_target, audio_loss_mask)
                             audio_weight = float(out.get("audio_loss_weight", 1.0))
+                            if audio_loss_balance_mode == "inv_freq":
+                                audio_weight = compute_inverse_frequency_audio_weight(
+                                    base_audio_weight=audio_weight,
+                                    audio_presence_ema=audio_presence_ema,
+                                    balance_eps=audio_loss_balance_eps,
+                                    balance_min=audio_loss_balance_min,
+                                    balance_max=audio_loss_balance_max,
+                                )
+                            elif audio_loss_balance_mode == "ema_mag":
+                                audio_loss_item = max(float(audio_loss.detach().item()), 1e-12)
+                                audio_loss_ema = update_loss_ema(
+                                    loss_ema=audio_loss_ema,
+                                    loss_value=audio_loss_item,
+                                    ema_decay=audio_loss_balance_ema_decay,
+                                )
+                                audio_loss_ema_value = audio_loss_ema
+                                audio_weight = compute_ema_magnitude_audio_weight(
+                                    base_audio_weight=audio_weight,
+                                    audio_loss_ema=audio_loss_ema,
+                                    video_loss_ema=video_loss_ema,
+                                    target_audio_ratio=audio_loss_balance_target_ratio,
+                                    balance_min=audio_loss_balance_min,
+                                    balance_max=audio_loss_balance_max,
+                                )
+                            audio_weight_effective_value = audio_weight
                             loss = loss + audio_loss * audio_weight
                             # Capture audio loss for logging (only if weight > 0)
                             if audio_weight > 0:
@@ -3062,6 +3178,10 @@ class NetworkTrainer:
                 if dict_output:
                     logs["loss_v"] = video_loss_value if video_loss_value is not None else "n/a"
                     logs["loss_a"] = audio_loss_value if audio_loss_value is not None else "n/a"
+                    if audio_weight_effective_value is not None:
+                        logs["audio_w"] = audio_weight_effective_value
+                    if audio_presence_ema_value is not None:
+                        logs["audio_p"] = audio_presence_ema_value
                 progress_bar.set_postfix(**logs)
 
                 if args.scale_weight_norms:
@@ -3072,6 +3192,14 @@ class NetworkTrainer:
                         args, current_loss, avr_loss, lr_scheduler, lr_descriptions, optimizer, keys_scaled, mean_norm, maximum_norm,
                         video_loss=video_loss_value, audio_loss=audio_loss_value,
                     )
+                    if audio_weight_effective_value is not None:
+                        logs["loss/audio_weight_effective"] = audio_weight_effective_value
+                    if audio_presence_ema_value is not None:
+                        logs["loss/audio_presence_ema"] = audio_presence_ema_value
+                    if audio_loss_ema_value is not None:
+                        logs["loss/audio_loss_ema"] = audio_loss_ema_value
+                    if video_loss_ema_value is not None:
+                        logs["loss/video_loss_ema"] = video_loss_ema_value
                     if pres_losses:
                         logs.update(pres_losses)
                     accelerator.log(logs, step=global_step)
@@ -3199,6 +3327,12 @@ def setup_parser_common() -> argparse.ArgumentParser:
         type=pathlib.Path,
         default=None,
         help="config file for dataset / データセットの設定ファイル",
+    )
+    parser.add_argument(
+        "--dataset_manifest",
+        type=pathlib.Path,
+        default=None,
+        help="cache-only dataset manifest JSON file (alternative to --dataset_config)",
     )
 
     # model settings
@@ -3508,8 +3642,8 @@ def setup_parser_common() -> argparse.ArgumentParser:
     )
 
     parser.add_argument("--fp8_base", action="store_true", help="use fp8 for base model / base modelにfp8を使う")
-    # parser.add_argument("--full_fp16", action="store_true", help="fp16 training including gradients / 勾配も含めてfp16で学習する")
-    # parser.add_argument("--full_bf16", action="store_true", help="bf16 training including gradients / 勾配も含めてbf16で学習する")
+    parser.add_argument("--full_fp16", action="store_true", help="fp16 training including gradients (uses stochastic rounding) / 勾配も含めてfp16で学習する")
+    parser.add_argument("--full_bf16", action="store_true", help="bf16 training including gradients (uses stochastic rounding) / 勾配も含めてbf16で学習する")
 
     parser.add_argument(
         "--dynamo_backend",

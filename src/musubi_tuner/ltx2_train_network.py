@@ -3,6 +3,7 @@
 import argparse
 import gc
 import os
+import random
 import re
 import subprocess
 import sys
@@ -27,6 +28,13 @@ from musubi_tuner.hv_train_network import (
     read_config_from_file,
     setup_parser_common,
     should_sample_images,
+)
+from musubi_tuner.audio_supervision import (
+    AudioSupervisionState,
+    format_audio_supervision_alert,
+    normalize_audio_supervision_mode,
+    reset_audio_supervision_state,
+    update_and_check_audio_supervision,
 )
 from musubi_tuner.hv_generate_video import save_images_grid, save_videos_grid
 from musubi_tuner.utils.device_utils import clean_memory_on_device
@@ -466,6 +474,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
         self._dit_attn_mode: Optional[str] = None
         self._latent_norm_cache: Dict = {}
         self._warned_missing_audio = False
+        self._audio_supervision_state = AudioSupervisionState()
 
         # Initialize latent normalization
         mean = torch.tensor(LTX2_LATENTS_MEAN, dtype=torch.float32).view(1, -1, 1, 1, 1)
@@ -477,6 +486,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
         self._num_timesteps: int = 1000
         self._audio_video: bool = False
         self._ltx_mode: str = "video"
+        self._logged_audio_only_timestep_shift: bool = False
         self.default_guidance_scale = 3.0
         self._audio_preview_config: Optional[Dict[str, int | float]] = None
 
@@ -697,14 +707,6 @@ class LTX2NetworkTrainer(NetworkTrainer):
             losses["loss/dop"] = val
 
         return losses
-
-        # Preservation / regularization (off by default — zero overhead)
-        self._preservation_active: bool = False
-        self._preservation_helper = None
-        self._last_dit_inputs: Optional[Dict[str, Any]] = None
-
-        # CREPA (off by default)
-        self._crepa = None
 
     # ------------------------------------------------------------------
     # Preservation / regularization hooks
@@ -1032,6 +1034,24 @@ class LTX2NetworkTrainer(NetworkTrainer):
 
         return timesteps / 1000.0
 
+    def _sample_independent_audio_timesteps(
+        self,
+        args: argparse.Namespace,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Sample audio timesteps in the same sigma range used by video timesteps."""
+        min_timestep = getattr(args, "min_timestep", None)
+        max_timestep = getattr(args, "max_timestep", None)
+        min_sigma = (float(min_timestep) / 1000.0) if min_timestep is not None else 0.0
+        max_sigma = (float(max_timestep) / 1000.0) if max_timestep is not None else 1.0
+        if max_sigma < min_sigma:
+            raise ValueError(f"Invalid timestep range: min_sigma={min_sigma} > max_sigma={max_sigma}")
+        sigmas = torch.rand((batch_size,), device=device, dtype=torch.float32)
+        sigmas = sigmas * (max_sigma - min_sigma) + min_sigma
+        return sigmas.to(device=device, dtype=dtype).view(batch_size, 1)
+
     def _ensure_fp8_buffers_on_device(self, model: torch.nn.Module) -> None:
         if not any(True for _ in model.parameters()):
             return
@@ -1098,6 +1118,71 @@ class LTX2NetworkTrainer(NetworkTrainer):
         b = min_shift - m * float(min_tokens)
         return m * float(seq_length) + b
 
+    @staticmethod
+    def _shifted_logit_normal_shift_for_sequence_lengths(
+        seq_lengths: torch.Tensor,
+        *,
+        min_tokens: int = 1024,
+        max_tokens: int = 4096,
+        min_shift: float = 0.95,
+        max_shift: float = 2.05,
+    ) -> torch.Tensor:
+        m = (max_shift - min_shift) / float(max_tokens - min_tokens)
+        b = min_shift - m * float(min_tokens)
+        return seq_lengths.to(dtype=torch.float32) * float(m) + float(b)
+
+    def _resolve_audio_only_sequence_lengths(self, batch_size: int, device: torch.device) -> Optional[torch.Tensor]:
+        latents_info = self.get_current_batch_latents_info()
+        if not isinstance(latents_info, dict):
+            return None
+
+        def _as_batch_int_tensor(value: Any) -> Optional[torch.Tensor]:
+            if isinstance(value, torch.Tensor):
+                if value.numel() == 1:
+                    return value.view(1).to(device=device, dtype=torch.int64).expand(batch_size)
+                if value.numel() == batch_size:
+                    return value.to(device=device, dtype=torch.int64).view(batch_size)
+                return None
+            if isinstance(value, (int, float)):
+                return torch.full((batch_size,), int(value), device=device, dtype=torch.int64)
+            return None
+
+        num_frames = _as_batch_int_tensor(latents_info.get("num_frames"))
+        height = _as_batch_int_tensor(latents_info.get("height"))
+        width = _as_batch_int_tensor(latents_info.get("width"))
+        if num_frames is None or height is None or width is None:
+            return None
+        seq_lens = num_frames * height * width
+        return seq_lens
+
+    def _resolve_shifted_logit_normal_shift(
+        self,
+        args: argparse.Namespace,
+        seq_len: int,
+    ) -> float:
+        """Resolve shifted-logit-normal shift for the current mode.
+
+        Audio-only mode requires duration-aware video latents so seq_len
+        reflects target token geometry.
+        """
+        if self._ltx_mode == "audio" and int(seq_len) <= 1:
+            raise ValueError(
+                "Audio-only training requires sequence-aware video latent geometry (seq_len>1). "
+                "Re-cache latents with ltx2_cache_latents.py using --ltx2_mode audio "
+                "to generate duration-aware geometry."
+            )
+
+        shift = self._shifted_logit_normal_shift_for_sequence_length(seq_len)
+        shift = max(0.95, min(2.05, float(shift)))
+        if self._ltx_mode == "audio" and not self._logged_audio_only_timestep_shift:
+            logger.info(
+                "LTX-2 audio-only mode: using shifted_logit_normal shift %.4f from seq_len=%s.",
+                shift,
+                int(seq_len),
+            )
+            self._logged_audio_only_timestep_shift = True
+        return shift
+
     def get_noisy_model_input_and_timesteps(
         self,
         args: argparse.Namespace,
@@ -1120,6 +1205,14 @@ class LTX2NetworkTrainer(NetworkTrainer):
         batch_size = latents.shape[0]
         frames, height, width = latents.shape[2], latents.shape[3], latents.shape[4]
         seq_len = int(frames * height * width)
+        audio_seq_lens = None
+        if self._ltx_mode == "audio":
+            audio_seq_lens = self._resolve_audio_only_sequence_lengths(batch_size, device)
+            if audio_seq_lens is not None and torch.any(audio_seq_lens <= 1):
+                raise ValueError(
+                    "Audio-only training requires sequence-aware video latent geometry (seq_len>1). "
+                    "Re-cache latents with ltx2_cache_latents.py using --ltx2_mode audio."
+                )
 
         # Get timestep sampling mode (default to shifted_logit_normal for LTX-2)
         timestep_sampling = getattr(args, "timestep_sampling", "shifted_logit_normal")
@@ -1131,9 +1224,30 @@ class LTX2NetworkTrainer(NetworkTrainer):
         if timestep_sampling == "shifted_logit_normal":
             # Official LTX-2 implementation: shifted logit-normal distribution
             # Shift is computed based on sequence length
-            shift = self._shifted_logit_normal_shift_for_sequence_length(seq_len)
+            if self._ltx_mode == "audio":
+                if audio_seq_lens is not None:
+                    shifts = self._shifted_logit_normal_shift_for_sequence_lengths(audio_seq_lens)
+                    shifts = shifts.clamp(min=0.95, max=2.05)
+                    if not self._logged_audio_only_timestep_shift:
+                        logger.info(
+                            "LTX-2 audio-only mode: shifted_logit_normal seq_len min=%s max=%s mean=%.2f, "
+                            "shift min=%.4f max=%.4f mean=%.4f.",
+                            int(audio_seq_lens.min().item()),
+                            int(audio_seq_lens.max().item()),
+                            float(audio_seq_lens.to(dtype=torch.float32).mean().item()),
+                            float(shifts.min().item()),
+                            float(shifts.max().item()),
+                            float(shifts.mean().item()),
+                        )
+                        self._logged_audio_only_timestep_shift = True
+                else:
+                    shift = self._resolve_shifted_logit_normal_shift(args, seq_len)
+                    shifts = torch.full((batch_size,), float(shift), device=device, dtype=torch.float32)
+            else:
+                shift = self._shifted_logit_normal_shift_for_sequence_length(seq_len)
+                shifts = torch.full((batch_size,), float(shift), device=device, dtype=torch.float32)
             std = getattr(args, "logit_std", 1.0)
-            normal_samples = torch.randn((batch_size,), device=device, dtype=torch.float32) * std + float(shift)
+            normal_samples = torch.randn((batch_size,), device=device, dtype=torch.float32) * std + shifts
             sigmas = torch.sigmoid(normal_samples)
         elif timestep_sampling == "uniform":
             # Uniform sampling from [0, 1]
@@ -1221,6 +1335,86 @@ class LTX2NetworkTrainer(NetworkTrainer):
 
         args.weighting_scheme = "none"
 
+        audio_balance_mode = str(getattr(args, "audio_loss_balance_mode", "none") or "none").lower()
+        if audio_balance_mode not in {"none", "inv_freq", "ema_mag"}:
+            raise ValueError(
+                f"audio_loss_balance_mode must be one of ['none', 'inv_freq', 'ema_mag']. Got: {audio_balance_mode}"
+            )
+        args.audio_loss_balance_mode = audio_balance_mode
+
+        audio_balance_beta = float(getattr(args, "audio_loss_balance_beta", 0.01))
+        audio_balance_eps = float(getattr(args, "audio_loss_balance_eps", 0.05))
+        audio_balance_min = float(getattr(args, "audio_loss_balance_min", 1.0))
+        audio_balance_max = float(getattr(args, "audio_loss_balance_max", 4.0))
+        audio_balance_ema_init = float(getattr(args, "audio_loss_balance_ema_init", 1.0))
+        audio_balance_target_ratio = float(getattr(args, "audio_loss_balance_target_ratio", 0.33))
+        audio_balance_ema_decay = float(getattr(args, "audio_loss_balance_ema_decay", 0.99))
+
+        if not (0.0 < audio_balance_beta <= 1.0):
+            raise ValueError(f"audio_loss_balance_beta must be in (0, 1]. Got: {audio_balance_beta}")
+        if audio_balance_eps <= 0.0:
+            raise ValueError(f"audio_loss_balance_eps must be > 0. Got: {audio_balance_eps}")
+        if audio_balance_min < 0.0:
+            raise ValueError(f"audio_loss_balance_min must be >= 0. Got: {audio_balance_min}")
+        if audio_balance_max <= 0.0:
+            raise ValueError(f"audio_loss_balance_max must be > 0. Got: {audio_balance_max}")
+        if audio_balance_max < audio_balance_min:
+            raise ValueError(
+                f"audio_loss_balance_max must be >= audio_loss_balance_min. Got: min={audio_balance_min}, max={audio_balance_max}"
+            )
+        if audio_balance_mode == "inv_freq":
+            if not (0.0 < audio_balance_ema_init <= 1.0):
+                raise ValueError(f"audio_loss_balance_ema_init must be in (0, 1] for inv_freq. Got: {audio_balance_ema_init}")
+        else:
+            if audio_balance_ema_init <= 0.0:
+                raise ValueError(f"audio_loss_balance_ema_init must be > 0. Got: {audio_balance_ema_init}")
+        if audio_balance_target_ratio < 0.0:
+            raise ValueError(f"audio_loss_balance_target_ratio must be >= 0. Got: {audio_balance_target_ratio}")
+        if not (0.0 < audio_balance_ema_decay < 1.0):
+            raise ValueError(f"audio_loss_balance_ema_decay must be in (0, 1). Got: {audio_balance_ema_decay}")
+
+        args.audio_loss_balance_beta = audio_balance_beta
+        args.audio_loss_balance_eps = audio_balance_eps
+        args.audio_loss_balance_min = audio_balance_min
+        args.audio_loss_balance_max = audio_balance_max
+        args.audio_loss_balance_ema_init = audio_balance_ema_init
+        args.audio_loss_balance_target_ratio = audio_balance_target_ratio
+        args.audio_loss_balance_ema_decay = audio_balance_ema_decay
+
+        args.independent_audio_timestep = bool(getattr(args, "independent_audio_timestep", False))
+        args.audio_silence_regularizer = bool(getattr(args, "audio_silence_regularizer", False))
+        audio_silence_regularizer_weight = float(getattr(args, "audio_silence_regularizer_weight", 1.0))
+        if audio_silence_regularizer_weight < 0.0:
+            raise ValueError(
+                f"audio_silence_regularizer_weight must be >= 0. Got: {audio_silence_regularizer_weight}"
+            )
+        args.audio_silence_regularizer_weight = audio_silence_regularizer_weight
+
+        audio_supervision_mode = normalize_audio_supervision_mode(
+            getattr(args, "audio_supervision_mode", "off")
+        )
+        audio_supervision_warmup_steps = int(getattr(args, "audio_supervision_warmup_steps", 50))
+        audio_supervision_check_interval = int(getattr(args, "audio_supervision_check_interval", 50))
+        audio_supervision_min_ratio = float(getattr(args, "audio_supervision_min_ratio", 0.9))
+        if audio_supervision_warmup_steps < 0:
+            raise ValueError(
+                f"audio_supervision_warmup_steps must be >= 0. Got: {audio_supervision_warmup_steps}"
+            )
+        if audio_supervision_check_interval <= 0:
+            raise ValueError(
+                f"audio_supervision_check_interval must be > 0. Got: {audio_supervision_check_interval}"
+            )
+        if not (0.0 <= audio_supervision_min_ratio <= 1.0):
+            raise ValueError(
+                f"audio_supervision_min_ratio must be in [0, 1]. Got: {audio_supervision_min_ratio}"
+            )
+        args.audio_supervision_mode = audio_supervision_mode
+        args.audio_supervision_warmup_steps = audio_supervision_warmup_steps
+        args.audio_supervision_check_interval = audio_supervision_check_interval
+        args.audio_supervision_min_ratio = audio_supervision_min_ratio
+
+        reset_audio_supervision_state(self._audio_supervision_state)
+
         apply_ltx2_tweaks(args)
 
     @property
@@ -1234,19 +1428,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
         return False
 
     def post_save_checkpoint_hook(self, args, ckpt_file, ckpt_name, accelerator, force_sync_upload=False):
-        """Convert saved LoRA to ComfyUI format and save CREPA projector. and save CREPA projector."""
-        # Save CREPA projector weights alongside LoRA checkpoint
-        if self._crepa is not None:
-            try:
-                from safetensors.torch import save_file
-                proj_sd = self._crepa.state_dict()
-                if proj_sd:
-                    proj_file = os.path.join(args.output_dir, "crepa_projector.safetensors")
-                    save_file(proj_sd, proj_file)
-                    accelerator.print(f"Saved CREPA projector: {proj_file}")
-            except Exception as e:
-                accelerator.print(f"Warning: Failed to save CREPA projector: {e}")
-
+        """Convert saved LoRA to ComfyUI format and save CREPA projector."""
         # Save CREPA projector weights alongside LoRA checkpoint
         if self._crepa is not None:
             try:
@@ -1860,6 +2042,18 @@ class LTX2NetworkTrainer(NetworkTrainer):
             if args.gradient_checkpointing:
                 text_mask = text_mask.to(torch.bool)
 
+        # Caption dropout: zero out text conditioning with probability p (for CFG training)
+        caption_dropout_rate = getattr(args, "caption_dropout_rate", 0.0)
+        if caption_dropout_rate > 0.0 and self.training:
+            text_embeds = text_embeds.clone()
+            if text_mask is not None:
+                text_mask = text_mask.clone()
+            for i in range(text_embeds.shape[0]):
+                if random.random() < caption_dropout_rate:
+                    text_embeds[i] = 0
+                    if text_mask is not None:
+                        text_mask[i] = False
+
         # Move latents to device
         latents = latents.to(device=accelerator.device, dtype=network_dtype)
         noise = noise.to(device=accelerator.device, dtype=network_dtype)
@@ -1895,6 +2089,15 @@ class LTX2NetworkTrainer(NetworkTrainer):
             model_timesteps = model_timesteps.unsqueeze(1)
 
         sigma = model_timesteps[:, 0]
+        audio_model_timesteps = model_timesteps
+        if self._ltx_mode in {"av", "audio"} and bool(getattr(args, "independent_audio_timestep", False)):
+            audio_model_timesteps = self._sample_independent_audio_timesteps(
+                args,
+                batch_size=model_timesteps.shape[0],
+                device=accelerator.device,
+                dtype=network_dtype,
+            )
+        audio_sigma = audio_model_timesteps[:, 0]
 
         ref_latents = batch.get("ref_latents")
         if ref_latents is None:
@@ -1937,7 +2140,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
 
             audio_latents = audio_latents.to(device=accelerator.device, dtype=network_dtype)
             audio_noise = torch.randn_like(audio_latents)
-            sigma_audio = sigma.view(-1, 1, 1, 1)
+            sigma_audio = audio_sigma.view(-1, 1, 1, 1)
             noisy_audio = (1.0 - sigma_audio) * audio_latents + sigma_audio * audio_noise
 
             # Check if real video latents are available (not dummy 1x1x1 or all zeros)
@@ -1964,6 +2167,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 model_pred = transformer(
                     [video_latents_for_audio, noisy_audio],
                     timestep=model_timesteps,
+                    audio_timestep=audio_model_timesteps,
                     context=text_embeds,
                     attention_mask=text_mask,
                     frame_rate=frame_rate,
@@ -2165,6 +2369,8 @@ class LTX2NetworkTrainer(NetworkTrainer):
         audio_noise = None
         noisy_audio = None
         audio_enabled_for_batch = False
+        audio_regularizer_active = False
+        audio_expected_for_batch = self._ltx_mode == "av"
         audio_loss_mask = None
         if self._ltx_mode == "av":
             audio_latents = batch.get("audio_latents")
@@ -2172,15 +2378,31 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 audio_latents = audio_latents.get("latents")
 
             if audio_latents is None:
-                if not self._warned_missing_audio:
-                    logger.warning(
-                        "LTXAV mode: missing audio latents in this batch; skipping audio branch. "
-                        "Provide cached audio latents to train audio generation."
+                if bool(getattr(args, "audio_silence_regularizer", False)):
+                    audio_latents = self._build_empty_audio_latents(
+                        args=args,
+                        transformer=transformer,
+                        latents=latents,
+                        frame_rate=float(frame_rate),
+                        device=accelerator.device,
+                        dtype=network_dtype,
                     )
-                    self._warned_missing_audio = True
-            elif not isinstance(audio_latents, torch.Tensor):
-                raise TypeError(f"Expected audio_latents to be a torch.Tensor, got: {type(audio_latents)}")
-            else:
+                    audio_regularizer_active = True
+                    if not self._warned_missing_audio:
+                        logger.warning(
+                            "LTXAV mode: missing audio latents in this batch; using silence regularizer fallback."
+                        )
+                        self._warned_missing_audio = True
+                else:
+                    if not self._warned_missing_audio:
+                        logger.warning(
+                            "LTXAV mode: missing audio latents in this batch; skipping audio branch. "
+                            "Provide cached audio latents to train audio generation."
+                        )
+                        self._warned_missing_audio = True
+            if audio_latents is not None:
+                if not isinstance(audio_latents, torch.Tensor):
+                    raise TypeError(f"Expected audio_latents to be a torch.Tensor, got: {type(audio_latents)}")
                 if audio_latents.dim() != 4:
                     raise ValueError(f"Expected audio_latents to be 4D [B, C, T, F], got shape: {tuple(audio_latents.shape)}")
                 if audio_latents.shape[0] != latents.shape[0]:
@@ -2206,7 +2428,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
 
                 audio_enabled_for_batch = True
                 audio_noise = torch.randn_like(audio_latents)
-                sigma_audio = sigma.view(-1, 1, 1, 1)
+                sigma_audio = audio_sigma.view(-1, 1, 1, 1)
                 noisy_audio = (1.0 - sigma_audio) * audio_latents + sigma_audio * audio_noise
                 _check_finite("noisy_audio", noisy_audio)
                 _log_stats("noisy_audio", noisy_audio)
@@ -2220,6 +2442,22 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 half = text_embeds.shape[-1] // 2
                 text_embeds = text_embeds[..., :half]
 
+        if bool(getattr(transformer, "training", False)) and self._ltx_mode == "av":
+            supervision_alert = update_and_check_audio_supervision(
+                self._audio_supervision_state,
+                mode=str(getattr(args, "audio_supervision_mode", "off")),
+                warmup_steps=int(getattr(args, "audio_supervision_warmup_steps", 50)),
+                check_interval=int(getattr(args, "audio_supervision_check_interval", 50)),
+                min_ratio=float(getattr(args, "audio_supervision_min_ratio", 0.9)),
+                audio_expected_for_batch=audio_expected_for_batch,
+                audio_supervised_for_batch=audio_enabled_for_batch and not audio_regularizer_active,
+            )
+            if supervision_alert is not None:
+                message = format_audio_supervision_alert(supervision_alert)
+                if str(getattr(args, "audio_supervision_mode", "off")) == "error":
+                    raise ValueError(message)
+                logger.warning("%s Running in warning mode; training will continue.", message)
+
         if skip_nonfinite and nonfinite_flag["hit"]:
             return {"_skip_step": True, "skip_reason": nonfinite_flag["tag"]}, torch.tensor(
                 0.0, device=accelerator.device
@@ -2232,6 +2470,21 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 caption_channels = getattr(getattr(base_model, "caption_projection", None), "in_features", None)
         if caption_channels is not None:
             expected_last_dim = int(caption_channels) * (2 if audio_enabled_for_batch else 1)
+            if text_embeds.shape[-1] != expected_last_dim:
+                if (
+                    self._ltx_mode == "av"
+                    and audio_enabled_for_batch
+                    and audio_regularizer_active
+                    and text_embeds.shape[-1] * 2 == expected_last_dim
+                ):
+                    text_embeds = torch.cat([text_embeds, text_embeds], dim=-1)
+                    expected_last_dim = text_embeds.shape[-1]
+                else:
+                    raise ValueError(
+                        f"Text embedding dim mismatch for {'LTXAV' if self._audio_video else 'LTXV'}: "
+                        f"got {text_embeds.shape[-1]}, expected {expected_last_dim}. "
+                        f"(caption_channels={caption_channels})"
+                    )
             if text_embeds.shape[-1] != expected_last_dim:
                 raise ValueError(
                     f"Text embedding dim mismatch for {'LTXAV' if self._audio_video else 'LTXV'}: "
@@ -2290,6 +2543,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
             self._last_dit_inputs = {
                 "model_input": model_input,
                 "model_timesteps": model_timesteps,
+                "audio_model_timesteps": audio_model_timesteps if audio_enabled_for_batch else None,
                 "text_embeds": text_embeds,
                 "text_mask": text_mask,
                 "frame_rate": frame_rate,
@@ -2302,6 +2556,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
             model_pred = transformer(
                 model_input,
                 timestep=model_timesteps,
+                audio_timestep=audio_model_timesteps if audio_enabled_for_batch else None,
                 context=text_embeds,
                 attention_mask=text_mask,
                 frame_rate=frame_rate,
@@ -2383,7 +2638,12 @@ class LTX2NetworkTrainer(NetworkTrainer):
                     "audio_pred": audio_pred,
                     "audio_target": audio_target,
                     "audio_loss_mask": audio_loss_mask,
-                    "audio_loss_weight": float(getattr(args, "audio_loss_weight", 1.0)),
+                    "audio_loss_weight": float(getattr(args, "audio_loss_weight", 1.0))
+                    * (
+                        float(getattr(args, "audio_silence_regularizer_weight", 1.0))
+                        if audio_regularizer_active
+                        else 1.0
+                    ),
                 }
             )
             if out["audio_loss_weight"] < 0.0:
@@ -2541,41 +2801,47 @@ class LTX2NetworkTrainer(NetworkTrainer):
         except Exception as e:
             raise RuntimeError(f"Failed to load I2V latents cache: {e}")
 
-    def _resolve_default_sample_prompts_cache(self, args: argparse.Namespace) -> str:
+    def _resolve_first_dataset_cache_directory(self, args: argparse.Namespace) -> str:
         from musubi_tuner.dataset import config_utils
         from musubi_tuner.dataset.config_utils import BlueprintGenerator, ConfigSanitizer
         from musubi_tuner.dataset.image_video_dataset import ARCHITECTURE_LTX2
 
-        if not getattr(args, "dataset_config", None):
-            raise ValueError("--dataset_config is required to resolve the sample prompt cache directory")
-        user_config = config_utils.load_user_config(args.dataset_config)
-        blueprint = BlueprintGenerator(ConfigSanitizer()).generate(user_config, args, architecture=ARCHITECTURE_LTX2)
-        dataset_group = config_utils.generate_dataset_group_by_blueprint(blueprint.dataset_group)
-        datasets = dataset_group.datasets
-        if not datasets:
-            raise ValueError("No datasets available to resolve sample prompt cache directory")
-        cache_dir = getattr(datasets[0], "cache_directory", None)
-        if not cache_dir:
-            raise ValueError("First dataset has no cache_directory; set cache_directory in dataset config")
+        if getattr(args, "dataset_manifest", None):
+            dataset_manifest = config_utils.load_dataset_manifest(args.dataset_manifest)
+            manifest_architecture = dataset_manifest.get("architecture")
+            if manifest_architecture is not None and manifest_architecture != ARCHITECTURE_LTX2:
+                raise ValueError(
+                    f"dataset manifest architecture mismatch: expected '{ARCHITECTURE_LTX2}', got '{manifest_architecture}'"
+                )
+            datasets = dataset_manifest.get("datasets", [])
+            if not datasets:
+                raise ValueError("No datasets available in dataset manifest to resolve sample cache directory")
+            cache_dir = datasets[0].get("params", {}).get("cache_directory")
+            if not cache_dir:
+                raise ValueError("First manifest dataset has no cache_directory")
+            return str(cache_dir)
+
+        if getattr(args, "dataset_config", None):
+            user_config = config_utils.load_user_config(args.dataset_config)
+            blueprint = BlueprintGenerator(ConfigSanitizer()).generate(user_config, args, architecture=ARCHITECTURE_LTX2)
+            dataset_group = config_utils.generate_dataset_group_by_blueprint(blueprint.dataset_group)
+            datasets = dataset_group.datasets
+            if not datasets:
+                raise ValueError("No datasets available to resolve sample cache directory")
+            cache_dir = getattr(datasets[0], "cache_directory", None)
+            if not cache_dir:
+                raise ValueError("First dataset has no cache_directory; set cache_directory in dataset config")
+            return cache_dir
+
+        raise ValueError("--dataset_config or --dataset_manifest is required to resolve sample cache directory")
+
+    def _resolve_default_sample_prompts_cache(self, args: argparse.Namespace) -> str:
+        cache_dir = self._resolve_first_dataset_cache_directory(args)
         return os.path.join(cache_dir, DEFAULT_SAMPLE_PROMPTS_CACHE)
 
     def _resolve_default_sample_latents_cache(self, args: argparse.Namespace) -> str:
         """Resolve default path for sample latents cache (same directory as prompts cache)."""
-        from musubi_tuner.dataset import config_utils
-        from musubi_tuner.dataset.config_utils import BlueprintGenerator, ConfigSanitizer
-        from musubi_tuner.dataset.image_video_dataset import ARCHITECTURE_LTX2
-
-        if not getattr(args, "dataset_config", None):
-            raise ValueError("--dataset_config is required to resolve the sample latents cache directory")
-        user_config = config_utils.load_user_config(args.dataset_config)
-        blueprint = BlueprintGenerator(ConfigSanitizer()).generate(user_config, args, architecture=ARCHITECTURE_LTX2)
-        dataset_group = config_utils.generate_dataset_group_by_blueprint(blueprint.dataset_group)
-        datasets = dataset_group.datasets
-        if not datasets:
-            raise ValueError("No datasets available to resolve sample latents cache directory")
-        cache_dir = getattr(datasets[0], "cache_directory", None)
-        if not cache_dir:
-            raise ValueError("First dataset has no cache_directory; set cache_directory in dataset config")
+        cache_dir = self._resolve_first_dataset_cache_directory(args)
         return os.path.join(cache_dir, DEFAULT_SAMPLE_LATENTS_CACHE)
 
     def process_sample_prompts(
@@ -4136,7 +4402,7 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         "--ltx2_mode", "--ltx_mode",
         dest="ltx_mode",
         type=str,
-        default="video",
+        default="v",
         choices=["video", "av", "audio", "v", "a", "va"],
         help="Training modality.",
     )
@@ -4207,6 +4473,105 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         type=float,
         default=1.0,
         help="Weight applied to the audio diffusion loss.",
+    )
+    parser.add_argument(
+        "--audio_loss_balance_mode",
+        type=str,
+        default="none",
+        choices=["none", "inv_freq", "ema_mag"],
+        help=(
+            "Optional dynamic balancing for audio loss. "
+            "'none' keeps static --audio_loss_weight; "
+            "'inv_freq' scales audio weight by inverse EMA of audio-batch frequency; "
+            "'ema_mag' matches audio loss magnitude to a target fraction of video loss."
+        ),
+    )
+    parser.add_argument(
+        "--audio_loss_balance_beta",
+        type=float,
+        default=0.01,
+        help="EMA update factor for audio-batch frequency when --audio_loss_balance_mode=inv_freq.",
+    )
+    parser.add_argument(
+        "--audio_loss_balance_eps",
+        type=float,
+        default=0.05,
+        help="Minimum denominator for inverse-frequency audio weighting (prevents extreme weights).",
+    )
+    parser.add_argument(
+        "--audio_loss_balance_min",
+        type=float,
+        default=1.0,
+        help="Minimum clamp for effective audio loss weight after inverse-frequency scaling.",
+    )
+    parser.add_argument(
+        "--audio_loss_balance_max",
+        type=float,
+        default=4.0,
+        help="Maximum clamp for effective audio loss weight after inverse-frequency scaling.",
+    )
+    parser.add_argument(
+        "--audio_loss_balance_ema_init",
+        type=float,
+        default=1.0,
+        help="Initial EMA value used by audio loss balancing modes.",
+    )
+    parser.add_argument(
+        "--audio_loss_balance_target_ratio",
+        type=float,
+        default=0.33,
+        help="Target audio/video loss magnitude ratio when --audio_loss_balance_mode=ema_mag.",
+    )
+    parser.add_argument(
+        "--audio_loss_balance_ema_decay",
+        type=float,
+        default=0.99,
+        help="EMA decay for loss magnitude tracking when --audio_loss_balance_mode=ema_mag.",
+    )
+    parser.add_argument(
+        "--independent_audio_timestep",
+        action="store_true",
+        help="Sample independent timesteps for audio noising/conditioning in AV and audio modes.",
+    )
+    parser.add_argument(
+        "--audio_silence_regularizer",
+        action="store_true",
+        help="Use synthetic silence audio latents for AV batches that are missing audio latents.",
+    )
+    parser.add_argument(
+        "--audio_silence_regularizer_weight",
+        type=float,
+        default=1.0,
+        help="Multiplier applied to audio loss on synthetic-silence fallback batches.",
+    )
+    parser.add_argument(
+        "--audio_supervision_mode",
+        type=str,
+        default="off",
+        choices=["off", "warn", "error"],
+        help=(
+            "Monitor AV audio supervision quality. "
+            "'warn' logs periodic warnings when supervised-audio ratio is too low; "
+            "'error' stops training; 'off' disables checks."
+        ),
+    )
+    parser.add_argument(
+        "--audio_supervision_warmup_steps",
+        type=int,
+        default=50,
+        help="Number of expected AV batches to observe before audio supervision checks begin.",
+    )
+    parser.add_argument(
+        "--audio_supervision_check_interval",
+        type=int,
+        default=50,
+        help="Run audio supervision checks every N expected AV batches.",
+    )
+    parser.add_argument(
+        "--audio_supervision_min_ratio",
+        type=float,
+        default=0.9,
+        help="Minimum required supervised/expected audio ratio for AV training.",
     )
     parser.add_argument(
         "--min_audio_batches_per_accum",
@@ -4449,7 +4814,6 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         help="Cache start_images latents in memory for image-to-video mode. When enabled and start_images are provided "
              "in sample parameters, the images are encoded to latents once and reused across all sampling steps.",
     )
-
     # -- Preservation / regularization flags --
     parser.add_argument(
         "--blank_preservation",
@@ -4553,6 +4917,14 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         action=argparse.BooleanOptionalAction,
         default=False,
         help="Freeze attention geometry params (to_q/to_k/q_norm/k_norm) during full fine-tuning.",
+    )
+    # -- Caption dropout --
+    parser.add_argument(
+        "--caption_dropout_rate",
+        type=float,
+        default=0.0,
+        help="Probability of dropping the caption for each sample (0.0 = disabled). "
+             "Zeros out text embeddings and mask to train unconditional generation for CFG.",
     )
 
     return parser

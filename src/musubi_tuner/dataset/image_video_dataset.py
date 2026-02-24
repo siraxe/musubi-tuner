@@ -286,12 +286,15 @@ def save_latent_cache_wan(
     save_latent_cache_common(item_info, sd, ARCHITECTURE_WAN_FULL)
 
 
-def save_latent_cache_ltx2(item_info: ItemInfo, latent: torch.Tensor):
+def save_latent_cache_ltx2(item_info: ItemInfo, latent: torch.Tensor, extra_tensors: Optional[dict[str, torch.Tensor]] = None):
     assert latent.dim() == 4, "latent should be 4D tensor (channel, frame, height, width)"
 
     _, F, H, W = latent.shape
     dtype_str = dtype_to_str(latent.dtype)
     sd = {f"latents_{F}x{H}x{W}_{dtype_str}": latent.detach().cpu().contiguous()}
+    if extra_tensors:
+        for key, value in extra_tensors.items():
+            sd[key] = value.detach().cpu().contiguous()
 
     save_latent_cache_common(item_info, sd, ARCHITECTURE_LTX2_FULL)
 
@@ -1323,12 +1326,32 @@ class BucketBatchManager:
             latents = batch_tensor_data.get("latents")
             if isinstance(latents, torch.Tensor) and latents.dim() == 5:
                 bsz, _c, frames, height, width = latents.shape
-                seq_len = frames * height * width
+                virtual_num_frames = batch_tensor_data.pop("ltx2_virtual_num_frames", None)
+                virtual_height = batch_tensor_data.pop("ltx2_virtual_height", None)
+                virtual_width = batch_tensor_data.pop("ltx2_virtual_width", None)
+
+                num_frames_tensor = torch.full((bsz,), frames, dtype=torch.int32)
+                height_tensor = torch.full((bsz,), height, dtype=torch.int32)
+                width_tensor = torch.full((bsz,), width, dtype=torch.int32)
+                if (
+                    isinstance(virtual_num_frames, torch.Tensor)
+                    and isinstance(virtual_height, torch.Tensor)
+                    and isinstance(virtual_width, torch.Tensor)
+                ):
+                    if (
+                        virtual_num_frames.numel() == bsz
+                        and virtual_height.numel() == bsz
+                        and virtual_width.numel() == bsz
+                    ):
+                        num_frames_tensor = virtual_num_frames.to(dtype=torch.int32).view(-1)
+                        height_tensor = virtual_height.to(dtype=torch.int32).view(-1)
+                        width_tensor = virtual_width.to(dtype=torch.int32).view(-1)
+
                 batch_tensor_data["latents"] = {
                     "latents": latents,
-                    "num_frames": torch.full((bsz,), frames, dtype=torch.int32),
-                    "height": torch.full((bsz,), height, dtype=torch.int32),
-                    "width": torch.full((bsz,), width, dtype=torch.int32),
+                    "num_frames": num_frames_tensor,
+                    "height": height_tensor,
+                    "width": width_tensor,
                     "fps": torch.full((bsz,), self.target_fps, dtype=torch.float32),
                 }
 
@@ -2272,6 +2295,7 @@ class BaseDataset(torch.utils.data.Dataset):
         self.caption_extension = caption_extension
         self.batch_size = batch_size
         self.num_repeats = num_repeats
+        self.enable_bucket = enable_bucket
         self.bucket_no_upscale = bucket_no_upscale
         self.cache_directory = cache_directory
         self.reference_cache_directory = reference_cache_directory
@@ -2493,12 +2517,14 @@ class ImageDataset(BaseDataset):
         cache_directory: Optional[str] = None,
         multiple_target: bool = False,
         reference_cache_directory: Optional[str] = None,
-        separate_audio_buckets: bool = False,        fp_latent_window_size: Optional[int] = 9,
+        separate_audio_buckets: bool = False,
+        fp_latent_window_size: Optional[int] = 9,
         fp_1f_clean_indices: Optional[list[int]] = None,
         fp_1f_target_index: Optional[int] = None,
         fp_1f_no_post: Optional[bool] = False,
         no_resize_control: Optional[bool] = False,
         control_resolution: Optional[Tuple[int, int]] = None,
+        cache_only: bool = False,
         debug_dataset: bool = False,
         architecture: str = "no_default",
         enable_ar_bucket: bool = False,
@@ -2533,6 +2559,7 @@ class ImageDataset(BaseDataset):
         self.fp_1f_no_post = fp_1f_no_post
         self.no_resize_control = no_resize_control
         self.control_resolution = control_resolution
+        self.cache_only = cache_only
 
         control_count_per_image: Optional[int] = 1
         if self.architecture == ARCHITECTURE_FRAMEPACK or self.architecture == ARCHITECTURE_WAN:
@@ -2551,7 +2578,9 @@ class ImageDataset(BaseDataset):
         elif self.architecture == ARCHITECTURE_QWEN_IMAGE_EDIT:
             control_count_per_image = None  # can be multiple control images
 
-        if image_directory is not None:
+        if self.cache_only:
+            self.datasource = None
+        elif image_directory is not None:
             self.datasource = ImageDirectoryDatasource(
                 image_directory, caption_extension, control_directory, control_count_per_image, multiple_target
             )
@@ -2562,10 +2591,12 @@ class ImageDataset(BaseDataset):
 
         if self.cache_directory is None:
             self.cache_directory = self.image_directory
+        if self.cache_only and self.cache_directory is None:
+            raise ValueError("cache_directory is required when cache_only=True")
 
         self.batch_manager = None
         self.num_train_items = 0
-        self.has_control = self.datasource.has_control
+        self.has_control = self.datasource.has_control if self.datasource is not None else False
 
     def get_metadata(self):
         metadata = super().get_metadata()
@@ -2576,12 +2607,17 @@ class ImageDataset(BaseDataset):
         if self.control_directory is not None:
             metadata["control_directory"] = os.path.basename(self.control_directory)
         metadata["has_control"] = self.has_control
+        metadata["cache_only"] = self.cache_only
         return metadata
 
     def get_total_image_count(self):
+        if self.datasource is None:
+            return None
         return len(self.datasource) if self.datasource.is_indexable() else None
 
     def retrieve_latent_cache_batches(self, num_workers: int):
+        if self.datasource is None:
+            raise ValueError("retrieve_latent_cache_batches is not available when cache_only=True")
         bucket_selector = BucketSelector(
             self.resolution,
             self.enable_bucket,
@@ -2730,6 +2766,8 @@ class ImageDataset(BaseDataset):
         executor.shutdown()
 
     def retrieve_text_encoder_output_cache_batches(self, num_workers: int):
+        if self.datasource is None:
+            raise ValueError("retrieve_text_encoder_output_cache_batches is not available when cache_only=True")
         return self._default_retrieve_text_encoder_output_cache_batches(self.datasource, self.batch_size, num_workers)
 
     def prepare_for_training(self, num_timestep_buckets: Optional[int] = None):
@@ -2835,6 +2873,7 @@ class AudioDataset(BaseDataset):
         cache_directory: Optional[str] = None,
         reference_cache_directory: Optional[str] = None,
         separate_audio_buckets: bool = False,
+        cache_only: bool = False,
         debug_dataset: bool = False,
         architecture: str = "no_default",
     ):
@@ -2853,8 +2892,11 @@ class AudioDataset(BaseDataset):
         )
         self.audio_directory = audio_directory
         self.audio_jsonl_file = audio_jsonl_file
+        self.cache_only = cache_only
 
-        if audio_directory is not None:
+        if self.cache_only:
+            self.datasource = None
+        elif audio_directory is not None:
             self.datasource = AudioDirectoryDatasource(audio_directory, caption_extension)
         elif audio_jsonl_file is not None:
             self.datasource = AudioJsonlDatasource(audio_jsonl_file)
@@ -2863,6 +2905,8 @@ class AudioDataset(BaseDataset):
 
         if self.cache_directory is None:
             self.cache_directory = self.audio_directory
+        if self.cache_only and self.cache_directory is None:
+            raise ValueError("cache_directory is required when cache_only=True")
 
         self.batch_manager = None
         self.num_train_items = 0
@@ -2873,18 +2917,24 @@ class AudioDataset(BaseDataset):
             metadata["audio_directory"] = os.path.basename(self.audio_directory)
         if self.audio_jsonl_file is not None:
             metadata["audio_jsonl_file"] = os.path.basename(self.audio_jsonl_file)
+        metadata["cache_only"] = self.cache_only
         return metadata
 
-    def _dummy_video_cache_path(self, item_key: str) -> str:
+    def _uses_ltx2_audio_video_geometry(self) -> bool:
+        return self.architecture in {ARCHITECTURE_LTX2, ARCHITECTURE_LTX2_FULL}
+
+    def _legacy_audio_latent_cache_path(self, item_key: str) -> str:
         basename = os.path.splitext(os.path.basename(item_key))[0]
         assert self.cache_directory is not None, "cache_directory is required / cache_directoryは必須です"
         return os.path.join(self.cache_directory, f"{basename}_0001x0001_{self.architecture}.safetensors")
 
-    def _strip_dummy_resolution(self, item_key: str) -> str:
+    def _legacy_strip_resolution_suffix(self, item_key: str) -> str:
         suffix = "_0001x0001"
         return item_key[: -len(suffix)] if item_key.endswith(suffix) else item_key
 
     def retrieve_latent_cache_batches(self, num_workers: int):
+        if self.datasource is None:
+            raise ValueError("retrieve_latent_cache_batches is not available when cache_only=True")
         executor = ThreadPoolExecutor(max_workers=num_workers)
         data: list[ItemInfo] = []
         futures = []
@@ -2900,9 +2950,15 @@ class AudioDataset(BaseDataset):
 
                 for future in completed_futures:
                     audio_path, caption = future.result()
-                    bucket_reso = self._append_audio_bucket_key((1, 1), True)
-                    item_info = ItemInfo(audio_path, caption, (1, 1), bucket_reso)
-                    item_info.latent_cache_path = self._dummy_video_cache_path(audio_path)
+                    if self._uses_ltx2_audio_video_geometry():
+                        width, height = int(self.resolution[0]), int(self.resolution[1])
+                        bucket_reso = self._append_audio_bucket_key((width, height), True)
+                        item_info = ItemInfo(audio_path, caption, (width, height), bucket_reso)
+                        item_info.latent_cache_path = self.get_latent_cache_path(item_info)
+                    else:
+                        bucket_reso = self._append_audio_bucket_key((1, 1), True)
+                        item_info = ItemInfo(audio_path, caption, (1, 1), bucket_reso)
+                        item_info.latent_cache_path = self._legacy_audio_latent_cache_path(audio_path)
                     item_info.audio_latent_cache_path = self.get_audio_latent_cache_path(item_info)
                     item_info.text_encoder_output_cache_path = self.get_text_encoder_output_cache_path(item_info)
                     item_info.audio_path = audio_path
@@ -2928,17 +2984,25 @@ class AudioDataset(BaseDataset):
                 batch = submit_batch()
                 if batch is None:
                     break
-                yield (1, 1), batch
+                if self._uses_ltx2_audio_video_geometry():
+                    yield (int(self.resolution[0]), int(self.resolution[1])), batch
+                else:
+                    yield (1, 1), batch
 
         aggregate_future(consume_all=True)
         while True:
             batch = submit_batch(flush=True)
             if batch is None:
                 break
-            yield (1, 1), batch
+            if self._uses_ltx2_audio_video_geometry():
+                yield (int(self.resolution[0]), int(self.resolution[1])), batch
+            else:
+                yield (1, 1), batch
         executor.shutdown()
 
     def retrieve_text_encoder_output_cache_batches(self, num_workers: int):
+        if self.datasource is None:
+            raise ValueError("retrieve_text_encoder_output_cache_batches is not available when cache_only=True")
         return self._default_retrieve_text_encoder_output_cache_batches(self.datasource, self.batch_size, num_workers)
 
     def prepare_for_training(self, num_timestep_buckets: Optional[int] = None):
@@ -2951,20 +3015,52 @@ class AudioDataset(BaseDataset):
             suffix = f"_{self.architecture}_audio.safetensors"
             if not base.endswith(suffix):
                 continue
-            item_key = self._strip_dummy_resolution(base[: -len(suffix)])
-            dummy_cache_file = os.path.join(self.cache_directory, f"{item_key}_0001x0001_{self.architecture}.safetensors")
-            if not os.path.exists(dummy_cache_file):
-                logger.warning(f"Dummy video cache file not found: {dummy_cache_file}")
-                continue
-            text_encoder_output_cache_file = os.path.join(self.cache_directory, f"{item_key}_{self.architecture}_te.safetensors")
-            if not os.path.exists(text_encoder_output_cache_file):
-                logger.warning(f"Text encoder output cache file not found: {text_encoder_output_cache_file}")
-                continue
+            if self._uses_ltx2_audio_video_geometry():
+                latent_cache_file = os.path.join(
+                    self.cache_directory,
+                    base[: -len(suffix)] + f"_{self.architecture}.safetensors",
+                )
+                if not os.path.exists(latent_cache_file):
+                    logger.warning(f"Video latent cache file not found: {latent_cache_file}")
+                    continue
 
-            bucket_reso = self._append_audio_bucket_key((1, 1), True)
-            item_info = ItemInfo(item_key, "", (1, 1), bucket_reso, latent_cache_path=dummy_cache_file)
-            item_info.text_encoder_output_cache_path = text_encoder_output_cache_file
-            item_info.audio_latent_cache_path = audio_cache_file
+                latent_stem = os.path.basename(latent_cache_file)[: -len(f"_{self.architecture}.safetensors")]
+                original_size = (int(self.resolution[0]), int(self.resolution[1]))
+                item_key = latent_stem
+                if "_" in latent_stem:
+                    key_stem, resolution_token = latent_stem.rsplit("_", 1)
+                    if "x" in resolution_token:
+                        w_s, h_s = resolution_token.split("x", 1)
+                        try:
+                            original_size = (int(w_s), int(h_s))
+                            item_key = key_stem
+                        except ValueError:
+                            item_key = latent_stem
+
+                text_encoder_output_cache_file = os.path.join(self.cache_directory, f"{item_key}_{self.architecture}_te.safetensors")
+                if not os.path.exists(text_encoder_output_cache_file):
+                    logger.warning(f"Text encoder output cache file not found: {text_encoder_output_cache_file}")
+                    continue
+
+                bucket_reso = self._append_audio_bucket_key((original_size[0], original_size[1]), True)
+                item_info = ItemInfo(item_key, "", original_size, bucket_reso, latent_cache_path=latent_cache_file)
+                item_info.text_encoder_output_cache_path = text_encoder_output_cache_file
+                item_info.audio_latent_cache_path = audio_cache_file
+            else:
+                item_key = self._legacy_strip_resolution_suffix(base[: -len(suffix)])
+                latent_cache_file = os.path.join(self.cache_directory, f"{item_key}_0001x0001_{self.architecture}.safetensors")
+                if not os.path.exists(latent_cache_file):
+                    logger.warning(f"Video latent cache file not found: {latent_cache_file}")
+                    continue
+                text_encoder_output_cache_file = os.path.join(self.cache_directory, f"{item_key}_{self.architecture}_te.safetensors")
+                if not os.path.exists(text_encoder_output_cache_file):
+                    logger.warning(f"Text encoder output cache file not found: {text_encoder_output_cache_file}")
+                    continue
+
+                bucket_reso = self._append_audio_bucket_key((1, 1), True)
+                item_info = ItemInfo(item_key, "", (1, 1), bucket_reso, latent_cache_path=latent_cache_file)
+                item_info.text_encoder_output_cache_path = text_encoder_output_cache_file
+                item_info.audio_latent_cache_path = audio_cache_file
 
             bucket = bucketed_item_info.get(bucket_reso, [])
             for _ in range(self.num_repeats):
@@ -3025,6 +3121,7 @@ class VideoDataset(BaseDataset):
         reference_cache_directory: Optional[str] = None,
         separate_audio_buckets: bool = False,
         fp_latent_window_size: Optional[int] = 9,
+        cache_only: bool = False,
         debug_dataset: bool = False,
         architecture: str = "no_default",
         enable_ar_bucket: bool = False,
@@ -3062,6 +3159,7 @@ class VideoDataset(BaseDataset):
         self.fp_latent_window_size = fp_latent_window_size
         self.enable_mask = enable_mask
         self.default_mask_file = default_mask_file
+        self.cache_only = cache_only
 
         self.vae_frame_stride = 4  # all architectures require frames to be divisible by 4
         if self.architecture == ARCHITECTURE_HUNYUAN_VIDEO:
@@ -3098,25 +3196,31 @@ class VideoDataset(BaseDataset):
 
         self.target_frames = target_frames
 
-        if video_directory is not None:
+        if self.cache_only:
+            self.datasource = None
+        elif video_directory is not None:
             self.datasource = VideoDirectoryDatasource(video_directory, caption_extension, control_directory, enable_mask, default_mask_file)
         elif video_jsonl_file is not None:
             self.datasource = VideoJsonlDatasource(video_jsonl_file)
+        else:
+            raise ValueError("video_directory or video_jsonl_file must be specified")
 
-        if self.frame_extraction == "uniform" and self.frame_sample == 1:
+        if not self.cache_only and self.frame_extraction == "uniform" and self.frame_sample == 1:
             self.frame_extraction = "head"
             logger.warning("frame_sample is set to 1 for frame_extraction=uniform. frame_extraction is changed to head.")
-        if self.frame_extraction == "head":
+        if not self.cache_only and self.frame_extraction == "head":
             # head extraction. we can limit the number of frames to be extracted
             self.datasource.set_start_and_end_frame(0, max(self.target_frames))
 
         if self.cache_directory is None:
             self.cache_directory = self.video_directory
+        if self.cache_only and self.cache_directory is None:
+            raise ValueError("cache_directory is required when cache_only=True")
 
         self.batch_manager = None
         self.num_train_items = 0
-        self.has_control = self.datasource.has_control
-        self.has_mask = getattr(self.datasource, "has_mask", False)
+        self.has_control = self.datasource.has_control if self.datasource is not None else False
+        self.has_mask = getattr(self.datasource, "has_mask", False) if self.datasource is not None else False
 
     def get_metadata(self):
         metadata = super().get_metadata()
@@ -3136,9 +3240,12 @@ class VideoDataset(BaseDataset):
         metadata["has_mask"] = self.has_mask
         metadata["enable_mask"] = self.enable_mask
         metadata["default_mask_file"] = self.default_mask_file
+        metadata["cache_only"] = self.cache_only
         return metadata
 
     def retrieve_latent_cache_batches(self, num_workers: int):
+        if self.datasource is None:
+            raise ValueError("retrieve_latent_cache_batches is not available when cache_only=True")
         buckset_selector = BucketSelector(
             self.resolution,
             enable_bucket=self.enable_bucket,
@@ -3314,6 +3421,8 @@ class VideoDataset(BaseDataset):
         executor.shutdown()
 
     def retrieve_text_encoder_output_cache_batches(self, num_workers: int):
+        if self.datasource is None:
+            raise ValueError("retrieve_text_encoder_output_cache_batches is not available when cache_only=True")
         return self._default_retrieve_text_encoder_output_cache_batches(self.datasource, self.batch_size, num_workers)
 
     def prepare_for_training(self, num_timestep_buckets: Optional[int] = None):
