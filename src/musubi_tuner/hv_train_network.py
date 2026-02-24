@@ -2017,10 +2017,16 @@ class NetworkTrainer:
             logger.info(
                 f"enable swap {blocks_to_swap} blocks to CPU from device: {accelerator.device}, use pinned memory: {args.use_pinned_memory_for_block_swap}"
             )
-            transformer.enable_block_swap(
-                blocks_to_swap, accelerator.device, supports_backward=True, use_pinned_memory=args.use_pinned_memory_for_block_swap,
-                swap_norms=getattr(args, 'swap_norms', False)
-            )
+            try:
+                transformer.enable_block_swap(
+                    blocks_to_swap, accelerator.device, supports_backward=True, use_pinned_memory=args.use_pinned_memory_for_block_swap,
+                    swap_norms=getattr(args, 'swap_norms', False)
+                )
+            except TypeError:
+                # Some models (e.g., WAN) don't support swap_norms parameter
+                transformer.enable_block_swap(
+                    blocks_to_swap, accelerator.device, supports_backward=True, use_pinned_memory=args.use_pinned_memory_for_block_swap
+                )
             _log_vram("AFTER enable_block_swap (offloader created)", logger)
             transformer.move_to_device_except_swap_blocks(accelerator.device)
             _log_vram("AFTER move_to_device_except_swap_blocks #1 (18 blocks to GPU)", logger)
@@ -2129,10 +2135,14 @@ class NetworkTrainer:
                         if hasattr(block, "use_pinned_memory"):
                             block.use_pinned_memory = True
             else:
-                transformer.enable_gradient_checkpointing(
-                    args.gradient_checkpointing_cpu_offload,
-                    blocks_to_checkpoint=blocks_to_ckpt
-                )
+                try:
+                    transformer.enable_gradient_checkpointing(
+                        args.gradient_checkpointing_cpu_offload,
+                        blocks_to_checkpoint=blocks_to_ckpt
+                    )
+                except TypeError:
+                    # Some models (e.g., WAN) don't support blocks_to_checkpoint parameter
+                    transformer.enable_gradient_checkpointing()
             try:
                 network.enable_gradient_checkpointing(
                     args.gradient_checkpointing_cpu_offload,
