@@ -89,6 +89,9 @@ class VideoDatasetParams(BaseDatasetParams):
     enable_mask: bool = False                     # Enable spatial ROI masking
     default_mask_file: Optional[str] = None      # Fallback mask file for missing masks (auto-detects mask/ subdirectory if not set)
 
+    # I2V slider control video parameters
+    control_args: Optional[Sequence] = None      # [type, num] e.g., ["jump", "1"] or ["fade", "1"]
+
 
 @dataclass
 class AudioDatasetParams(BaseDatasetParams):
@@ -176,6 +179,7 @@ class ConfigSanitizer:
         "fp_latent_window_size": int,
         "enable_mask": bool,
         "default_mask_file": str,
+        "control_args": list,
     }
 
     # options handled by argparse but not handled by user config
@@ -409,6 +413,7 @@ def generate_dataset_group_by_blueprint(
         source_fps: {dataset.source_fps}
         target_fps: {getattr(dataset, "target_fps", None)}
         fp_latent_window_size: {dataset.fp_latent_window_size}
+        control_args: {getattr(dataset, "control_args", None)}
     \n"""
                 ),
                 "    ",

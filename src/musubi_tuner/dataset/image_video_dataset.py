@@ -3130,6 +3130,7 @@ class VideoDataset(BaseDataset):
         num_ar_buckets: int = 2,
         enable_mask: bool = False,
         default_mask_file: Optional[str] = None,
+        control_args: Optional[Sequence] = None,
     ):
         super(VideoDataset, self).__init__(
             resolution,
@@ -3159,6 +3160,7 @@ class VideoDataset(BaseDataset):
         self.fp_latent_window_size = fp_latent_window_size
         self.enable_mask = enable_mask
         self.default_mask_file = default_mask_file
+        self.control_args = control_args
         self.cache_only = cache_only
 
         self.vae_frame_stride = 4  # all architectures require frames to be divisible by 4
