@@ -5940,68 +5940,6 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         help="Cache start_images latents in memory for image-to-video mode. When enabled and start_images are provided "
              "in sample parameters, the images are encoded to latents once and reused across all sampling steps.",
     )
-    # -- Preservation / regularization flags --
-    parser.add_argument(
-        "--blank_preservation",
-        action="store_true",
-        help="Regularize LoRA to not change blank-prompt output (MSE between LoRA ON/OFF with empty prompt).",
-    )
-    parser.add_argument(
-        "--blank_preservation_args",
-        type=str,
-        nargs="*",
-        help="Key=value args for blank preservation, e.g. multiplier=0.5",
-    )
-    parser.add_argument(
-        "--dop",
-        action="store_true",
-        help="Differential Output Preservation: regularize LoRA to not change class-prompt output.",
-    )
-    parser.add_argument(
-        "--dop_args",
-        type=str,
-        nargs="*",
-        help="Key=value args for DOP, e.g. class=woman multiplier=1.0",
-    )
-    parser.add_argument(
-        "--prior_divergence",
-        action="store_true",
-        help="Encourage LoRA output to diverge from base model on training prompts.",
-    )
-    parser.add_argument(
-        "--prior_divergence_args",
-        type=str,
-        nargs="*",
-        help="Key=value args for prior divergence, e.g. multiplier=0.1",
-    )
-    parser.add_argument(
-        "--use_precached_preservation",
-        action="store_true",
-        help="Load preservation embeddings from precached .pt file instead of loading Gemma. "
-             "Run ltx2_cache_text_encoder_outputs.py with --precache_preservation_prompts first.",
-    )
-    parser.add_argument(
-        "--preservation_prompts_cache",
-        type=str,
-        default=None,
-        help="Path to precached preservation prompt embeddings (.pt). "
-             "Defaults to <cache_directory>/ltx2_preservation_cache.pt. Requires --use_precached_preservation.",
-    )
-
-    # -- CREPA (Cross-frame Representation Alignment) --
-    parser.add_argument(
-        "--crepa",
-        action="store_true",
-        help="Enable CREPA temporal consistency regularization (arxiv 2506.09229). "
-             "Aligns DiT hidden states across video frames via a small projector MLP.",
-    )
-    parser.add_argument(
-        "--crepa_args",
-        type=str,
-        nargs="*",
-        help="Key=value args for CREPA, e.g. student_block_idx=16 teacher_block_idx=32 "
-             "lambda_crepa=0.1 tau=1.0 num_neighbors=2 schedule=constant normalize=true",
-    )
 
     parser.add_argument(
         "--freeze_early_blocks",
@@ -6043,14 +5981,6 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         action=argparse.BooleanOptionalAction,
         default=False,
         help="Freeze attention geometry params (to_q/to_k/q_norm/k_norm) during full fine-tuning.",
-    )
-    # -- Caption dropout --
-    parser.add_argument(
-        "--caption_dropout_rate",
-        type=float,
-        default=0.0,
-        help="Probability of dropping the caption for each sample (0.0 = disabled). "
-             "Zeros out text embeddings and mask to train unconditional generation for CFG.",
     )
 
     return parser

@@ -35,8 +35,10 @@ def _patch_lora_load_state_dict_for_audio(network: lora.LoRANetwork) -> lora.LoR
                 f"Missing non-audio LoRA keys in state_dict: {non_audio_missing[:10]}"
             )
         if non_audio_unexpected:
-            raise RuntimeError(
-                f"Unexpected non-audio LoRA keys in state_dict: {non_audio_unexpected[:10]}"
+            # Changed from error to warning - extra modules (like FFN in V2V preset) are harmless
+            logger.warning(
+                f"LTX2 LoRA: {len(non_audio_unexpected)} unexpected non-audio keys in checkpoint (extra modules not in current preset). "
+                f"These will be ignored. Showing first 10: {non_audio_unexpected[:10]}"
             )
         if missing and not non_audio_missing:
             logger.warning(
@@ -49,7 +51,7 @@ def _patch_lora_load_state_dict_for_audio(network: lora.LoRANetwork) -> lora.LoR
         try:
             incompatible = torch.nn.modules.module._IncompatibleKeys(  # type: ignore[attr-defined]
                 missing_keys=non_audio_missing,
-                unexpected_keys=non_audio_unexpected,
+                unexpected_keys=[],  # Clear unexpected keys since we're allowing them
             )
             return incompatible
         except Exception:

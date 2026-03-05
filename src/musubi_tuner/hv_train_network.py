@@ -1917,6 +1917,9 @@ class NetworkTrainer:
             args.seed = random.randint(0, 2**32)
         set_seed(args.seed)
 
+        # Optional GUI metrics (for Flet GUI integration)
+        gui_metrics = None
+
         loss_diag_enabled = os.getenv("LTX2_LOSS_DIAG", "0") == "1"
         loss_diag_every = int(os.getenv("LTX2_LOSS_DIAG_EVERY", "10"))
         audio_loss_balance_mode = str(getattr(args, "audio_loss_balance_mode", "none") or "none").lower()
@@ -2255,7 +2258,7 @@ class NetworkTrainer:
         )
 
         optimizer_name, optimizer_args, optimizer, optimizer_train_fn, optimizer_eval_fn = self.get_optimizer(
-            args, trainable_params, optimizer_kwargs=optimizer_kwargs
+            args, trainable_params
         )
 
         # prepare dataloader
