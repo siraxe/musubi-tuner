@@ -365,8 +365,13 @@ def line_to_prompt_dict(line: str) -> dict:
                 continue
 
             m = re.match(r"i (.+)", parg, re.IGNORECASE)
-            if m:  # image path
+            if m:  # image path (I2V conditioning)
                 prompt_dict["image_path"] = m.group(1).strip()
+                continue
+
+            m = re.match(r"v (.+)", parg, re.IGNORECASE)
+            if m:  # v2v reference path (IC-LoRA / v2v conditioning)
+                prompt_dict["v2v_ref_path"] = m.group(1).strip()
                 continue
 
             m = re.match(r"ei (.+)", parg, re.IGNORECASE)
@@ -1508,6 +1513,10 @@ class NetworkTrainer:
 
         self.default_guidance_scale = 6.0
 
+    def get_checkpoint_metadata(self, args: argparse.Namespace) -> Dict[str, Any]:
+        """Return extra metadata to include in LoRA safetensors. Override in subclasses."""
+        return {}
+
     def post_save_checkpoint_hook(self, args, ckpt_file, ckpt_name, accelerator, force_sync_upload=False):
         """Hook called after checkpoint is saved. Override in subclasses for architecture-specific processing."""
         pass
@@ -1913,7 +1922,7 @@ class NetworkTrainer:
         audio_loss_balance_mode = str(getattr(args, "audio_loss_balance_mode", "none") or "none").lower()
         audio_loss_balance_beta = float(getattr(args, "audio_loss_balance_beta", 0.01))
         audio_loss_balance_eps = float(getattr(args, "audio_loss_balance_eps", 0.05))
-        audio_loss_balance_min = float(getattr(args, "audio_loss_balance_min", 1.0))
+        audio_loss_balance_min = float(getattr(args, "audio_loss_balance_min", 0.05))
         audio_loss_balance_max = float(getattr(args, "audio_loss_balance_max", 4.0))
         audio_presence_ema = float(getattr(args, "audio_loss_balance_ema_init", 1.0))
         audio_presence_ema = min(max(audio_presence_ema, 1e-6), 1.0)
@@ -2033,7 +2042,12 @@ class NetworkTrainer:
 
         # HunyuanVideo: bfloat16 or float16, Wan2.1: bfloat16
         dit_dtype = torch.bfloat16 if args.dit_dtype is None else model_utils.str_to_dtype(args.dit_dtype)
-        dit_weight_dtype = (None if args.fp8_scaled else torch.float8_e4m3fn) if args.fp8_base else dit_dtype
+        if getattr(args, "nf4_base", False):
+            dit_weight_dtype = None  # NF4: quantized at load time, no dtype override needed
+        elif args.fp8_base:
+            dit_weight_dtype = None if args.fp8_scaled else torch.float8_e4m3fn
+        else:
+            dit_weight_dtype = dit_dtype
         logger.info(f"DiT precision: {dit_dtype}, weight precision: {dit_weight_dtype}")
 
         # get embedding for sampling images
@@ -2133,6 +2147,16 @@ class NetworkTrainer:
                 key, value = net_arg.split("=", 1)
                 net_kwargs[key] = value
 
+        # Inject pre-computed LoftQ data if available (computed during model loading).
+        # Use a separate dict so loftq_data (tensors) doesn't end up in net_kwargs
+        # which gets JSON-serialized for metadata.
+        _loftq_net_kwargs = dict(net_kwargs)
+        from musubi_tuner.ltx2_train_network import load_ltx2_model
+        _loftq_data = getattr(load_ltx2_model, "_loftq_data", None)
+        if _loftq_data is not None:
+            _loftq_net_kwargs["loftq_data"] = _loftq_data
+            load_ltx2_model._loftq_data = None  # consume it
+
         if args.dim_from_weights:
             logger.info(f"Loading network from weights: {args.dim_from_weights}")
             weights_sd = load_file(args.dim_from_weights)
@@ -2148,7 +2172,7 @@ class NetworkTrainer:
                     None,
                     transformer,
                     neuron_dropout=args.network_dropout,
-                    **net_kwargs,
+                    **_loftq_net_kwargs,
                 )
             else:
                 # LyCORIS compatibility
@@ -2159,7 +2183,7 @@ class NetworkTrainer:
                     vae,
                     None,
                     transformer,
-                    **net_kwargs,
+                    **_loftq_net_kwargs,
                 )
         if network is None:
             return
@@ -2224,12 +2248,12 @@ class NetworkTrainer:
         # prepare optimizer, data loader etc.
         accelerator.print("prepare optimizer, data loader etc.")
 
-        trainable_params, lr_descriptions = network.prepare_optimizer_params(unet_lr=args.learning_rate)
+        trainable_params, lr_descriptions = network.prepare_optimizer_params(
+            unet_lr=args.learning_rate,
+            audio_lr=getattr(args, "audio_lr", None),
+            lr_args=getattr(args, "lr_args", None),
+        )
 
-        # Parse optimizer args using utility function
-        optimizer_kwargs = {}
-        if parse_optimizer_args_list is not None and args.optimizer_args is not None:
-            optimizer_kwargs = parse_optimizer_args_list(args.optimizer_args)
         optimizer_name, optimizer_args, optimizer, optimizer_train_fn, optimizer_eval_fn = self.get_optimizer(
             args, trainable_params, optimizer_kwargs=optimizer_kwargs
         )
@@ -2389,6 +2413,17 @@ class NetworkTrainer:
                         weights.pop(i)
                 # print(f"save model hook: {len(weights)} weights will be saved")
 
+                # Save CREPA projector into state directory so it matches the optimizer state
+                if hasattr(self, '_crepa') and self._crepa is not None:
+                    try:
+                        from safetensors.torch import save_file
+                        proj_sd = self._crepa.state_dict()
+                        if proj_sd:
+                            proj_file = os.path.join(output_dir, "crepa_projector.safetensors")
+                            save_file(proj_sd, proj_file)
+                    except Exception as e:
+                        logger.warning(f"Failed to save CREPA projector to state dir: {e}")
+
         def load_model_hook(models, input_dir):
             # remove models except network
             remove_indices = []
@@ -2401,6 +2436,17 @@ class NetworkTrainer:
 
         accelerator.register_save_state_pre_hook(save_model_hook)
         accelerator.register_load_state_pre_hook(load_model_hook)
+
+        # Set up CREPA (and any other pre-train hooks) BEFORE resume so that the
+        # optimizer has the correct number of param groups when load_state() restores
+        # the saved optimizer state.  Without this, resume crashes with
+        # "loaded state dict has a different number of parameter groups".
+        self.pre_train_hook(args, accelerator, transformer=transformer, network=network)
+        if hasattr(self, '_crepa') and self._crepa is not None:
+            crepa_params = self._crepa.get_trainable_params()
+            if crepa_params:
+                optimizer.add_param_group({"params": crepa_params, "lr": args.learning_rate})
+                accelerator.print(f"CREPA: added {sum(p.numel() for p in crepa_params):,} projector params to optimizer")
 
         # epoch数を計算する
         num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -2456,6 +2502,9 @@ class NetworkTrainer:
             "ss_optimizer": optimizer_name + (f"({optimizer_args})" if len(optimizer_args) > 0 else ""),
             "ss_max_grad_norm": args.max_grad_norm,
             "ss_fp8_base": bool(args.fp8_base),
+            "ss_nf4_base": bool(getattr(args, "nf4_base", False)),
+            "ss_loftq_init": bool(getattr(args, "loftq_init", False)),
+            "ss_awq_calibration": bool(getattr(args, "awq_calibration", False)),
             # "ss_fp8_llm": bool(args.fp8_llm), # remove this because this is only for HuanyuanVideo TODO set architecure dependent metadata
             "ss_full_fp16": bool(args.full_fp16),
             "ss_full_bf16": bool(args.full_bf16),
@@ -2467,6 +2516,12 @@ class NetworkTrainer:
             "ss_timestep_sampling": args.timestep_sampling,
             "ss_sigmoid_scale": args.sigmoid_scale,
             "ss_discrete_flow_shift": args.discrete_flow_shift,
+            "ss_ltx_version": getattr(args, "ltx_version", None),
+            "ss_shifted_logit_mode": getattr(args, "shifted_logit_mode", None),
+            "ss_shifted_logit_eps": getattr(args, "shifted_logit_eps", None),
+            "ss_shifted_logit_uniform_prob": getattr(args, "shifted_logit_uniform_prob", None),
+            "ss_audio_lr": getattr(args, "audio_lr", None),
+            "ss_lr_args": json.dumps(getattr(args, "lr_args", None)) if getattr(args, "lr_args", None) else None,
         }
 
         datasets_metadata = []
@@ -2574,6 +2629,11 @@ class NetworkTrainer:
 
             metadata_to_save.update(sai_metadata)
 
+            # Architecture-specific metadata (e.g. v2v/IC-LoRA info for LTX-2)
+            extra_md = self.get_checkpoint_metadata(args)
+            if extra_md:
+                metadata_to_save.update({k: str(v) for k, v in extra_md.items()})
+
             unwrapped_nw.save_weights(ckpt_file, save_dtype, metadata_to_save)
 
             # Call post-save hook for architecture-specific processing
@@ -2589,11 +2649,41 @@ class NetworkTrainer:
             if args.huggingface_repo_id is not None:
                 huggingface_utils.upload(args, ckpt_file, "/" + ckpt_name, force_sync_upload=force_sync_upload)
 
+            if getattr(args, "save_checkpoint_metadata", False):
+                from datetime import datetime
+
+                _md = {
+                    "step": steps,
+                    "epoch": epoch_no,
+                    "timestamp": datetime.now().isoformat(timespec="seconds"),
+                }
+                try:
+                    _md["loss"] = loss.detach().item()
+                except Exception:
+                    pass
+                if loss_recorder.loss_list:
+                    _md["loss_avg"] = loss_recorder.moving_average
+                try:
+                    _md["lr"] = float(lr_scheduler.get_last_lr()[0])
+                except Exception:
+                    pass
+                if video_loss_value is not None:
+                    _md["loss_video"] = video_loss_value
+                if audio_loss_value is not None:
+                    _md["loss_audio"] = audio_loss_value
+                train_utils.save_checkpoint_metadata(ckpt_file, _md)
+
         def remove_model(old_ckpt_name):
             old_ckpt_file = os.path.join(args.output_dir, old_ckpt_name)
             if os.path.exists(old_ckpt_file):
                 accelerator.print(f"removing old checkpoint: {old_ckpt_file}")
                 os.remove(old_ckpt_file)
+            if getattr(args, "convert_to_comfy", True):
+                comfy_old_ckpt_file = old_ckpt_file.replace(".safetensors", ".comfy.safetensors")
+                if os.path.exists(comfy_old_ckpt_file):
+                    accelerator.print(f"removing old Comfy checkpoint: {comfy_old_ckpt_file}")
+                    os.remove(comfy_old_ckpt_file)
+            train_utils.remove_checkpoint_metadata(old_ckpt_file)
 
         def run_validation(step: int, epoch_no: int | None = None) -> None:
             if validation_dataloader is None:
@@ -2798,23 +2888,8 @@ class NetworkTrainer:
 
         clean_memory_on_device(accelerator.device)
 
-        self.pre_train_hook(args, accelerator, transformer=transformer, network=network)
+        # pre_train_hook and CREPA param group already called before resume (above)
 
-        # CREPA projector params → add to existing optimizer
-        if hasattr(self, '_crepa') and self._crepa is not None:
-            crepa_params = self._crepa.get_trainable_params()
-            if crepa_params:
-                optimizer.add_param_group({"params": crepa_params, "lr": args.learning_rate})
-                accelerator.print(f"CREPA: added {sum(p.numel() for p in crepa_params):,} projector params to optimizer")
-
-        # GUI dashboard
-        gui_metrics = None
-        if getattr(args, "gui", False) and accelerator.is_main_process:
-            from musubi_tuner.gui_dashboard import create_metrics_writer, start_gui_server
-
-            gui_metrics = create_metrics_writer(args.output_dir)
-            gui_metrics.update_status(step=0, max_steps=args.max_train_steps, epoch=0, max_epochs=num_train_epochs, status="starting")
-            start_gui_server(args.output_dir, host=getattr(args, "gui_host", "0.0.0.0"), port=getattr(args, "gui_port", 7860))
         optimizer_train_fn()  # Set training mode
 
         for epoch in range(epoch_to_start, num_train_epochs):
@@ -3914,6 +3989,11 @@ def setup_parser_common() -> argparse.ArgumentParser:
         action="store_true",
         help="save training state (including optimizer states etc.) on train end even if --save_state is not specified"
         " / --save_stateが未指定時にもoptimizerなど学習状態も含めたstateを学習終了時に保存する",
+    )
+    parser.add_argument(
+        "--save_checkpoint_metadata",
+        action="store_true",
+        help="save a JSON metadata file alongside each checkpoint with loss, lr, step, epoch",
     )
 
     # SAI Model spec

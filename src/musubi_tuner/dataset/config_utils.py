@@ -74,6 +74,7 @@ class VideoDatasetParams(BaseDatasetParams):
     video_directory: Optional[str] = None
     video_jsonl_file: Optional[str] = None
     control_directory: Optional[str] = None
+    reference_directory: Optional[str] = None
     target_frames: Sequence[int] = (1,)
     frame_extraction: Optional[str] = "head"
     frame_stride: Optional[int] = 1
@@ -97,6 +98,8 @@ class VideoDatasetParams(BaseDatasetParams):
 class AudioDatasetParams(BaseDatasetParams):
     audio_directory: Optional[str] = None
     audio_jsonl_file: Optional[str] = None
+    audio_bucket_strategy: str = "pad"  # "pad" (default) or "truncate"
+    audio_bucket_interval: float = 2.0  # bucket step in seconds
 
 
 @dataclass
@@ -164,11 +167,14 @@ class ConfigSanitizer:
     AUDIO_DATASET_DISTINCT_SCHEMA = {
         "audio_directory": str,
         "audio_jsonl_file": str,
+        "audio_bucket_strategy": str,
+        "audio_bucket_interval": float,
     }
     VIDEO_DATASET_DISTINCT_SCHEMA = {
         "video_directory": str,
         "video_jsonl_file": str,
         "control_directory": str,
+        "reference_directory": str,
         "target_frames": [int],
         "frame_extraction": str,
         "frame_stride": int,
@@ -376,6 +382,8 @@ def generate_dataset_group_by_blueprint(
                     f"""\
         audio_directory: "{dataset.audio_directory}"
         audio_jsonl_file: "{dataset.audio_jsonl_file}"
+        audio_bucket_strategy: {getattr(dataset, "audio_bucket_strategy", "pad")}
+        audio_bucket_interval: {getattr(dataset, "audio_bucket_interval", 2.0)}
     \n"""
                 ),
                 "    ",
@@ -477,6 +485,7 @@ def _manifest_params_with_cache_only(dataset_type: str, params: dict) -> dict:
         params["video_directory"] = None
         params["video_jsonl_file"] = None
         params["control_directory"] = None
+        params["reference_directory"] = None
 
     return params
 

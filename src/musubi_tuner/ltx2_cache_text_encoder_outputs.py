@@ -33,6 +33,19 @@ DEFAULT_SAMPLE_PROMPTS_CACHE = "ltx2_sample_prompts_cache.pt"
 DEFAULT_PRESERVATION_CACHE = "ltx2_preservation_cache.pt"
 
 
+def _all_declared_datasets_are_audio(user_config: dict) -> bool:
+    declared_datasets: list[dict] = []
+    for section_name in ("datasets", "validation_datasets"):
+        section = user_config.get(section_name, [])
+        if isinstance(section, list):
+            declared_datasets.extend(ds for ds in section if isinstance(ds, dict))
+
+    if not declared_datasets:
+        return False
+
+    return all(("audio_directory" in ds or "audio_jsonl_file" in ds) for ds in declared_datasets)
+
+
 def encode_and_save_batch_official_gemma(
     text_encoder,
     batch: list[ItemInfo],
@@ -42,7 +55,7 @@ def encode_and_save_batch_official_gemma(
     audio_video: bool,
 ) -> None:
     if autocast_dtype is not None and device.type == "cuda":
-        autocast_context = torch.cuda.amp.autocast(dtype=autocast_dtype)
+        autocast_context = torch.amp.autocast("cuda", dtype=autocast_dtype)
     else:
         autocast_context = nullcontext()
 
@@ -81,7 +94,7 @@ def _encode_prompt_text_ltx2(
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if autocast_dtype is not None and device.type == "cuda":
-        autocast_context = torch.cuda.amp.autocast(dtype=autocast_dtype)
+        autocast_context = torch.amp.autocast("cuda", dtype=autocast_dtype)
     else:
         autocast_context = nullcontext()
     with torch.no_grad(), autocast_context:
@@ -545,6 +558,66 @@ def _precache_preservation_prompts(
     logger.info("Saved preservation prompt cache to %s", cache_path)
 
 
+def _precache_preservation_prompts(
+    args: argparse.Namespace,
+    *,
+    datasets: list,
+    text_encoder,
+    audio_video: bool,
+    autocast_dtype: torch.dtype | None,
+    device: torch.device,
+) -> None:
+    """Encode blank/class prompts for preservation techniques and save to disk."""
+    blank = getattr(args, "blank_preservation", False)
+    dop = getattr(args, "dop", False)
+    dop_class = getattr(args, "dop_class_prompt", "") or ""
+
+    if not blank and not dop:
+        logger.warning("--precache_preservation_prompts set but neither --blank_preservation nor --dop enabled, skipping.")
+        return
+
+    cache_path = getattr(args, "preservation_prompts_cache", None)
+    if not cache_path:
+        if not datasets:
+            raise ValueError("No datasets available to resolve preservation cache directory")
+        cache_dir = getattr(datasets[0], "cache_directory", None)
+        if not cache_dir:
+            raise ValueError("First dataset has no cache_directory; set cache_directory in dataset config")
+        cache_path = os.path.join(cache_dir, DEFAULT_PRESERVATION_CACHE)
+
+    payload: dict = {"version": 1, "audio_video": audio_video}
+
+    # Always encode as video-only for preservation (even in AV mode)
+    def _encode_video_only(prompt_text: str) -> tuple[torch.Tensor, torch.Tensor]:
+        embed, mask = _encode_prompt_text_ltx2(
+            text_encoder, prompt_text,
+            audio_video=audio_video, ltx_mode="video",  # force video-only encoding
+            autocast_dtype=autocast_dtype, device=device,
+        )
+        # In AV mode the encoder still concatenates; take video half
+        if audio_video and embed.shape[-1] % 2 == 0:
+            embed = embed[..., : embed.shape[-1] // 2]
+        return embed, mask
+
+    if blank:
+        embed, mask = _encode_video_only("")
+        payload["blank_embed"] = embed
+        payload["blank_mask"] = mask
+        logger.info("Preservation cache: encoded blank prompt  embed=%s", tuple(embed.shape))
+
+    if dop:
+        if not dop_class:
+            logger.warning("--dop set but no --dop_class_prompt provided, encoding empty string.")
+        embed, mask = _encode_video_only(dop_class)
+        payload["dop_embed"] = embed
+        payload["dop_mask"] = mask
+        payload["dop_class_prompt"] = dop_class
+        logger.info("Preservation cache: encoded DOP class prompt %r  embed=%s", dop_class, tuple(embed.shape))
+
+    torch.save(payload, cache_path)
+    logger.info("Saved preservation prompt cache to %s", cache_path)
+
+
 def main() -> None:
     parser = cache_text_encoder_outputs.setup_parser_common()
     parser = ltx2_setup_parser(parser)
@@ -555,15 +628,20 @@ def main() -> None:
     if getattr(args, "ltx_mode", None) in short_map:
         args.ltx_mode = short_map[args.ltx_mode]
 
-    ltx_mode = getattr(args, "ltx_mode", "video")
-    # For audio-only or AV mode, we need the AV encoder to get audio encodings
-    audio_video = ltx_mode in ("av", "audio")
-
     device = torch.device(args.device if args.device is not None else ("cuda" if torch.cuda.is_available() else "cpu"))
 
     blueprint_generator = BlueprintGenerator(ConfigSanitizer())
     logger.info("Load dataset config from %s", args.dataset_config)
     user_config = config_utils.load_user_config(args.dataset_config)
+    ltx_mode = getattr(args, "ltx_mode", "video")
+    if ltx_mode == "video" and _all_declared_datasets_are_audio(user_config):
+        logger.info("All datasets are audio-only; automatically switching to --ltx2_mode audio")
+        ltx_mode = "audio"
+        args.ltx_mode = "audio"
+
+    # For audio-only or AV mode, we need the AV encoder to get audio encodings
+    audio_video = ltx_mode in ("av", "audio")
+
     blueprint = blueprint_generator.generate(user_config, args, architecture=ARCHITECTURE_LTX2)
     train_dataset_group = config_utils.generate_dataset_group_by_blueprint(blueprint.dataset_group)
 
@@ -600,11 +678,11 @@ def main() -> None:
 
     autocast_dtype = torch.float16 if args.mixed_precision == "fp16" else torch.bfloat16 if args.mixed_precision == "bf16" else None
 
-    if getattr(args, "require_gemma_root", False):
-        if args.gemma_root is None:
-            raise ValueError("--gemma_root is required for LTX-2 Gemma text caching")
-    elif args.gemma_root is None:
-        raise ValueError("--gemma_root is required for LTX-2 Gemma text caching")
+    gemma_safetensors = getattr(args, "gemma_safetensors", None)
+    if args.gemma_root is None and not gemma_safetensors:
+        raise ValueError("--gemma_root or --gemma_safetensors is required for LTX-2 Gemma text caching")
+    if gemma_safetensors and (getattr(args, "gemma_load_in_8bit", False) or getattr(args, "gemma_load_in_4bit", False)):
+        raise ValueError("--gemma_safetensors cannot be combined with --gemma_load_in_4bit/8bit")
     if args.ltx2_checkpoint is None and getattr(args, "ltx2_text_encoder_checkpoint", None) is None:
         raise ValueError("--ltx2_checkpoint is required for LTX-2 Gemma text caching")
     from musubi_tuner.ltx_2.loader.single_gpu_model_builder import SingleGPUModelBuilder
@@ -644,6 +722,7 @@ def main() -> None:
         model_sd_ops=key_ops,
         module_ops=module_ops_from_gemma_root(
             args.gemma_root,
+            gemma_safetensors=gemma_safetensors,
             torch_dtype=dtype,
             load_in_8bit=bool(getattr(args, "gemma_load_in_8bit", False)),
             load_in_4bit=bool(getattr(args, "gemma_load_in_4bit", False)),
@@ -732,6 +811,16 @@ def main() -> None:
             device=device,
         )
 
+    if getattr(args, "precache_preservation_prompts", False):
+        _precache_preservation_prompts(
+            args,
+            datasets=datasets,
+            text_encoder=text_encoder,
+            audio_video=audio_video,
+            autocast_dtype=autocast_dtype,
+            device=device,
+        )
+
     cache_text_encoder_outputs.process_text_encoder_batches(
         num_workers,
         args.skip_existing,
@@ -765,6 +854,12 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         type=str,
         default=None,
         help="Local directory containing Gemma weights/tokenizer (Gemma backend only)",
+    )
+    parser.add_argument(
+        "--gemma_safetensors",
+        type=str,
+        default=None,
+        help="Path to a single Gemma safetensors file (e.g. fp8 from ComfyUI). Loads weights, config, and tokenizer from one file. No --gemma_root needed.",
     )
     parser.add_argument(
         "--ltx2_mode", "--ltx_mode",

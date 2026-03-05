@@ -213,6 +213,7 @@ class ItemInfo:
         self.content = content
         self.latent_cache_path = latent_cache_path
         self.text_encoder_output_cache_path: Optional[str] = None
+        self.reference_latent_cache_path: Optional[str] = None
 
         # np.ndarray for video, list[np.ndarray] for image with multiple controls
         self.control_content: Optional[Union[np.ndarray, list[np.ndarray]]] = None
@@ -922,12 +923,23 @@ def load_video(
         except Exception:
             pass  # detection failed, fall through to no-conversion branch
 
-    # skip resampling when source and target FPS are nearly equal (within 1%)
+    # skip resampling when source and target FPS are nearly equal
+    # ceil the source FPS so that e.g. 23.976 -> 24, then compare against target (25): diff=1, skip
+    from musubi_tuner.ltx_2.env import get_ltx2_env
+
+    fps_threshold = get_ltx2_env().fps_resampling_threshold
     needs_resampling = (
         source_fps is not None
         and target_fps is not None
-        and abs(source_fps - target_fps) / max(source_fps, target_fps) > 0.01
+        and abs(math.ceil(source_fps) - target_fps) > fps_threshold
     )
+
+    if not needs_resampling and source_fps is not None and target_fps is not None and source_fps != target_fps:
+        logger.info(
+            f"Skipping FPS resampling for {os.path.basename(video_path)}: "
+            f"source {source_fps:.3f} FPS within threshold of target {target_fps:.1f} FPS "
+            f"(ceil={math.ceil(source_fps)}, diff={abs(math.ceil(source_fps) - target_fps)}, threshold={fps_threshold})"
+        )
 
     if not needs_resampling:
         if os.path.isfile(video_path):
@@ -1050,6 +1062,7 @@ class BucketBatchManager:
         num_timestep_buckets: Optional[int] = None,
         architecture: Optional[str] = None,
         target_fps: float = 25.0,
+        audio_bucket_strategy: str = "pad",
     ):
         self.batch_size = batch_size
         self.buckets = bucketed_item_info
@@ -1059,6 +1072,7 @@ class BucketBatchManager:
         self.timestep_pool = None
         self.architecture = architecture
         self.target_fps = target_fps
+        self.audio_bucket_strategy = audio_bucket_strategy
 
         # indices for enumerating batches. each batch is reso + batch_idx. reso is (width, height) or (width, height, frames)
         self.bucket_batch_indices: list[tuple[tuple[Any], int]] = []
@@ -1260,48 +1274,79 @@ class BucketBatchManager:
                 dtype = ref.dtype
                 device = ref.device
 
-                lengths = []
-                max_t = 0
-                for i, lat in enumerate(audio_latents_per_item):
-                    if isinstance(lat, torch.Tensor):
-                        t = int(lat.shape[1])
-                        length_val = t
-                        cached_len = audio_lengths_per_item[i]
-                        if isinstance(cached_len, torch.Tensor) and cached_len.numel() == 1:
-                            length_val = int(cached_len.view(-1)[0].item())
-                        length_val = max(0, min(length_val, t))
-                    else:
-                        length_val = 0
-                        t = 0
-                    lengths.append(length_val)
-                    max_t = max(max_t, t)
+                if self.audio_bucket_strategy == "truncate":
+                    # Truncate mode: extract quantized_t from bucket_reso (last int element)
+                    # and truncate all audio latents to that length — no padding needed.
+                    quantized_t = None
+                    for elem in reversed(bucket_reso):
+                        if isinstance(elem, int):
+                            quantized_t = elem
+                            break
+                    if quantized_t is None or quantized_t <= 0:
+                        quantized_t = int(ref.shape[1])
 
-                if max_t <= 0:
-                    max_t = 1
+                    truncated = []
+                    for lat in audio_latents_per_item:
+                        if isinstance(lat, torch.Tensor):
+                            if lat.dim() != 3:
+                                raise ValueError(f"Expected audio latents to be 3D [C, T, F], got {tuple(lat.shape)}")
+                            if int(lat.shape[0]) != channels or int(lat.shape[2]) != mel_bins:
+                                raise ValueError(
+                                    "Audio latents shape mismatch in batch: "
+                                    f"expected [C={channels}, *, F={mel_bins}], got {tuple(lat.shape)}"
+                                )
+                            truncated.append(lat[:, :quantized_t, :].to(device=device, dtype=dtype))
+                        else:
+                            truncated.append(torch.zeros((channels, quantized_t, mel_bins), device=device, dtype=dtype))
 
-                padded = []
-                for i, lat in enumerate(audio_latents_per_item):
-                    if isinstance(lat, torch.Tensor):
-                        if lat.dim() != 3:
-                            raise ValueError(f"Expected audio latents to be 3D [C, T, F], got {tuple(lat.shape)}")
-                        if int(lat.shape[0]) != channels or int(lat.shape[2]) != mel_bins:
-                            raise ValueError(
-                                "Audio latents shape mismatch in batch: "
-                                f"expected [C={channels}, *, F={mel_bins}], got {tuple(lat.shape)}"
-                            )
+                    batch_tensor_data["audio_latents"] = torch.stack(truncated)
+                    batch_tensor_data["audio_lengths"] = torch.full(
+                        (len(truncated),), quantized_t, device=device, dtype=torch.int32
+                    )
+                else:
+                    # Pad mode (default): pad shorter clips to max_t and store actual lengths.
+                    lengths = []
+                    max_t = 0
+                    for i, lat in enumerate(audio_latents_per_item):
+                        if isinstance(lat, torch.Tensor):
+                            t = int(lat.shape[1])
+                            length_val = t
+                            cached_len = audio_lengths_per_item[i]
+                            if isinstance(cached_len, torch.Tensor) and cached_len.numel() == 1:
+                                length_val = int(cached_len.view(-1)[0].item())
+                            length_val = max(0, min(length_val, t))
+                        else:
+                            length_val = 0
+                            t = 0
+                        lengths.append(length_val)
+                        max_t = max(max_t, t)
 
-                        t = int(lat.shape[1])
-                        use_t = min(t, max_t)
-                        out = torch.zeros((channels, max_t, mel_bins), device=device, dtype=dtype)
-                        if use_t > 0:
-                            out[:, :use_t, :] = lat[:, :use_t, :].to(device=device, dtype=dtype)
-                        padded.append(out)
-                        lengths[i] = int(min(max(0, lengths[i]), max_t))
-                    else:
-                        padded.append(torch.zeros((channels, max_t, mel_bins), device=device, dtype=dtype))
+                    if max_t <= 0:
+                        max_t = 1
 
-                batch_tensor_data["audio_latents"] = torch.stack(padded)
-                batch_tensor_data["audio_lengths"] = torch.tensor(lengths, device=device, dtype=torch.int32)
+                    padded = []
+                    for i, lat in enumerate(audio_latents_per_item):
+                        if isinstance(lat, torch.Tensor):
+                            if lat.dim() != 3:
+                                raise ValueError(f"Expected audio latents to be 3D [C, T, F], got {tuple(lat.shape)}")
+                            if int(lat.shape[0]) != channels or int(lat.shape[2]) != mel_bins:
+                                raise ValueError(
+                                    "Audio latents shape mismatch in batch: "
+                                    f"expected [C={channels}, *, F={mel_bins}], got {tuple(lat.shape)}"
+                                )
+
+                            t = int(lat.shape[1])
+                            use_t = min(t, max_t)
+                            out = torch.zeros((channels, max_t, mel_bins), device=device, dtype=dtype)
+                            if use_t > 0:
+                                out[:, :use_t, :] = lat[:, :use_t, :].to(device=device, dtype=dtype)
+                            padded.append(out)
+                            lengths[i] = int(min(max(0, lengths[i]), max_t))
+                        else:
+                            padded.append(torch.zeros((channels, max_t, mel_bins), device=device, dtype=dtype))
+
+                    batch_tensor_data["audio_latents"] = torch.stack(padded)
+                    batch_tensor_data["audio_lengths"] = torch.tensor(lengths, device=device, dtype=torch.int32)
 
             else:
                 # Skip allocating placeholder audio tensors when the batch has no audio.
@@ -2828,6 +2873,14 @@ class ImageDataset(BaseDataset):
             dino_cache_file = self.get_dino_feature_cache_path_from_latent_cache_path(cache_file)
             item_info.dino_feature_cache_path = dino_cache_file if os.path.exists(dino_cache_file) else None
 
+            if self.reference_cache_directory is not None:
+                ref_cache_path = os.path.join(self.reference_cache_directory, os.path.basename(cache_file))
+                if os.path.exists(ref_cache_path):
+                    item_info.reference_latent_cache_path = ref_cache_path
+                else:
+                    logger.warning(f"Reference cache not found, skipping item: {ref_cache_path}")
+                    continue
+
             bucket = bucketed_item_info.get(bucket_reso, [])
             for _ in range(self.num_repeats):
                 bucket.append(item_info)
@@ -2876,6 +2929,8 @@ class AudioDataset(BaseDataset):
         cache_only: bool = False,
         debug_dataset: bool = False,
         architecture: str = "no_default",
+        audio_bucket_strategy: str = "pad",
+        audio_bucket_interval: float = 2.0,
     ):
         super(AudioDataset, self).__init__(
             resolution,
@@ -2893,6 +2948,11 @@ class AudioDataset(BaseDataset):
         self.audio_directory = audio_directory
         self.audio_jsonl_file = audio_jsonl_file
         self.cache_only = cache_only
+        self.audio_bucket_strategy = audio_bucket_strategy
+        self.audio_bucket_interval = audio_bucket_interval
+
+        if self.audio_bucket_strategy not in ("pad", "truncate"):
+            raise ValueError(f"audio_bucket_strategy must be 'pad' or 'truncate', got '{self.audio_bucket_strategy}'")
 
         if self.cache_only:
             self.datasource = None
@@ -3062,16 +3122,49 @@ class AudioDataset(BaseDataset):
                 item_info.text_encoder_output_cache_path = text_encoder_output_cache_file
                 item_info.audio_latent_cache_path = audio_cache_file
 
+            # Duration bucketing: group audio clips by quantized length to minimize
+            # padding within batches.  Reads only the safetensors header (fast).
+            # Convert audio_bucket_interval (seconds) to latent frames (25 fps).
+            _AUDIO_DURATION_BUCKET_STEP = max(int(round(self.audio_bucket_interval * 25)), 1)
+            audio_key = safetensors_utils.find_key(audio_cache_file, starts_with="audio_latents_")
+            if audio_key is not None:
+                try:
+                    # key format: audio_latents_{T}x{F}x{C}_{dtype}
+                    dims_part = audio_key.split("_")[2]  # "{T}x{F}x{C}"
+                    audio_t = int(dims_part.split("x")[0])
+                    if self.audio_bucket_strategy == "truncate":
+                        # Floor division: all items in bucket have T >= quantized_t
+                        quantized_t = max(
+                            (audio_t // _AUDIO_DURATION_BUCKET_STEP) * _AUDIO_DURATION_BUCKET_STEP,
+                            _AUDIO_DURATION_BUCKET_STEP,
+                        )
+                    else:
+                        # Round-to-nearest (pad mode)
+                        quantized_t = max(
+                            ((audio_t + _AUDIO_DURATION_BUCKET_STEP // 2) // _AUDIO_DURATION_BUCKET_STEP)
+                            * _AUDIO_DURATION_BUCKET_STEP,
+                            _AUDIO_DURATION_BUCKET_STEP,
+                        )
+                    bucket_reso = (*bucket_reso, quantized_t)
+                except (ValueError, IndexError):
+                    pass
+
             bucket = bucketed_item_info.get(bucket_reso, [])
             for _ in range(self.num_repeats):
                 bucket.append(item_info)
             bucketed_item_info[bucket_reso] = bucket
+
+        target_fps = 24.0
+        if self.architecture in {ARCHITECTURE_LTX2, ARCHITECTURE_LTX2_FULL}:
+            target_fps = VideoDataset.TARGET_FPS_LTX2
 
         self.batch_manager = BucketBatchManager(
             bucketed_item_info,
             self.batch_size,
             num_timestep_buckets=num_timestep_buckets,
             architecture=self.architecture,
+            target_fps=target_fps,
+            audio_bucket_strategy=self.audio_bucket_strategy,
         )
         self.batch_manager.show_bucket_info()
 
@@ -3117,6 +3210,7 @@ class VideoDataset(BaseDataset):
         video_directory: Optional[str] = None,
         video_jsonl_file: Optional[str] = None,
         control_directory: Optional[str] = None,
+        reference_directory: Optional[str] = None,
         cache_directory: Optional[str] = None,
         reference_cache_directory: Optional[str] = None,
         separate_audio_buckets: bool = False,
@@ -3152,6 +3246,7 @@ class VideoDataset(BaseDataset):
         self.video_directory = video_directory
         self.video_jsonl_file = video_jsonl_file
         self.control_directory = control_directory
+        self.reference_directory = reference_directory
         self.frame_extraction = frame_extraction
         self.frame_stride = frame_stride
         self.frame_sample = frame_sample

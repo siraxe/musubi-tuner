@@ -13,7 +13,7 @@ from musubi_tuner.ltx_2.model.transformer.offloading_utils import (
 )
 from musubi_tuner.ltx_2.model.ltx2_custom_offloading_utils import _clean_memory_on_device
 from musubi_tuner.ltx_2.guidance.perturbations import BatchedPerturbationConfig
-from musubi_tuner.ltx_2.model.transformer.adaln import AdaLayerNormSingle
+from musubi_tuner.ltx_2.model.transformer.adaln import AdaLayerNormSingle, adaln_embedding_coefficient
 from musubi_tuner.ltx_2.model.transformer.attention import AttentionCallable, AttentionFunction
 from musubi_tuner.ltx_2.model.transformer.fp8_device_utils import (
     ensure_fp8_modules_on_device,
@@ -98,6 +98,8 @@ def _move_transformer_args(
         cross_positional_embeddings=_move_tensor(args.cross_positional_embeddings),
         cross_scale_shift_timestep=_move_tensor(args.cross_scale_shift_timestep),
         cross_gate_timestep=_move_tensor(args.cross_gate_timestep),
+        prompt_timestep=_move_tensor(args.prompt_timestep),
+        self_attention_mask=_move_tensor(args.self_attention_mask),
     )
 
 
@@ -145,6 +147,9 @@ class LTXModel(torch.nn.Module):
         av_ca_timestep_scale_multiplier: int = 1,
         rope_type: LTXRopeType = LTXRopeType.INTERLEAVED,
         double_precision_rope: bool = False,
+        apply_gated_attention: bool = False,
+        caption_proj_before_connector: bool = False,
+        cross_attention_adaln: bool = False,
     ):
         super().__init__()
         self._enable_gradient_checkpointing = False
@@ -159,6 +164,10 @@ class LTXModel(torch.nn.Module):
         self.timestep_scale_multiplier = timestep_scale_multiplier
         self.positional_embedding_theta = positional_embedding_theta
         self.model_type = model_type
+        self.cross_attention_dim = cross_attention_dim
+        self.audio_cross_attention_dim = audio_cross_attention_dim
+        self.caption_proj_before_connector = caption_proj_before_connector
+        self.cross_attention_adaln = cross_attention_adaln
         cross_pe_max_pos = None
         if model_type.is_video_enabled():
             if positional_embedding_max_pos is None:
@@ -202,6 +211,7 @@ class LTXModel(torch.nn.Module):
             audio_cross_attention_dim=audio_cross_attention_dim,
             norm_eps=norm_eps,
             attention_type=attention_type,
+            apply_gated_attention=apply_gated_attention,
         )
 
         self.num_blocks = len(self.transformer_blocks)
@@ -217,13 +227,22 @@ class LTXModel(torch.nn.Module):
         # Video input components
         self.patchify_proj = torch.nn.Linear(in_channels, self.inner_dim, bias=True)
 
-        self.adaln_single = AdaLayerNormSingle(self.inner_dim)
-
-        # Video caption projection
-        self.caption_projection = PixArtAlphaTextProjection(
-            in_features=caption_channels,
-            hidden_size=self.inner_dim,
+        self.adaln_single = AdaLayerNormSingle(
+            self.inner_dim,
+            embedding_coefficient=adaln_embedding_coefficient(self.cross_attention_adaln),
         )
+        self.prompt_adaln_single = (
+            AdaLayerNormSingle(self.inner_dim, embedding_coefficient=2) if self.cross_attention_adaln else None
+        )
+
+        # Caption projection is baked into LTX-23 feature extractor before connectors.
+        if self.caption_proj_before_connector:
+            self.caption_projection = None
+        else:
+            self.caption_projection = PixArtAlphaTextProjection(
+                in_features=caption_channels,
+                hidden_size=self.inner_dim,
+            )
 
         # Video output components
         self.scale_shift_table = torch.nn.Parameter(torch.empty(2, self.inner_dim))
@@ -244,13 +263,20 @@ class LTXModel(torch.nn.Module):
 
         self.audio_adaln_single = AdaLayerNormSingle(
             self.audio_inner_dim,
+            embedding_coefficient=adaln_embedding_coefficient(self.cross_attention_adaln),
+        )
+        self.audio_prompt_adaln_single = (
+            AdaLayerNormSingle(self.audio_inner_dim, embedding_coefficient=2) if self.cross_attention_adaln else None
         )
 
-        # Audio caption projection
-        self.audio_caption_projection = PixArtAlphaTextProjection(
-            in_features=caption_channels,
-            hidden_size=self.audio_inner_dim,
-        )
+        # Caption projection is baked into LTX-23 feature extractor before connectors.
+        if self.caption_proj_before_connector:
+            self.audio_caption_projection = None
+        else:
+            self.audio_caption_projection = PixArtAlphaTextProjection(
+                in_features=caption_channels,
+                hidden_size=self.audio_inner_dim,
+            )
 
         # Audio output components
         self.audio_scale_shift_table = torch.nn.Parameter(torch.empty(2, self.audio_inner_dim))
@@ -306,6 +332,7 @@ class LTXModel(torch.nn.Module):
                 positional_embedding_theta=self.positional_embedding_theta,
                 rope_type=self.rope_type,
                 av_ca_timestep_scale_multiplier=self.av_ca_timestep_scale_multiplier,
+                prompt_adaln=self.prompt_adaln_single,
             )
             self.audio_args_preprocessor = MultiModalTransformerArgsPreprocessor(
                 patchify_proj=self.audio_patchify_proj,
@@ -324,6 +351,7 @@ class LTXModel(torch.nn.Module):
                 positional_embedding_theta=self.positional_embedding_theta,
                 rope_type=self.rope_type,
                 av_ca_timestep_scale_multiplier=self.av_ca_timestep_scale_multiplier,
+                prompt_adaln=self.audio_prompt_adaln_single,
             )
         elif self.model_type.is_video_enabled():
             self.video_args_preprocessor = TransformerArgsPreprocessor(
@@ -338,6 +366,7 @@ class LTXModel(torch.nn.Module):
                 double_precision_rope=self.double_precision_rope,
                 positional_embedding_theta=self.positional_embedding_theta,
                 rope_type=self.rope_type,
+                prompt_adaln=self.prompt_adaln_single,
             )
         elif self.model_type.is_audio_enabled():
             self.audio_args_preprocessor = TransformerArgsPreprocessor(
@@ -352,6 +381,7 @@ class LTXModel(torch.nn.Module):
                 double_precision_rope=self.double_precision_rope,
                 positional_embedding_theta=self.positional_embedding_theta,
                 rope_type=self.rope_type,
+                prompt_adaln=self.audio_prompt_adaln_single,
             )
 
     def _init_transformer_blocks(
@@ -363,6 +393,7 @@ class LTXModel(torch.nn.Module):
         audio_cross_attention_dim: int,
         norm_eps: float,
         attention_type: AttentionFunction | AttentionCallable,
+        apply_gated_attention: bool = False,
     ) -> None:
         """Initialize transformer blocks for LTX."""
         video_config = (
@@ -371,6 +402,8 @@ class LTXModel(torch.nn.Module):
                 heads=self.num_attention_heads,
                 d_head=attention_head_dim,
                 context_dim=cross_attention_dim,
+                apply_gated_attention=apply_gated_attention,
+                cross_attention_adaln=self.cross_attention_adaln,
             )
             if self.model_type.is_video_enabled()
             else None
@@ -381,6 +414,8 @@ class LTXModel(torch.nn.Module):
                 heads=self.audio_num_attention_heads,
                 d_head=audio_attention_head_dim,
                 context_dim=audio_cross_attention_dim,
+                apply_gated_attention=apply_gated_attention,
+                cross_attention_adaln=self.cross_attention_adaln,
             )
             if self.model_type.is_audio_enabled()
             else None
@@ -469,6 +504,9 @@ class LTXModel(torch.nn.Module):
             f"Cannot swap more than {self.num_blocks - 1} blocks. Requested {self.blocks_to_swap} blocks to swap."
         )
 
+        prefetch_window = int(os.getenv("LTX2_SWAP_PREFETCH_WINDOW", "1"))
+        self._prefetch_window = prefetch_window
+
         self.offloader = LTX2ModelOffloader(
             "ltx2_block",
             self.transformer_blocks,
@@ -478,6 +516,7 @@ class LTXModel(torch.nn.Module):
             device,
             use_pinned_memory,
             swap_norms=swap_norms,
+            prefetch_window=prefetch_window,
         )
         swap_start = max(0, self.num_blocks - self.blocks_to_swap)
         for idx, block in enumerate(self.transformer_blocks):
@@ -500,23 +539,21 @@ class LTXModel(torch.nn.Module):
 
     def move_to_device_except_swap_blocks(self, device: torch.device) -> None:
         import torch  # ensure available
-        def _trace_vram(tag):
+        def _vram_summary():
             if torch.cuda.is_available():
                 a = torch.cuda.memory_allocated() / (1024**3)
                 r = torch.cuda.memory_reserved() / (1024**3)
                 m = torch.cuda.max_memory_allocated() / (1024**3)
-                print(f"[VRAM_TRACE_MOVE] {tag}: alloc={a:.2f}GB res={r:.2f}GB max={m:.2f}GB")
+                return f"alloc={a:.2f}GB res={r:.2f}GB max={m:.2f}GB"
+            return ""
 
-        _trace_vram("START move_to_device_except_swap_blocks")
         swap_mode = getattr(self, "swap_mode", "default")
         if self.blocks_to_swap and swap_mode in {"aggressive", "aggressive_no_offload"}:
             target_device = torch.device(device)
             # Move non-block modules/params to the target device.
             saved_blocks = self.transformer_blocks
             self.transformer_blocks = torch.nn.ModuleList()
-            _trace_vram("BEFORE self.to(device) [aggressive mode, blocks detached]")
             self.to(target_device)
-            _trace_vram("AFTER self.to(device) [aggressive mode]")
             self.transformer_blocks = saved_blocks
 
             managed_indices = set()
@@ -529,23 +566,24 @@ class LTXModel(torch.nn.Module):
 
             # Move non-managed blocks to GPU; keep managed blocks on CPU.
             cpu_device = torch.device("cpu")
+            gpu_blocks = []
+            cpu_blocks = []
             for idx, block in enumerate(self.transformer_blocks):
                 if idx in managed_indices:
                     block.to(cpu_device)
+                    cpu_blocks.append(idx)
                 else:
                     block.to(target_device)
-                if idx % 10 == 0:
-                    _trace_vram(f"AFTER moving block {idx} (managed={idx in managed_indices})")
-            _trace_vram("END move_to_device_except_swap_blocks [aggressive]")
+                    gpu_blocks.append(idx)
+            print(f"[BLOCK_SWAP] aggressive: blocks {gpu_blocks[0]}-{gpu_blocks[-1]} on GPU, "
+                  f"blocks {cpu_blocks[0]}-{cpu_blocks[-1]} on CPU | {_vram_summary()}")
             return
 
         if self.blocks_to_swap:
             saved_blocks = self.transformer_blocks
             self.transformer_blocks = torch.nn.ModuleList()
-            _trace_vram("BEFORE self.to(device) [default mode, blocks detached]")
 
         self.to(device)
-        _trace_vram("AFTER self.to(device) [non-block params moved]")
 
         if self.blocks_to_swap:
             self.transformer_blocks = saved_blocks
@@ -553,15 +591,16 @@ class LTXModel(torch.nn.Module):
             swap_start = max(0, len(self.transformer_blocks) - int(self.blocks_to_swap or 0))
             cpu_device = torch.device("cpu")
             target_device = torch.device(device)
-            print(f"[VRAM_TRACE_MOVE] Moving blocks: 0-{swap_start-1} to GPU, {swap_start}-{len(self.transformer_blocks)-1} to CPU")
             for idx, block in enumerate(self.transformer_blocks):
                 if idx >= swap_start:
                     block.to(cpu_device)
                 else:
                     block.to(target_device)
-                if idx % 5 == 0 or idx == swap_start - 1 or idx == swap_start:
-                    _trace_vram(f"AFTER moving block {idx} ({'CPU' if idx >= swap_start else 'GPU'})")
-        _trace_vram("END move_to_device_except_swap_blocks")
+            last_block = len(self.transformer_blocks) - 1
+            print(f"[BLOCK_SWAP] blocks 0-{swap_start-1} on GPU, "
+                  f"blocks {swap_start}-{last_block} on CPU | {_vram_summary()}")
+        else:
+            print(f"[BLOCK_SWAP] all blocks on {device} | {_vram_summary()}")
 
     def prepare_block_swap_before_forward(self) -> None:
         if self.blocks_to_swap is None or self.blocks_to_swap == 0 or self.offloader is None:
@@ -681,21 +720,17 @@ class LTXModel(torch.nn.Module):
                 if fp8_swap_sync_strict:
                     torch.cuda.current_stream().synchronize()
 
-            # Phase 2: Prefetch Next Block
-            # Trigger load for N+1 on Transfer Stream while N is about to compute
-            if (
-                transfer_stream is not None
-                and getattr(block, "weight_cpu_offloading", False)
-                and block_idx + 1 < len(self.transformer_blocks)
-            ):
-                next_block = self.transformer_blocks[block_idx + 1]
-                # Only prefetch if next block also wants it
-                if getattr(next_block, "weight_cpu_offloading", False):
-                    with torch.cuda.stream(transfer_stream):
-                        # Safe to call because it checks p.device internally
-                        # If already loaded, it's a fast no-op.
-                        # If on CPU, it triggers H2D copy.
-                        next_block._load_weights(next_block, target_device)
+            # Phase 2: Prefetch Next k Blocks
+            # Trigger load for N+1..N+k on Transfer Stream while N is about to compute
+            prefetch_window = getattr(self, '_prefetch_window', 1)
+            if transfer_stream is not None and getattr(block, "weight_cpu_offloading", False):
+                for offset in range(1, prefetch_window + 1):
+                    look_idx = block_idx + offset
+                    if look_idx < len(self.transformer_blocks):
+                        look_block = self.transformer_blocks[look_idx]
+                        if getattr(look_block, "weight_cpu_offloading", False):
+                            with torch.cuda.stream(transfer_stream):
+                                look_block._load_weights(look_block, target_device)
 
             # Execute block (it now handles checkpointing i.e. load/compute/offload)
             # If offloading is on, block expects CPU inputs (for checkpoint savings) and returns CPU outputs
@@ -851,8 +886,8 @@ class LTXModel(torch.nn.Module):
         if not self.model_type.is_audio_enabled() and audio is not None:
             raise ValueError("Audio is not enabled for this model")
 
-        video_args = self.video_args_preprocessor.prepare(video) if video is not None else None
-        audio_args = self.audio_args_preprocessor.prepare(audio) if audio is not None else None
+        video_args = self.video_args_preprocessor.prepare(video, audio) if video is not None else None
+        audio_args = self.audio_args_preprocessor.prepare(audio, video) if audio is not None else None
         # Process transformer blocks
         video_out, audio_out = self._process_transformer_blocks(
             video=video_args,

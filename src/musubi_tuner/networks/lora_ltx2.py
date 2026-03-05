@@ -160,10 +160,14 @@ class LTX2Wrapper(nn.Module):
         else:
             video_latents, audio_latents = x, None
 
+        model_type = getattr(self.model, "model_type", None)
+        model_video_enabled = bool(model_type.is_video_enabled()) if model_type is not None else True
+        model_audio_enabled = bool(model_type.is_audio_enabled()) if model_type is not None else True
+
         if audio_only:
             if audio_latents is None:
                 raise ValueError("audio_only=True requires audio_latents")
-            if video_latents is None:
+            if video_latents is None and model_video_enabled:
                 in_channels = getattr(self.model, "in_channels", None)
                 if in_channels is None:
                     raise ValueError("audio_only=True requires model.in_channels to create dummy video latents")
@@ -174,16 +178,31 @@ class LTX2Wrapper(nn.Module):
                     dtype=audio_latents.dtype,
                 )
 
-        if not isinstance(video_latents, torch.Tensor) or video_latents.dim() != 5:
+        if not model_audio_enabled and audio_latents is not None:
+            raise ValueError("Audio latents were provided but the loaded model has no audio branch")
+        if not model_video_enabled and not audio_only:
+            raise ValueError("Loaded audio-only transformer requires audio_only=True")
+
+        if model_video_enabled:
+            if not isinstance(video_latents, torch.Tensor) or video_latents.dim() != 5:
+                raise ValueError(f"Expected video latents shape [B, C, F, H, W], got: {getattr(video_latents, 'shape', None)}")
+        elif video_latents is not None and (not isinstance(video_latents, torch.Tensor) or video_latents.dim() != 5):
             raise ValueError(f"Expected video latents shape [B, C, F, H, W], got: {getattr(video_latents, 'shape', None)}")
 
-        bsz, vch, vframes, vheight, vwidth = video_latents.shape
+        ref_latents = video_latents if isinstance(video_latents, torch.Tensor) else audio_latents
+        if not isinstance(ref_latents, torch.Tensor):
+            raise ValueError("Expected at least one latent tensor (video or audio) to be present")
+
+        bsz = int(ref_latents.shape[0])
+        vch = vframes = vheight = vwidth = None
+        if isinstance(video_latents, torch.Tensor):
+            _, vch, vframes, vheight, vwidth = video_latents.shape
 
         def _to_sigma(ts_value, *, name: str) -> torch.Tensor:
             if isinstance(ts_value, torch.Tensor):
                 ts = ts_value
             else:
-                ts = torch.tensor(ts_value, device=video_latents.device, dtype=video_latents.dtype)
+                ts = torch.tensor(ts_value, device=ref_latents.device, dtype=ref_latents.dtype)
             if ts.dim() == 0:
                 ts = ts.view(1)
             if ts.dim() == 2 and ts.shape[1] == 1:
@@ -196,61 +215,89 @@ class LTX2Wrapper(nn.Module):
                 sigma = sigma.expand(bsz)
             if sigma.shape[0] != bsz:
                 raise ValueError(f"Expected {name} batch size {bsz}, got {sigma.shape[0]}")
-            return sigma.to(device=video_latents.device, dtype=video_latents.dtype)
+            return sigma.to(device=ref_latents.device, dtype=ref_latents.dtype)
 
         sigma = _to_sigma(timestep, name="timestep")
         audio_timestep = kwargs.get("audio_timestep")
         audio_sigma = _to_sigma(audio_timestep, name="audio_timestep") if audio_timestep is not None else sigma
 
-        video_tokens = self._video_patchifier.patchify(video_latents)
-        video_seq_len = video_tokens.shape[1]
-        video_timesteps = sigma.view(bsz, 1).expand(bsz, video_seq_len)
+        video_tokens = None
+        video_timesteps = None
+        video_positions = None
+        if model_video_enabled:
+            video_tokens = self._video_patchifier.patchify(video_latents)
+            video_seq_len = video_tokens.shape[1]
+            video_timesteps = sigma.view(bsz, 1).expand(bsz, video_seq_len)
 
-        video_conditioning_mask = None
-        if isinstance(transformer_options, dict):
-            video_conditioning_mask = transformer_options.get("video_conditioning_mask")
-        if video_conditioning_mask is not None:
-            if not isinstance(video_conditioning_mask, torch.Tensor):
-                raise TypeError(f"Expected video_conditioning_mask to be a torch.Tensor, got: {type(video_conditioning_mask)}")
-            if video_conditioning_mask.shape != (bsz, video_seq_len):
-                raise ValueError(
-                    f"video_conditioning_mask shape mismatch: got {tuple(video_conditioning_mask.shape)}, expected {(bsz, video_seq_len)}"
-                )
-            video_conditioning_mask = video_conditioning_mask.to(device=video_tokens.device, dtype=torch.bool)
-            video_timesteps = torch.where(video_conditioning_mask, torch.zeros_like(video_timesteps), video_timesteps)
+            video_conditioning_mask = None
+            if isinstance(transformer_options, dict):
+                video_conditioning_mask = transformer_options.get("video_conditioning_mask")
+            if video_conditioning_mask is not None:
+                if not isinstance(video_conditioning_mask, torch.Tensor):
+                    raise TypeError(f"Expected video_conditioning_mask to be a torch.Tensor, got: {type(video_conditioning_mask)}")
+                if video_conditioning_mask.shape != (bsz, video_seq_len):
+                    raise ValueError(
+                        f"video_conditioning_mask shape mismatch: got {tuple(video_conditioning_mask.shape)}, expected {(bsz, video_seq_len)}"
+                    )
+                video_conditioning_mask = video_conditioning_mask.to(device=video_tokens.device, dtype=torch.bool)
+                video_timesteps = torch.where(video_conditioning_mask, torch.zeros_like(video_timesteps), video_timesteps)
 
-        latent_coords = self._video_patchifier.get_patch_grid_bounds(
-            output_shape=VideoLatentShape(
-                batch=bsz,
-                channels=vch,
-                frames=vframes,
-                height=vheight,
-                width=vwidth,
-            ),
-            device=video_latents.device,
-        )
-        video_positions = get_pixel_coords(
-            latent_coords=latent_coords,
-            scale_factors=SpatioTemporalScaleFactors.default(),
-            causal_fix=True,
-        ).to(dtype=video_latents.dtype)
-        video_positions[:, 0, ...] = video_positions[:, 0, ...] / float(frame_rate)
+            latent_coords = self._video_patchifier.get_patch_grid_bounds(
+                output_shape=VideoLatentShape(
+                    batch=bsz,
+                    channels=vch,
+                    frames=vframes,
+                    height=vheight,
+                    width=vwidth,
+                ),
+                device=video_latents.device,
+            )
+            video_positions = get_pixel_coords(
+                latent_coords=latent_coords,
+                scale_factors=SpatioTemporalScaleFactors.default(),
+                causal_fix=True,
+            ).to(dtype=video_latents.dtype)
+            video_positions[:, 0, ...] = video_positions[:, 0, ...] / float(frame_rate)
 
         video_context = context
         audio_context = context
-        if not audio_only and audio_latents is not None and isinstance(context, torch.Tensor) and context.shape[-1] % 2 == 0:
-            half = context.shape[-1] // 2
-            video_context = context[..., :half]
-            audio_context = context[..., half:]
+        if (
+            model_video_enabled
+            and not audio_only
+            and audio_latents is not None
+            and isinstance(context, torch.Tensor)
+        ):
+            split_video_dim = getattr(self.model, "cross_attention_dim", None)
+            split_audio_dim = getattr(self.model, "audio_cross_attention_dim", None)
+            if (
+                isinstance(split_video_dim, int)
+                and isinstance(split_audio_dim, int)
+                and split_video_dim > 0
+                and split_audio_dim > 0
+                and (split_video_dim + split_audio_dim) == context.shape[-1]
+            ):
+                video_context = context[..., :split_video_dim]
+                audio_context = context[..., split_video_dim : split_video_dim + split_audio_dim]
+            elif context.shape[-1] % 2 == 0:
+                half = context.shape[-1] // 2
+                video_context = context[..., :half]
+                audio_context = context[..., half:]
 
-        video_modality = Modality(
-            enabled=(not audio_only if video_enabled is None else bool(video_enabled)),
-            latent=video_tokens,
-            timesteps=video_timesteps,
-            positions=video_positions,
-            context=video_context,
-            context_mask=attention_mask,
-        )
+        video_modality = None
+        if model_video_enabled:
+            video_self_attention_mask = None
+            if isinstance(transformer_options, dict):
+                video_self_attention_mask = transformer_options.get("self_attention_mask")
+            video_modality = Modality(
+                enabled=(not audio_only if video_enabled is None else bool(video_enabled)),
+                latent=video_tokens,
+                timesteps=video_timesteps,
+                positions=video_positions,
+                context=video_context,
+                sigma=sigma,
+                context_mask=attention_mask,
+                attention_mask=video_self_attention_mask,
+            )
 
         audio_modality = None
         audio_shape = None
@@ -275,22 +322,33 @@ class LTX2Wrapper(nn.Module):
                 timesteps=audio_timesteps,
                 positions=audio_positions.to(dtype=audio_latents.dtype),
                 context=audio_context,
+                sigma=audio_sigma,
                 context_mask=attention_mask,
             )
 
         perturbations = BatchedPerturbationConfig.empty(bsz)
         video_pred_tokens, audio_pred_tokens = self.model(video_modality, audio_modality, perturbations)
 
-        video_pred = self._video_patchifier.unpatchify(
-            video_pred_tokens,
-            output_shape=VideoLatentShape(
-                batch=bsz,
-                channels=vch,
-                frames=vframes,
-                height=vheight,
-                width=vwidth,
-            ),
-        )
+        if model_video_enabled:
+            video_pred = self._video_patchifier.unpatchify(
+                video_pred_tokens,
+                output_shape=VideoLatentShape(
+                    batch=bsz,
+                    channels=vch,
+                    frames=vframes,
+                    height=vheight,
+                    width=vwidth,
+                ),
+            )
+        elif isinstance(video_latents, torch.Tensor):
+            video_pred = torch.zeros_like(video_latents)
+        else:
+            channel_count = int(getattr(self.model, "in_channels", 1) or 1)
+            video_pred = torch.zeros(
+                (bsz, channel_count, 1, 1, 1),
+                device=ref_latents.device,
+                dtype=ref_latents.dtype,
+            )
 
         if audio_latents is None:
             return video_pred
@@ -429,6 +487,8 @@ def _build_exclude_patterns(raw_patterns: Optional[str], audio_video: bool = Fal
     """Build exclude patterns list, including connector exclusions."""
     patterns: List[str] = [
         r".*text_embedding_projection\.aggregate_embed.*",
+        r".*text_embedding_projection\.video_aggregate_embed.*",
+        r".*text_embedding_projection\.audio_aggregate_embed.*",
         r".*embeddings_connector\..*",
         r".*audio_embeddings_connector\..*",
     ]
@@ -451,6 +511,64 @@ def _get_include_patterns_for_preset(preset: Optional[str]) -> Optional[List[str
             f"Valid presets: {list(LTX2_LORA_TARGET_PRESETS.keys())}"
         )
     return LTX2_LORA_TARGET_PRESETS[preset]
+
+
+def compute_loftq_from_state_dict(
+    state_dict: dict,
+    loftq_config: dict,
+    network_dim: int,
+    target_layer_keys: Optional[List[str]] = None,
+    exclude_layer_keys: Optional[List[str]] = None,
+) -> Dict[str, tuple]:
+    """Pre-compute LoftQ (lora_A, lora_B) from full-precision weights in a state dict.
+
+    Must be called BEFORE NF4 quantization, while weights are still full-precision.
+
+    Returns a dict mapping ``lora_unet_<module_path>`` → ``(lora_A, lora_B)``.
+    """
+    from tqdm import tqdm
+    from musubi_tuner.modules.loftq_init import loftq_initialize
+    from musubi_tuner.modules.nf4_optimization_utils import quantize_nf4_block, dequantize_nf4_block
+
+    num_iterations = loftq_config.get("num_iterations", 1)
+    block_size = loftq_config.get("block_size", 64)
+    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+
+    # Find target weight keys (same filtering as NF4 quantization)
+    target_keys = []
+    for key in state_dict:
+        if not key.endswith(".weight"):
+            continue
+        is_target = target_layer_keys is None or any(p in key for p in target_layer_keys)
+        is_excluded = exclude_layer_keys is not None and any(p in key for p in exclude_layer_keys)
+        if is_target and not is_excluded:
+            w = state_dict[key]
+            if isinstance(w, torch.Tensor) and w.ndim == 2 and w.shape[1] % block_size == 0:
+                target_keys.append(key)
+
+    loftq_data: Dict[str, tuple] = {}
+    for key in tqdm(target_keys, desc="LoftQ SVD init"):
+        weight = state_dict[key]
+        # Build lora_name matching the convention in lora.py's create_modules
+        module_path = key.rsplit(".weight", 1)[0]
+        lora_name = f"lora_unet_{module_path}".replace(".", "_")
+        try:
+            lora_A, lora_B = loftq_initialize(
+                weight,
+                quantize_fn=quantize_nf4_block,
+                dequantize_fn=dequantize_nf4_block,
+                lora_rank=network_dim,
+                block_size=block_size,
+                num_iterations=num_iterations,
+                device=device,
+            )
+            loftq_data[lora_name] = (lora_A.cpu(), lora_B.cpu())
+        except Exception as e:
+            logger.warning("LoftQ init failed for %s: %s", module_path, e)
+            continue
+
+    logger.info("LoftQ initialization computed for %d modules", len(loftq_data))
+    return loftq_data
 
 
 def create_arch_network(
@@ -482,6 +600,15 @@ def create_arch_network(
                 f"Both lora_target_preset='{lora_target_preset}' and include_patterns are set. "
                 "Using explicit include_patterns, ignoring preset."
             )
+
+    # Handle LoftQ: loftq_data is pre-computed from full-precision weights
+    # before NF4 quantization (passed via kwargs from the training script)
+    kwargs.pop("loftq_config", None)  # consumed upstream, not needed here
+    loftq_data = kwargs.pop("loftq_data", None)
+    if loftq_data is not None:
+        module_kwargs = kwargs.get("module_kwargs", None) or {}
+        module_kwargs["loftq_data"] = loftq_data
+        kwargs["module_kwargs"] = module_kwargs
 
     net = lora.create_network(
         LTX2_TARGET_REPLACE_MODULES,

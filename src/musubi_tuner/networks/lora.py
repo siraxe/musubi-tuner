@@ -36,6 +36,7 @@ class LoRAModule(torch.nn.Module):
         rank_dropout=None,
         module_dropout=None,
         split_dims: Optional[List[int]] = None,
+        **kwargs,
     ):
         """
         if alpha == 0 or None, alpha is rank (no scaling).
@@ -68,6 +69,13 @@ class LoRAModule(torch.nn.Module):
 
             torch.nn.init.kaiming_uniform_(self.lora_down.weight, a=math.sqrt(5))
             torch.nn.init.zeros_(self.lora_up.weight)
+
+            # LoftQ override: if pre-computed (lora_A, lora_B) are provided, use them
+            loftq_init_data = kwargs.get("loftq_init_data", None)
+            if loftq_init_data is not None:
+                lora_A, lora_B = loftq_init_data
+                self.lora_down.weight.data.copy_(lora_A)
+                self.lora_up.weight.data.copy_(lora_B)
         else:
             # conv2d not supported
             assert sum(split_dims) == out_dim, "sum of split_dims must be equal to out_dim"
@@ -475,6 +483,7 @@ class LoRANetwork(torch.nn.Module):
                 exclude_re_patterns.append(re_pattern)
 
         include_re_patterns = []
+        has_include_filter = include_patterns is not None
         if include_patterns is not None:
             for pattern in include_patterns:
                 try:
@@ -515,7 +524,7 @@ class LoRANetwork(torch.nn.Module):
                                 if pattern.fullmatch(original_name):
                                     excluded = True
                                     break
-                            included = False
+                            included = not has_include_filter
                             for pattern in include_re_patterns:
                                 if pattern.fullmatch(original_name):
                                     included = True
@@ -523,6 +532,10 @@ class LoRANetwork(torch.nn.Module):
                             if excluded and not included:
                                 if verbose:
                                     logger.info(f"exclude: {original_name}")
+                                continue
+                            if has_include_filter and not included:
+                                if verbose:
+                                    logger.info(f"not included: {original_name}")
                                 continue
 
                             # filter by name (not used in the current implementation)
@@ -552,6 +565,12 @@ class LoRANetwork(torch.nn.Module):
                                     skipped.append(lora_name)
                                 continue
 
+                            # Build per-module kwargs, injecting LoftQ data if available
+                            per_module_kwargs = dict(self.module_kwargs)
+                            loftq_data = per_module_kwargs.pop("loftq_data", None)
+                            if loftq_data is not None and lora_name in loftq_data:
+                                per_module_kwargs["loftq_init_data"] = loftq_data[lora_name]
+
                             lora = module_class(
                                 lora_name,
                                 child_module,
@@ -561,7 +580,7 @@ class LoRANetwork(torch.nn.Module):
                                 dropout=dropout,
                                 rank_dropout=rank_dropout,
                                 module_dropout=module_dropout,
-                                **self.module_kwargs,
+                                **per_module_kwargs,
                             )
                             loras.append(lora)
 
@@ -694,9 +713,80 @@ class LoRANetwork(torch.nn.Module):
         logger.info(f"LoRA+ UNet LR Ratio: {self.loraplus_lr_ratio}")
         # logger.info(f"LoRA+ Text Encoder LR Ratio: {self.loraplus_text_encoder_lr_ratio or self.loraplus_lr_ratio}")
 
-    def prepare_optimizer_params(self, unet_lr: float = 1e-4, **kwargs):
+    def prepare_optimizer_params(self, unet_lr: float = 1e-4, audio_lr=None, lr_args=None, **kwargs):
         self.requires_grad_(True)
 
+        # Parse lr_args from CLI format ["pattern=lr", ...] → dict
+        lr_patterns = {}
+        if lr_args:
+            for entry in lr_args:
+                if "=" not in entry:
+                    raise ValueError(f"Invalid --lr_args entry (expected pattern=lr): {entry}")
+                pattern, lr_str = entry.split("=", 1)
+                lr_patterns[pattern] = float(lr_str)
+
+        # If no custom LR config, use original fast path
+        if not lr_patterns and audio_lr is None:
+            return self._prepare_optimizer_params_simple(unet_lr)
+
+        # Group LoRA modules by resolved LR
+        lr_to_params = {}  # lr_value → {"lora": {name: param}, "plus": {name: param}}
+        lr_to_desc = {}  # lr_value → description string
+
+        for lora in self.unet_loras:
+            resolved_lr = unet_lr  # default
+            desc = "video"
+
+            # Check lr_args patterns first (highest priority)
+            matched_pattern = False
+            for pattern, pattern_lr in lr_patterns.items():
+                if re.search(pattern, lora.lora_name):
+                    resolved_lr = pattern_lr
+                    desc = pattern
+                    matched_pattern = True
+                    break
+
+            # If no pattern matched, check audio_lr
+            if not matched_pattern and audio_lr is not None:
+                if "audio_" in lora.lora_name:
+                    resolved_lr = audio_lr
+                    desc = "audio"
+
+            # Add params to the correct LR group
+            group = lr_to_params.setdefault(resolved_lr, {"lora": {}, "plus": {}})
+            lr_to_desc.setdefault(resolved_lr, desc)
+            for name, param in lora.named_parameters():
+                key = f"{lora.lora_name}.{name}"
+                if self.loraplus_lr_ratio is not None and "lora_up" in name:
+                    group["plus"][key] = param
+                else:
+                    group["lora"][key] = param
+
+        # Build final param groups
+        all_params = []
+        lr_descriptions = []
+        for lr_val in sorted(lr_to_params.keys()):
+            groups = lr_to_params[lr_val]
+            desc = lr_to_desc[lr_val]
+            for key in ("lora", "plus"):
+                if not groups[key]:
+                    continue
+                param_data = {"params": list(groups[key].values()), "lr": lr_val}
+                if key == "plus" and self.loraplus_lr_ratio:
+                    param_data["lr"] = lr_val * self.loraplus_lr_ratio
+                all_params.append(param_data)
+                suffix = " plus" if key == "plus" else ""
+                lr_descriptions.append(f"unet_{desc}{suffix}")
+
+        # Log group breakdown
+        logger.info(f"LR groups: {len(all_params)} groups created")
+        for param_data, desc in zip(all_params, lr_descriptions):
+            logger.info(f"  {desc}: lr={param_data['lr']}, {len(param_data['params'])} params")
+
+        return all_params, lr_descriptions
+
+    def _prepare_optimizer_params_simple(self, unet_lr: float = 1e-4):
+        """Original single-group optimizer param assembly (no per-module LR)."""
         all_params = []
         lr_descriptions = []
 

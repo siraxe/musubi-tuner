@@ -606,7 +606,15 @@ class LTX2SliderTrainer:
         # Sample sigma from shifted logit-normal
         seq_len = latent_frames * latent_height * latent_width
         shift = LTX2NetworkTrainer._shifted_logit_normal_shift_for_sequence_length(seq_len)
-        sigma = torch.sigmoid(torch.randn(1, device=device) + shift)
+        shifted_logit_mode = self._net_trainer._resolve_shifted_logit_mode(args)
+        sigma = LTX2NetworkTrainer._sample_shifted_logit_normal_sigmas(
+            1,
+            torch.tensor([float(shift)], device=device, dtype=torch.float32),
+            std=float(getattr(args, "logit_std", 1.0)),
+            mode=shifted_logit_mode,
+            eps=float(getattr(args, "shifted_logit_eps", 1e-3)),
+            uniform_prob=float(getattr(args, "shifted_logit_uniform_prob", 0.1)),
+        )
         sigma_exp = sigma.view(1, 1, 1, 1, 1)
         noisy = sigma_exp * noise  # pure noise scaled by sigma
 
@@ -753,8 +761,16 @@ class LTX2SliderTrainer:
         # Sample sigma per batch element
         seq_len = pos_latents.shape[2] * pos_latents.shape[3] * pos_latents.shape[4]
         shift = LTX2NetworkTrainer._shifted_logit_normal_shift_for_sequence_length(seq_len)
-        sigma = torch.sigmoid(torch.randn(batch_size, device=device) + shift)  # [B]
-        sigma_exp = sigma.view(batch_size, 1, 1, 1, 1)  # [B, 1, 1, 1, 1]
+        shifted_logit_mode = self._net_trainer._resolve_shifted_logit_mode(args)
+        sigma = LTX2NetworkTrainer._sample_shifted_logit_normal_sigmas(
+            1,
+            torch.tensor([float(shift)], device=device, dtype=torch.float32),
+            std=float(getattr(args, "logit_std", 1.0)),
+            mode=shifted_logit_mode,
+            eps=float(getattr(args, "shifted_logit_eps", 1e-3)),
+            uniform_prob=float(getattr(args, "shifted_logit_uniform_prob", 0.1)),
+        )
+        sigma_exp = sigma.view(1, 1, 1, 1, 1)
 
         # Create noisy versions (flow matching interpolation)
         noisy_pos = ((1.0 - sigma_exp) * pos_latents + sigma_exp * noise).to(dtype=dit_dtype)
@@ -1421,15 +1437,42 @@ class LTX2SliderTrainer:
             # ComfyUI conversion
             self._net_trainer.post_save_checkpoint_hook(args, ckpt_file, ckpt_name, accelerator, force_sync_upload)
 
-            if getattr(args, "huggingface_repo_id", None) is not None:
+            upload_original = (not getattr(args, "convert_to_comfy", True)) or getattr(args, "save_original_lora", True)
+            if getattr(args, "huggingface_repo_id", None) is not None and upload_original:
                 from musubi_tuner.utils import huggingface_utils
                 huggingface_utils.upload(args, ckpt_file, "/" + ckpt_name, force_sync_upload=force_sync_upload)
+
+            if getattr(args, "save_checkpoint_metadata", False):
+                from datetime import datetime
+
+                _md = {
+                    "step": steps,
+                    "epoch": epoch_no,
+                    "timestamp": datetime.now().isoformat(timespec="seconds"),
+                }
+                try:
+                    _md["loss"] = float(loss)
+                except Exception:
+                    pass
+                if loss_recorder.loss_list:
+                    _md["loss_avg"] = loss_recorder.moving_average
+                try:
+                    _md["lr"] = float(lr_scheduler.get_last_lr()[0])
+                except Exception:
+                    pass
+                train_utils.save_checkpoint_metadata(ckpt_file, _md)
 
         def remove_model(old_ckpt_name):
             old_ckpt_file = os.path.join(args.output_dir, old_ckpt_name)
             if os.path.exists(old_ckpt_file):
                 accelerator.print(f"removing old checkpoint: {old_ckpt_file}")
                 os.remove(old_ckpt_file)
+            if getattr(args, "convert_to_comfy", True):
+                comfy_old_ckpt_file = old_ckpt_file.replace(".safetensors", ".comfy.safetensors")
+                if os.path.exists(comfy_old_ckpt_file):
+                    accelerator.print(f"removing old Comfy checkpoint: {comfy_old_ckpt_file}")
+                    os.remove(comfy_old_ckpt_file)
+            train_utils.remove_checkpoint_metadata(old_ckpt_file)
 
         # -- Training loop -----------------------------------------------------
         progress_bar = tqdm(

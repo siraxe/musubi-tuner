@@ -2,6 +2,7 @@ from enum import Enum
 from typing import Protocol
 
 import logging
+import math
 import torch
 from musubi_tuner.ltx_2.model.transformer.fp8_device_utils import ensure_fp8_modules_on_device
 from musubi_tuner.ltx_2.model.transformer.rope import LTXRopeType, apply_rotary_emb
@@ -247,6 +248,7 @@ class Attention(torch.nn.Module):
         norm_eps: float = 1e-6,
         rope_type: LTXRopeType = LTXRopeType.INTERLEAVED,
         attention_function: AttentionCallable | AttentionFunction = AttentionFunction.DEFAULT,
+        apply_gated_attention: bool = False,
     ) -> None:
         super().__init__()
         self.rope_type = rope_type
@@ -268,9 +270,24 @@ class Attention(torch.nn.Module):
 
         self.to_out = torch.nn.Sequential(torch.nn.Linear(inner_dim, query_dim, bias=True), torch.nn.Identity())
 
+        # Gated attention: per-head learnable gates on attention output.
+        # Zero-init gives gates = 2 * sigmoid(0) = 1.0 (identity at init).
+        if apply_gated_attention:
+            self.to_gate_logits = torch.nn.Linear(query_dim, heads, bias=True)
+        else:
+            self.to_gate_logits = None
+
         # Split attention settings (configured after model load)
         self.split_attn_mode: str | None = None  # "batch" or "query"
         self.split_attn_chunk_size: int = 0  # chunk size for query mode (0 = use default 1024)
+
+        # Optional attention-map capture for training-side regularization.
+        # These fields are toggled externally by ltx2_train's recorder context.
+        self._motion_record_enabled: bool = False
+        self._motion_record_max_queries: int = 32
+        self._motion_record_max_keys: int = 64
+        self._motion_record_capture_grad: bool = False
+        self._motion_record_attn_map: torch.Tensor | None = None
 
     def _split_attention_batch(
         self,
@@ -407,6 +424,42 @@ class Attention(torch.nn.Module):
             q = apply_rotary_emb(q, pe, self.rope_type)
             k = apply_rotary_emb(k, pe if k_pe is None else k_pe, self.rope_type)
 
+        if self._motion_record_enabled:
+            bsz = q.shape[0]
+            qh = q.view(bsz, -1, self.heads, self.dim_head).transpose(1, 2)
+            kh = k.view(bsz, -1, self.heads, self.dim_head).transpose(1, 2)
+            if qh.shape[2] > 0 and kh.shape[2] > 0:
+                q_count = max(1, min(int(self._motion_record_max_queries), int(qh.shape[2])))
+                k_count = max(1, min(int(self._motion_record_max_keys), int(kh.shape[2])))
+                if q_count >= int(qh.shape[2]):
+                    q_idx = torch.arange(int(qh.shape[2]), device=qh.device, dtype=torch.long)
+                else:
+                    q_idx = (
+                        torch.linspace(0, int(qh.shape[2]) - 1, steps=q_count, device=qh.device)
+                        .round()
+                        .to(torch.long)
+                    )
+                    q_idx = torch.unique(q_idx, sorted=True)
+                if k_count >= int(kh.shape[2]):
+                    k_idx = torch.arange(int(kh.shape[2]), device=kh.device, dtype=torch.long)
+                else:
+                    k_idx = (
+                        torch.linspace(0, int(kh.shape[2]) - 1, steps=k_count, device=kh.device)
+                        .round()
+                        .to(torch.long)
+                    )
+                    k_idx = torch.unique(k_idx, sorted=True)
+
+                q_sample = qh[:, :, q_idx, :].to(torch.float32)
+                k_sample = kh[:, :, k_idx, :].to(torch.float32)
+                logits = torch.matmul(q_sample, k_sample.transpose(-1, -2)) / math.sqrt(float(self.dim_head))
+                attn = torch.softmax(logits, dim=-1).mean(dim=1)
+                if not self._motion_record_capture_grad:
+                    attn = attn.detach()
+                self._motion_record_attn_map = attn
+            else:
+                self._motion_record_attn_map = None
+
         # Apply split attention if configured
         split_mode = getattr(self, "split_attn_mode", None)
         if split_mode == "batch":
@@ -416,4 +469,14 @@ class Attention(torch.nn.Module):
         else:
             # attention_function can be an enum *or* a custom callable
             out = self.attention_function(q, k, v, self.heads, mask)
+
+        # Gated attention: apply per-head learnable gates
+        if self.to_gate_logits is not None:
+            gate_logits = self.to_gate_logits(x)  # (B, T, H) from original input
+            b, t, _ = out.shape
+            out = out.view(b, t, self.heads, self.dim_head)
+            gates = 2.0 * torch.sigmoid(gate_logits)
+            out = out * gates.unsqueeze(-1)
+            out = out.view(b, t, self.heads * self.dim_head)
+
         return self.to_out(out)
