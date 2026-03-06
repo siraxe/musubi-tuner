@@ -200,6 +200,7 @@ class LTX2Wrapper(nn.Module):
         if isinstance(video_latents, torch.Tensor):
             _, vch, vframes, vheight, vwidth = video_latents.shape
 
+        # Prompt AdaLN expects per-sample sigma. Collapse token-wise timesteps when present.
         def _to_sigma(ts_value, *, name: str) -> torch.Tensor:
             if isinstance(ts_value, torch.Tensor):
                 ts = ts_value
@@ -207,8 +208,12 @@ class LTX2Wrapper(nn.Module):
                 ts = torch.tensor(ts_value, device=ref_latents.device, dtype=ref_latents.dtype)
             if ts.dim() == 0:
                 ts = ts.view(1)
-            if ts.dim() == 2 and ts.shape[1] == 1:
-                sigma = ts[:, 0]
+            if ts.dim() == 2:
+                if ts.shape[1] == 1:
+                    sigma = ts[:, 0]
+                else:
+                    # Prompt AdaLN expects per-sample sigma. Collapse token-wise timesteps when present.
+                    sigma = ts.to(dtype=torch.float32).mean(dim=1)
             elif ts.dim() == 1:
                 sigma = ts
             else:
