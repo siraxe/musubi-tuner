@@ -2551,6 +2551,8 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 device=accelerator.device,
                 dtype=network_dtype,
             )
+            # In pure audio-only mode, we don't have real video latents
+            has_real_video = False
             if has_real_video:
                 video_latents_for_audio = latents.to(device=accelerator.device, dtype=network_dtype)
                 print("\033[92m[Audio Mode] Using real video latents for cross-attention training (video_to_audio_attn)\033[0m")

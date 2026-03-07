@@ -33,7 +33,7 @@ logging.basicConfig(level=logging.INFO)
 
 IMAGE_EXTENSIONS = [".png", ".jpg", ".jpeg", ".webp", ".bmp", ".PNG", ".JPG", ".JPEG", ".WEBP", ".BMP", ".avif", ".AVIF"]
 
-AUDIO_EXTENSIONS = [".wav", ".flac", ".mp3", ".ogg", ".m4a", ".aac", ".opus", ".wma"]
+AUDIO_EXTENSIONS = [".wav", ".flac", ".mp3", ".ogg", ".m4a", ".aac", ".opus", ".wma", ".WAV", ".FLAC", ".MP3", ".OGG", ".M4A", ".AAC", ".OPUS", ".WMA", ".mp4", ".mov", ".avi", ".mkv", ".webm", ".MP4", ".MOV", ".AVI", ".MKV", ".WEBM"]
 
 
 if find_spec("jxlpy") is not None:  # JPEG-XL on Linux
@@ -2931,6 +2931,10 @@ class AudioDataset(BaseDataset):
         architecture: str = "no_default",
         audio_bucket_strategy: str = "pad",
         audio_bucket_interval: float = 2.0,
+        enable_ar_bucket: bool = False,
+        min_ar: float = 0.5,
+        max_ar: float = 2.0,
+        num_ar_buckets: int = 2,
     ):
         super(AudioDataset, self).__init__(
             resolution,
@@ -2944,6 +2948,10 @@ class AudioDataset(BaseDataset):
             separate_audio_buckets,
             debug_dataset,
             architecture,
+            enable_ar_bucket,
+            min_ar,
+            max_ar,
+            num_ar_buckets,
         )
         self.audio_directory = audio_directory
         self.audio_jsonl_file = audio_jsonl_file
