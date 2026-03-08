@@ -2380,6 +2380,17 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 audio_prompt_embeds = conditions.get("audio_prompt_embeds")
                 if video_prompt_embeds is not None and audio_prompt_embeds is not None:
                     text_embeds = torch.cat([video_prompt_embeds, audio_prompt_embeds], dim=-1)
+                elif video_prompt_embeds is not None:
+                    # Video-only batch in AV mode: use video_prompt_embeds alone
+                    text_embeds = video_prompt_embeds
+                    # Handle 1D or 2D cache format and expand to match batch
+                    batch_size = latents.shape[0]
+                    if text_embeds.dim() == 2:
+                        # 2D [seq_len, hidden] -> [batch, seq_len, hidden]
+                        text_embeds = text_embeds.unsqueeze(0).expand(batch_size, -1, -1).contiguous()
+                    elif text_embeds.dim() == 1:
+                        # 1D [hidden] -> [batch, 1, hidden] (single embedding)
+                        text_embeds = text_embeds.unsqueeze(0).unsqueeze(0).expand(batch_size, 1, -1).contiguous()
                 else:
                     text_embeds = conditions.get("prompt_embeds")
             else:
@@ -2851,13 +2862,20 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 _log_stats("noisy_audio", noisy_audio)
 
         if self._ltx_mode == "av" and not audio_enabled_for_batch:
-            if getattr(args, "av_use_video_prompt_embeds", False) and conditions is not None:
-                video_prompt_embeds = conditions.get("video_prompt_embeds")
-                if isinstance(video_prompt_embeds, torch.Tensor):
-                    text_embeds = video_prompt_embeds
-            elif isinstance(text_embeds, torch.Tensor) and text_embeds.shape[-1] % 2 == 0:
+            # For video-only batches in AV mode, try to use video_prompt_embeds directly
+            video_prompt_embeds = conditions.get("video_prompt_embeds") if conditions is not None else None
+            if isinstance(video_prompt_embeds, torch.Tensor):
+                text_embeds = video_prompt_embeds
+                # Handle 1D or 2D cache format and expand to match batch
+                batch_size = latents.shape[0]
+                if text_embeds.dim() == 2:
+                    text_embeds = text_embeds.unsqueeze(0).expand(batch_size, -1, -1).contiguous()
+                elif text_embeds.dim() == 1:
+                    text_embeds = text_embeds.unsqueeze(0).unsqueeze(0).expand(batch_size, 1, -1).contiguous()
+            elif getattr(args, "av_use_video_prompt_embeds", False) and isinstance(text_embeds, torch.Tensor) and text_embeds.shape[-1] % 2 == 0:
+                # Legacy fallback: only slice if explicitly enabled via av_use_video_prompt_embeds
                 half = text_embeds.shape[-1] // 2
-                text_embeds = text_embeds[..., :half]
+                text_embeds = text_embeds[..., :half].contiguous()
 
         if bool(getattr(transformer, "training", False)) and self._ltx_mode == "av":
             supervision_alert = update_and_check_audio_supervision(
