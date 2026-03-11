@@ -2459,7 +2459,9 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 if random.random() < caption_dropout_rate:
                     text_embeds[i] = 0
                     if text_mask is not None:
+                        # Keep the first token unmasked (e.g., BOS token) to avoid all-masked context
                         text_mask[i] = False
+                        text_mask[i, 0] = True
 
         # Move latents to device
         latents = latents.to(device=accelerator.device, dtype=network_dtype)
