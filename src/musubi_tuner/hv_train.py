@@ -425,6 +425,24 @@ class FineTuningTrainer:
             optimizer_class = torch.optim.AdamW
             optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
 
+        elif optimizer_type == "stiefel":
+            try:
+                from adv_optm import Stiefel_LoRA
+            except ImportError:
+                raise ImportError(
+                    "adv_optm package is required for Stiefel-LoRA. Install with: pip install adv_optm==2.3.dev3"
+                )
+            logger.info(f"use Stiefel-LoRA optimizer | lr={lr} | {optimizer_kwargs}")
+            optimizer_class = Stiefel_LoRA
+            # Set defaults for Stiefel-LoRA if not specified
+            if "momentum" not in optimizer_kwargs:
+                optimizer_kwargs["momentum"] = 0.95
+            if "weight_decay" not in optimizer_kwargs:
+                optimizer_kwargs["weight_decay"] = 0.0
+            if "cautious_wd" not in optimizer_kwargs:
+                optimizer_kwargs["cautious_wd"] = False
+            optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
+
         if optimizer is None:
             # 任意のoptimizerを使う
             case_sensitive_optimizer_type = args.optimizer_type  # not lower
@@ -432,12 +450,24 @@ class FineTuningTrainer:
 
             if "." not in case_sensitive_optimizer_type:  # from torch.optim
                 optimizer_module = torch.optim
+                case_sensitive_optimizer_type = case_sensitive_optimizer_type
+                optimizer_class = getattr(optimizer_module, case_sensitive_optimizer_type)
             else:  # from other library
                 values = case_sensitive_optimizer_type.split(".")
                 optimizer_module = importlib.import_module(".".join(values[:-1]))
                 case_sensitive_optimizer_type = values[-1]
+                optimizer_class = getattr(optimizer_module, case_sensitive_optimizer_type)
 
-            optimizer_class = getattr(optimizer_module, case_sensitive_optimizer_type)
+            # Wrap Prodigy optimizers to reduce state file size
+            if case_sensitive_optimizer_type.lower() == "prodigy" or \
+               "prodigy" in case_sensitive_optimizer_type.lower():
+                try:
+                    from musubi_tuner.optimizers.prodigy_wrapper import wrap_prodigy_optimizer
+                    optimizer_class = wrap_prodigy_optimizer(optimizer_class)
+                    logger.info("Using Prodigy state filtering to reduce optimizer.bin file size")
+                except ImportError:
+                    logger.warning("Could not import prodigy_wrapper, optimizer state files will be large")
+
             optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
 
         # for logging

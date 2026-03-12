@@ -36,6 +36,7 @@ class LoRAModule(torch.nn.Module):
         rank_dropout=None,
         module_dropout=None,
         split_dims: Optional[List[int]] = None,
+        use_stiefel: bool = False,
         **kwargs,
     ):
         """
@@ -45,6 +46,7 @@ class LoRAModule(torch.nn.Module):
         """
         super().__init__()
         self.lora_name = lora_name
+        self.use_stiefel = use_stiefel
 
         if org_module.__class__.__name__ == "Conv2d":
             in_dim = org_module.in_channels
@@ -67,15 +69,25 @@ class LoRAModule(torch.nn.Module):
                 self.lora_down = torch.nn.Linear(in_dim, self.lora_dim, bias=False)
                 self.lora_up = torch.nn.Linear(self.lora_dim, out_dim, bias=False)
 
-            torch.nn.init.kaiming_uniform_(self.lora_down.weight, a=math.sqrt(5))
-            torch.nn.init.zeros_(self.lora_up.weight)
-
             # LoftQ override: if pre-computed (lora_A, lora_B) are provided, use them
             loftq_init_data = kwargs.get("loftq_init_data", None)
             if loftq_init_data is not None:
                 lora_A, lora_B = loftq_init_data
                 self.lora_down.weight.data.copy_(lora_A)
                 self.lora_up.weight.data.copy_(lora_B)
+            elif self.use_stiefel:
+                # Stiefel-LoRA Initialization:
+                # B-factor (lora_up) initialized as orthogonal matrix (on Stiefel Manifold)
+                # A-factor (lora_down) initialized as zeros (so adapter starts as identity)
+                torch.nn.init.orthogonal_(self.lora_up.weight)
+                torch.nn.init.zeros_(self.lora_down.weight)
+                # Mark weights for Stiefel optimizer detection
+                self.lora_down.weight._is_lora_A = True
+                self.lora_up.weight._is_lora_B = True
+            else:
+                # Standard LoRA initialization
+                torch.nn.init.kaiming_uniform_(self.lora_down.weight, a=math.sqrt(5))
+                torch.nn.init.zeros_(self.lora_up.weight)
         else:
             # conv2d not supported
             assert sum(split_dims) == out_dim, "sum of split_dims must be equal to out_dim"
@@ -85,10 +97,19 @@ class LoRAModule(torch.nn.Module):
                 [torch.nn.Linear(in_dim, self.lora_dim, bias=False) for _ in range(len(split_dims))]
             )
             self.lora_up = torch.nn.ModuleList([torch.nn.Linear(self.lora_dim, split_dim, bias=False) for split_dim in split_dims])
-            for lora_down in self.lora_down:
-                torch.nn.init.kaiming_uniform_(lora_down.weight, a=math.sqrt(5))
-            for lora_up in self.lora_up:
-                torch.nn.init.zeros_(lora_up.weight)
+            if self.use_stiefel:
+                # Stiefel-LoRA Initialization for split_dims
+                for lora_up in self.lora_up:
+                    torch.nn.init.orthogonal_(lora_up.weight)
+                    lora_up.weight._is_lora_B = True
+                for lora_down in self.lora_down:
+                    torch.nn.init.zeros_(lora_down.weight)
+                    lora_down.weight._is_lora_A = True
+            else:
+                for lora_down in self.lora_down:
+                    torch.nn.init.kaiming_uniform_(lora_down.weight, a=math.sqrt(5))
+                for lora_up in self.lora_up:
+                    torch.nn.init.zeros_(lora_up.weight)
 
         if type(alpha) == torch.Tensor:
             alpha = alpha.detach().float().numpy()  # without casting, bf16 causes error
@@ -175,10 +196,11 @@ class LoRAInfModule(LoRAModule):
         multiplier=1.0,
         lora_dim=4,
         alpha=1,
+        use_stiefel: bool = False,
         **kwargs,
     ):
         # no dropout for inference
-        super().__init__(lora_name, org_module, multiplier, lora_dim, alpha)
+        super().__init__(lora_name, org_module, multiplier, lora_dim, alpha, use_stiefel=use_stiefel)
 
         self.org_module_ref = [org_module]  # for reference
         self.enabled = True
@@ -370,6 +392,11 @@ def create_network(
     if verbose is not None:
         verbose = True if verbose == "True" else False
 
+    # Stiefel-LoRA support
+    use_stiefel = kwargs.get("use_stiefel", False)
+    if isinstance(use_stiefel, str):
+        use_stiefel = use_stiefel.lower() in ("true", "1", "yes")
+
     # regular expression for module selection: exclude and include
     exclude_patterns = kwargs.get("exclude_patterns", None)
     if exclude_patterns is not None and isinstance(exclude_patterns, str):
@@ -400,6 +427,7 @@ def create_network(
         exclude_patterns=exclude_patterns,
         include_patterns=include_patterns,
         verbose=verbose,
+        use_stiefel=use_stiefel,
     )
 
     loraplus_lr_ratio = kwargs.get("loraplus_lr_ratio", None)
@@ -438,6 +466,7 @@ class LoRANetwork(torch.nn.Module):
         exclude_patterns: Optional[List[str]] = None,
         include_patterns: Optional[List[str]] = None,
         verbose: Optional[bool] = False,
+        use_stiefel: bool = False,
     ) -> None:
         super().__init__()
         self.multiplier = multiplier
@@ -452,6 +481,7 @@ class LoRANetwork(torch.nn.Module):
         self.target_replace_modules = target_replace_modules
         self.prefix = prefix
         self.module_kwargs = module_kwargs or {}
+        self.use_stiefel = use_stiefel
 
         self.loraplus_lr_ratio = None
         # self.loraplus_unet_lr_ratio = None
@@ -464,6 +494,8 @@ class LoRANetwork(torch.nn.Module):
             logger.info(
                 f"neuron dropout: p={self.dropout}, rank dropout: p={self.rank_dropout}, module dropout: p={self.module_dropout}"
             )
+            if self.use_stiefel:
+                logger.info("Stiefel-LoRA enabled: B-factor uses orthogonal initialization, A-factor uses zero initialization")
             # if self.conv_lora_dim is not None:
             #     logger.info(
             #         f"apply LoRA to Conv2d with kernel size (3,3). dim (rank): {self.conv_lora_dim}, alpha: {self.conv_alpha}"
@@ -580,6 +612,7 @@ class LoRANetwork(torch.nn.Module):
                                 dropout=dropout,
                                 rank_dropout=rank_dropout,
                                 module_dropout=module_dropout,
+                                use_stiefel=self.use_stiefel,
                                 **per_module_kwargs,
                             )
                             loras.append(lora)
@@ -1005,6 +1038,11 @@ def create_network_from_weights(
     if module_class is None:
         module_class = LoRAInfModule if for_inference else LoRAModule
 
+    # Get use_stiefel from kwargs (for resuming training)
+    use_stiefel = kwargs.get("use_stiefel", False)
+    if isinstance(use_stiefel, str):
+        use_stiefel = use_stiefel.lower() in ("true", "1", "yes")
+
     network = LoRANetwork(
         target_replace_modules,
         "lora_unet",
@@ -1015,5 +1053,6 @@ def create_network_from_weights(
         modules_alpha=modules_alpha,
         module_class=module_class,
         module_kwargs=module_kwargs,
+        use_stiefel=use_stiefel,
     )
     return network
