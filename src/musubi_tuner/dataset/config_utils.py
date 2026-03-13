@@ -47,6 +47,11 @@ class BaseDatasetParams:
     cache_only: bool = False
     debug_dataset: bool = False
     architecture: str = "no_default"  # short style like "hv" or "wan"
+    # Aspect ratio bucketing parameters
+    enable_ar_bucket: bool = False
+    min_ar: float = 0.5
+    max_ar: float = 2.0
+    num_ar_buckets: int = 2
 
 
 @dataclass
@@ -139,6 +144,10 @@ class ConfigSanitizer:
         "reference_cache_directory": str,
         "separate_audio_buckets": bool,
         "cache_only": bool,
+        "enable_ar_bucket": bool,
+        "min_ar": float,
+        "max_ar": float,
+        "num_ar_buckets": int,
     }
     IMAGE_DATASET_DISTINCT_SCHEMA = {
         "image_directory": str,
