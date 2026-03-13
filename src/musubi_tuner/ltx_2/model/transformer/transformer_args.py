@@ -124,7 +124,27 @@ class TransformerArgsPreprocessor:
         batch_size = x.shape[0]
         if self.caption_projection is not None:
             context = self.caption_projection(context)
-        context = context.view(batch_size, -1, x.shape[-1])
+        expected_hidden = int(x.shape[-1])
+        actual_hidden = int(context.shape[-1])
+        if actual_hidden != expected_hidden:
+            raise ValueError(
+                f"Context hidden size mismatch: got {actual_hidden}, expected {expected_hidden}. "
+                "Check cached text embeddings and modality selection."
+            )
+        context = context.reshape(batch_size, -1, expected_hidden)
+
+        # Validate common 2D token masks early to avoid downstream attention errors.
+        if attention_mask is not None and attention_mask.dim() == 2:
+            if int(attention_mask.shape[0]) != batch_size:
+                raise ValueError(
+                    "Context mask batch mismatch: "
+                    f"got {int(attention_mask.shape[0])}, expected {batch_size}."
+                )
+            if int(attention_mask.shape[-1]) != int(context.shape[1]):
+                raise ValueError(
+                    "Context mask length mismatch: "
+                    f"got {int(attention_mask.shape[-1])}, expected {int(context.shape[1])}."
+                )
 
         return context, attention_mask
 

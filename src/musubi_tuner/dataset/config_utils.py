@@ -39,17 +39,14 @@ class BaseDatasetParams:
     caption_extension: Optional[str] = None
     batch_size: int = 1
     num_repeats: int = 1
+    video_loss_weight: Optional[float] = None
+    audio_loss_weight: Optional[float] = None
     cache_directory: Optional[str] = None
     reference_cache_directory: Optional[str] = None
     separate_audio_buckets: bool = False
     cache_only: bool = False
     debug_dataset: bool = False
     architecture: str = "no_default"  # short style like "hv" or "wan"
-    # Aspect ratio bucketing parameters
-    enable_ar_bucket: bool = False
-    min_ar: float = 0.5
-    max_ar: float = 2.0
-    num_ar_buckets: int = 2
 
 
 @dataclass
@@ -85,13 +82,6 @@ class VideoDatasetParams(BaseDatasetParams):
 
     # FramePack dependent parameters
     fp_latent_window_size: Optional[int] = 9
-
-    # Spatial ROI masking parameters
-    enable_mask: bool = False                     # Enable spatial ROI masking
-    default_mask_file: Optional[str] = None      # Fallback mask file for missing masks (auto-detects mask/ subdirectory if not set)
-
-    # I2V slider control video parameters
-    control_args: Optional[Sequence] = None      # [type, num] e.g., ["jump", "1"] or ["fade", "1"]
 
 
 @dataclass
@@ -143,13 +133,11 @@ class ConfigSanitizer:
         "resolution": functools.partial(__validate_and_convert_scalar_or_twodim.__func__, int),
         "enable_bucket": bool,
         "bucket_no_upscale": bool,
+        "video_loss_weight": float,
+        "audio_loss_weight": float,
         "cache_directory": str,
         "reference_cache_directory": str,
         "separate_audio_buckets": bool,
-        "enable_ar_bucket": bool,
-        "min_ar": float,
-        "max_ar": float,
-        "num_ar_buckets": int,
         "cache_only": bool,
     }
     IMAGE_DATASET_DISTINCT_SCHEMA = {
@@ -183,9 +171,6 @@ class ConfigSanitizer:
         "source_fps": float,
         "target_fps": float,
         "fp_latent_window_size": int,
-        "enable_mask": bool,
-        "default_mask_file": str,
-        "control_args": list,
     }
 
     # options handled by argparse but not handled by user config
@@ -362,14 +347,12 @@ def generate_dataset_group_by_blueprint(
         resolution: {dataset.resolution}
         batch_size: {dataset.batch_size}
         num_repeats: {dataset.num_repeats}
+        video_loss_weight: {getattr(dataset, "video_loss_weight", None)}
+        audio_loss_weight: {getattr(dataset, "audio_loss_weight", None)}
         caption_extension: "{dataset.caption_extension}"
         enable_bucket: {dataset.enable_bucket}
         bucket_no_upscale: {dataset.bucket_no_upscale}
         separate_audio_buckets: {getattr(dataset, "separate_audio_buckets", False)}
-        enable_ar_bucket: {dataset.enable_ar_bucket}
-        min_ar: {dataset.min_ar}
-        max_ar: {dataset.max_ar}
-        num_ar_buckets: {dataset.num_ar_buckets}
         cache_only: {getattr(dataset, "cache_only", False)}
         cache_directory: "{dataset.cache_directory}"
         debug_dataset: {dataset.debug_dataset}
@@ -421,25 +404,11 @@ def generate_dataset_group_by_blueprint(
         source_fps: {dataset.source_fps}
         target_fps: {getattr(dataset, "target_fps", None)}
         fp_latent_window_size: {dataset.fp_latent_window_size}
-        control_args: {getattr(dataset, "control_args", None)}
     \n"""
                 ),
                 "    ",
             )
     logger.info(f"{info}")
-
-    # Log mask information for video datasets
-    total_masked = 0
-    for dataset in datasets:
-        if isinstance(dataset, VideoDataset):
-            if hasattr(dataset, 'datasource') and hasattr(dataset.datasource, 'has_mask'):
-                if dataset.datasource.has_mask:
-                    mask_count = len(dataset.datasource.mask_paths)
-                    total_masked += mask_count
-
-    if total_masked > 0:
-        from loguru import logger as loguru_logger
-        loguru_logger.success(f"[Spatial Masking] {total_masked} video(s) will use spatial ROI masks from mask/ directory")
 
     # make buckets first because it determines the length of dataset
     # and set the same seed for all datasets

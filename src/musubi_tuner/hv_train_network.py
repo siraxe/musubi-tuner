@@ -54,6 +54,7 @@ from musubi_tuner.audio_loss_balance import (
 from musubi_tuner.modules.lr_schedulers import RexLR
 from musubi_tuner.modules.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
 import musubi_tuner.networks.lora as lora_module
+from musubi_tuner.networks.optimizer_params_compat import prepare_optimizer_params_compat
 from musubi_tuner.dataset.config_utils import BlueprintGenerator, ConfigSanitizer
 from musubi_tuner.dataset.image_video_dataset import ARCHITECTURE_HUNYUAN_VIDEO, ARCHITECTURE_HUNYUAN_VIDEO_FULL
 from musubi_tuner.hv_generate_video import save_images_grid, save_videos_grid, resize_image_to_bucket, encode_to_latents
@@ -61,13 +62,6 @@ from musubi_tuner.hv_generate_video import save_images_grid, save_videos_grid, r
 import logging
 
 from musubi_tuner.utils import huggingface_utils, model_utils, train_utils, sai_model_spec
-
-# Import utility for parsing optimizer args
-try:
-    from scripts.musubi_utils import parse_optimizer_args_list
-except ImportError:
-    # Fallback if not available (e.g., different import path)
-    parse_optimizer_args_list = None
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -398,17 +392,6 @@ def line_to_prompt_dict(line: str) -> dict:
                 prompt_dict["one_frame"] = m.group(1).strip()
                 continue
 
-            m = re.match(r"video_dims (.+)", parg, re.IGNORECASE)
-            if m:  # video dimensions for I2V (width, height, num_frames)
-                dims_str = m.group(1).strip()
-                try:
-                    dims = [int(x.strip()) for x in dims_str.split(",")]
-                    if len(dims) == 3:
-                        prompt_dict["video_dims"] = dims_str
-                except ValueError:
-                    pass
-                continue
-
         except ValueError as ex:
             logger.error(f"Exception in parsing / 解析エラー: {parg}")
             logger.error(ex)
@@ -505,6 +488,16 @@ def compute_loss_weighting_for_sd3(weighting_scheme: str, noise_scheduler, times
     return weighting
 
 
+def _per_element_loss(pred: torch.Tensor, tgt: torch.Tensor, loss_type: str = "mse", huber_delta: float = 1.0) -> torch.Tensor:
+    """Compute per-element (unreduced) loss based on loss_type."""
+    if loss_type == "mae" or loss_type == "l1":
+        return torch.nn.functional.l1_loss(pred.float(), tgt.float(), reduction="none")
+    elif loss_type == "huber" or loss_type == "smooth_l1":
+        return torch.nn.functional.smooth_l1_loss(pred.float(), tgt.float(), reduction="none", beta=huber_delta)
+    else:  # "mse"
+        return torch.nn.functional.mse_loss(pred.float(), tgt.float(), reduction="none")
+
+
 def should_sample_images(args, steps, epoch=None):
     if steps == 0:
         if not args.sample_at_first:
@@ -527,6 +520,7 @@ class NetworkTrainer:
         self.vae_frame_stride = 4  # all architectures require frames to be divisible by 4, except Qwen-Image-Layered
         self.default_discrete_flow_shift = 14.5  # default value for discrete flow shift for all models TODO may be None is better
         self._current_batch_latents_info: Optional[dict[str, Any]] = None
+        self.training = False
 
     # TODO 他のスクリプトと共通化する
     def generate_step_logs(
@@ -586,11 +580,8 @@ class NetworkTrainer:
                     logs[f"lr/d*eff_lr/{lr_desc}"] = optimizer.param_groups[i]["d"] * optimizer.param_groups[i]["effective_lr"]
 
             if args.optimizer_type.lower() == "automagic" and optimizer is not None:
-                # Handle AcceleratedOptimizer wrapper from accelerate
-                actual_optimizer = optimizer.optimizer if hasattr(optimizer, "optimizer") else optimizer
-                if hasattr(actual_optimizer, "get_avg_learning_rate"):
-                    logs[f"lr/automagic_avg"] = actual_optimizer.get_avg_learning_rate()
-                lr_tensor = actual_optimizer.get_lr_tensor()
+                logs[f"lr/automagic_avg"] = optimizer.get_avg_learning_rate()
+                lr_tensor = optimizer.get_lr_tensor()
                 if lr_tensor is not None and len(lr_tensor) > 1:
                     logs["lr/automagic_min"] = float(lr_tensor.min())
                     logs["lr/automagic_max"] = float(lr_tensor.max())
@@ -598,14 +589,14 @@ class NetworkTrainer:
 
         return logs
 
-    def get_optimizer(self, args, trainable_params: list[torch.nn.Parameter], optimizer_kwargs: dict | None = None) -> tuple[str, str, torch.optim.Optimizer]:
+    def get_optimizer(self, args, trainable_params: list[torch.nn.Parameter]) -> tuple[str, str, torch.optim.Optimizer]:
         # adamw, adamw8bit, adafactor
 
         optimizer_type = args.optimizer_type.lower()
 
-        # Use pre-parsed optimizer_kwargs from caller, or parse from args.optimizer_args
-        optimizer_kwargs = optimizer_kwargs or {}
-        if not optimizer_kwargs and args.optimizer_args is not None and len(args.optimizer_args) > 0:
+        # split optimizer_type and optimizer_args
+        optimizer_kwargs = {}
+        if args.optimizer_args is not None and len(args.optimizer_args) > 0:
             for arg in args.optimizer_args:
                 if "=" not in arg:
                     raise ValueError(f"Invalid --optimizer_args entry (expected key=value): {arg}")
@@ -686,24 +677,6 @@ class NetworkTrainer:
             optimizer_class = Automagic
             optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
 
-        elif optimizer_type == "stiefel" or optimizer_type == "stiefel_lora":
-            try:
-                from adv_optm import Stiefel_LoRA
-            except ImportError:
-                raise ImportError(
-                    "adv_optm package is required for Stiefel-LoRA. Install with: pip install adv_optm==2.3.dev3"
-                )
-            logger.info(f"use Stiefel-LoRA optimizer | lr={lr} | {optimizer_kwargs}")
-            optimizer_class = Stiefel_LoRA
-            # Set defaults for Stiefel-LoRA if not specified
-            if "momentum" not in optimizer_kwargs:
-                optimizer_kwargs["momentum"] = 0.95
-            if "weight_decay" not in optimizer_kwargs:
-                optimizer_kwargs["weight_decay"] = 0.0
-            if "cautious_wd" not in optimizer_kwargs:
-                optimizer_kwargs["cautious_wd"] = 0.1
-            optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
-
         if optimizer is None:
             # 任意のoptimizerを使う
             case_sensitive_optimizer_type = args.optimizer_type  # not lower
@@ -711,24 +684,12 @@ class NetworkTrainer:
 
             if "." not in case_sensitive_optimizer_type:  # from torch.optim
                 optimizer_module = torch.optim
-                case_sensitive_optimizer_type = case_sensitive_optimizer_type
-                optimizer_class = getattr(optimizer_module, case_sensitive_optimizer_type)
             else:  # from other library
                 values = case_sensitive_optimizer_type.split(".")
                 optimizer_module = importlib.import_module(".".join(values[:-1]))
                 case_sensitive_optimizer_type = values[-1]
-                optimizer_class = getattr(optimizer_module, case_sensitive_optimizer_type)
 
-            # Wrap Prodigy optimizers to reduce state file size
-            if case_sensitive_optimizer_type.lower() == "prodigy" or \
-               "prodigy" in case_sensitive_optimizer_type.lower():
-                try:
-                    from musubi_tuner.optimizers.prodigy_wrapper import wrap_prodigy_optimizer
-                    optimizer_class = wrap_prodigy_optimizer(optimizer_class)
-                    logger.info("Using Prodigy state filtering to reduce optimizer.bin file size")
-                except ImportError:
-                    logger.warning("Could not import prodigy_wrapper, optimizer state files will be large")
-
+            optimizer_class = getattr(optimizer_module, case_sensitive_optimizer_type)
             optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
 
         # for logging
@@ -744,6 +705,58 @@ class NetworkTrainer:
             eval_fn = lambda: None
 
         return optimizer_name, optimizer_args, optimizer, train_fn, eval_fn
+
+    def _enable_lycoris_fp8_forward_compat(self, args: argparse.Namespace, network: Any) -> None:
+        network_module_name = str(getattr(args, "network_module", "") or "")
+        uses_lycoris_module = "lycoris" in network_module_name.lower()
+        uses_fp8_base = bool(getattr(args, "fp8_base", False) or getattr(args, "fp8_scaled", False))
+        if not uses_lycoris_module or not uses_fp8_base:
+            return
+        if bool(getattr(network, "_lycoris_fp8_forward_compat_applied", False)):
+            return
+
+        if args.mixed_precision == "fp16":
+            compat_dtype = torch.float16
+        elif args.mixed_precision == "bf16":
+            compat_dtype = torch.bfloat16
+        else:
+            compat_dtype = torch.float32
+
+        converted = 0
+        checked = 0
+        for lora in getattr(network, "loras", []):
+            org_modules = getattr(lora, "org_module", None)
+            if not isinstance(org_modules, (list, tuple)) or len(org_modules) == 0:
+                continue
+            module = org_modules[0]
+            if module is None or not hasattr(module, "weight"):
+                continue
+            if not isinstance(module.weight, torch.nn.Parameter):
+                continue
+
+            checked += 1
+            weight_data = module.weight.data
+            if not isinstance(weight_data, torch.Tensor) or weight_data.dtype.itemsize != 1:
+                continue
+
+            module.weight.data = weight_data.to(dtype=compat_dtype)
+            if hasattr(module, "bias") and isinstance(module.bias, torch.nn.Parameter) and module.bias is not None:
+                module.bias.data = module.bias.data.to(dtype=compat_dtype)
+            converted += 1
+
+        setattr(network, "_lycoris_fp8_forward_compat_applied", True)
+        if converted > 0:
+            logger.warning(
+                "LyCORIS FP8 forward compat enabled: upcasted %d/%d adapted base layers to %s to avoid FP8 op limitations.",
+                converted,
+                checked,
+                compat_dtype,
+            )
+        else:
+            logger.info(
+                "LyCORIS FP8 forward compat checked %d adapted layers; no FP8 base layers required upcast.",
+                checked,
+            )
 
     def is_schedulefree_optimizer(self, optimizer: torch.optim.Optimizer, args: argparse.Namespace) -> bool:
         return args.optimizer_type.lower().endswith("schedulefree".lower()) or args.optimizer_type.lower() == "automagic"
@@ -1947,9 +1960,6 @@ class NetworkTrainer:
             args.seed = random.randint(0, 2**32)
         set_seed(args.seed)
 
-        # Optional GUI metrics (for Flet GUI integration)
-        gui_metrics = None
-
         loss_diag_enabled = os.getenv("LTX2_LOSS_DIAG", "0") == "1"
         loss_diag_every = int(os.getenv("LTX2_LOSS_DIAG_EVERY", "10"))
         audio_loss_balance_mode = str(getattr(args, "audio_loss_balance_mode", "none") or "none").lower()
@@ -2083,6 +2093,14 @@ class NetworkTrainer:
             dit_weight_dtype = dit_dtype
         logger.info(f"DiT precision: {dit_dtype}, weight precision: {dit_weight_dtype}")
 
+        # GUI dashboard metrics writer (lazy import, no-op when --gui is not set)
+        gui_metrics = None
+        if getattr(args, "gui", False) and accelerator.is_main_process:
+            from musubi_tuner.gui_dashboard import create_metrics_writer
+
+            gui_metrics = create_metrics_writer(args.output_dir)
+            gui_metrics.update_status(step=0, max_steps=args.max_train_steps, status="starting")
+
         # get embedding for sampling images
         vae_dtype = torch.float16 if args.vae_dtype is None else model_utils.str_to_dtype(args.vae_dtype)
         sample_parameters = None
@@ -2133,16 +2151,10 @@ class NetworkTrainer:
             logger.info(
                 f"enable swap {blocks_to_swap} blocks to CPU from device: {accelerator.device}, use pinned memory: {args.use_pinned_memory_for_block_swap}"
             )
-            try:
-                transformer.enable_block_swap(
-                    blocks_to_swap, accelerator.device, supports_backward=True, use_pinned_memory=args.use_pinned_memory_for_block_swap,
-                    swap_norms=getattr(args, 'swap_norms', False)
-                )
-            except TypeError:
-                # Some models (e.g., WAN) don't support swap_norms parameter
-                transformer.enable_block_swap(
-                    blocks_to_swap, accelerator.device, supports_backward=True, use_pinned_memory=args.use_pinned_memory_for_block_swap
-                )
+            transformer.enable_block_swap(
+                blocks_to_swap, accelerator.device, supports_backward=True, use_pinned_memory=args.use_pinned_memory_for_block_swap,
+                swap_norms=getattr(args, 'swap_norms', False)
+            )
             _log_vram("AFTER enable_block_swap (offloader created)", logger)
             transformer.move_to_device_except_swap_blocks(accelerator.device)
             _log_vram("AFTER move_to_device_except_swap_blocks #1 (18 blocks to GPU)", logger)
@@ -2234,6 +2246,10 @@ class NetworkTrainer:
             info = network.load_weights(args.network_weights)
             accelerator.print(f"load network weights from {args.network_weights}: {info}")
 
+        # LyCORIS + FP8 backend compatibility:
+        # keep most base model in FP8, but upcast adapted base layers that LyCORIS touches.
+        self._enable_lycoris_fp8_forward_compat(args, network)
+
         if args.gradient_checkpointing:
             blocks_to_ckpt = getattr(args, "blocks_to_checkpoint", -1)
             if getattr(args, "blockwise_checkpointing", False):
@@ -2261,14 +2277,10 @@ class NetworkTrainer:
                         if hasattr(block, "use_pinned_memory"):
                             block.use_pinned_memory = True
             else:
-                try:
-                    transformer.enable_gradient_checkpointing(
-                        args.gradient_checkpointing_cpu_offload,
-                        blocks_to_checkpoint=blocks_to_ckpt
-                    )
-                except TypeError:
-                    # Some models (e.g., WAN) don't support blocks_to_checkpoint parameter
-                    transformer.enable_gradient_checkpointing()
+                transformer.enable_gradient_checkpointing(
+                    args.gradient_checkpointing_cpu_offload,
+                    blocks_to_checkpoint=blocks_to_ckpt
+                )
             try:
                 network.enable_gradient_checkpointing(
                     args.gradient_checkpointing_cpu_offload,
@@ -2281,15 +2293,28 @@ class NetworkTrainer:
         # prepare optimizer, data loader etc.
         accelerator.print("prepare optimizer, data loader etc.")
 
-        trainable_params, lr_descriptions = network.prepare_optimizer_params(
-            unet_lr=args.learning_rate,
-            audio_lr=getattr(args, "audio_lr", None),
-            lr_args=getattr(args, "lr_args", None),
-        )
+        network_module_name = str(getattr(args, "network_module", "") or "")
+        uses_lycoris_module = "lycoris" in network_module_name.lower()
+        if uses_lycoris_module:
+            trainable_params, lr_descriptions = prepare_optimizer_params_compat(network, args, logger)
+        else:
+            trainable_params, lr_descriptions = network.prepare_optimizer_params(
+                unet_lr=args.learning_rate,
+                audio_lr=getattr(args, "audio_lr", None),
+                lr_args=getattr(args, "lr_args", None),
+            )
 
         optimizer_name, optimizer_args, optimizer, optimizer_train_fn, optimizer_eval_fn = self.get_optimizer(
             args, trainable_params
         )
+
+        def set_trainer_train_mode() -> None:
+            optimizer_train_fn()
+            self.training = True
+
+        def set_trainer_eval_mode() -> None:
+            optimizer_eval_fn()
+            self.training = False
 
         # prepare dataloader
 
@@ -2362,9 +2387,6 @@ class NetworkTrainer:
         # send max_train_steps to train_dataset_group
         train_dataset_group.set_max_train_steps(args.max_train_steps)
 
-        # prepare lr_scheduler
-        lr_scheduler = self.get_lr_scheduler(args, optimizer, accelerator.num_processes)
-
         # prepare training model. accelerator does some magic here
 
         # experimental feature: train the model with gradients in fp16/bf16
@@ -2405,6 +2427,30 @@ class NetworkTrainer:
             transformer = self.compile_transformer(args, transformer)
             transformer.__dict__["_orig_mod"] = transformer  # for annoying accelerator checks
 
+        # Set up pre-train hooks (CREPA, Self-Flow, etc.) BEFORE creating the LR scheduler.
+        # This guarantees optimizer.param_groups is finalized before scheduler init.
+        # Otherwise torch LR schedulers can fail with:
+        #   ValueError: zip() argument 2 is shorter than argument 1
+        self.pre_train_hook(args, accelerator, transformer=transformer, network=network)
+        if hasattr(self, '_crepa') and self._crepa is not None:
+            crepa_params = self._crepa.get_trainable_params()
+            if crepa_params:
+                optimizer.add_param_group({"params": crepa_params, "lr": args.learning_rate})
+                accelerator.print(f"CREPA: added {sum(p.numel() for p in crepa_params):,} projector params to optimizer")
+        if hasattr(self, "_self_flow") and self._self_flow is not None:
+            self_flow_params = self._self_flow.get_trainable_params()
+            if self_flow_params:
+                projector_lr = getattr(getattr(self._self_flow, "config", None), "projector_lr", None)
+                effective_projector_lr = float(projector_lr) if projector_lr is not None else float(args.learning_rate)
+                optimizer.add_param_group({"params": self_flow_params, "lr": effective_projector_lr})
+                accelerator.print(
+                    f"Self-Flow: added {sum(p.numel() for p in self_flow_params):,} projector params to optimizer "
+                    f"(lr={effective_projector_lr:g})"
+                )
+
+        # prepare lr_scheduler (must happen after all optimizer param groups are added)
+        lr_scheduler = self.get_lr_scheduler(args, optimizer, accelerator.num_processes)
+
         if validation_dataloader is not None:
             network, optimizer, train_dataloader, validation_dataloader, lr_scheduler = accelerator.prepare(
                 network, optimizer, train_dataloader, validation_dataloader, lr_scheduler
@@ -2421,6 +2467,7 @@ class NetworkTrainer:
             transformer.eval()
 
         accelerator.unwrap_model(network).prepare_grad_etc(transformer)
+        self._current_call_network = accelerator.unwrap_model(network)
 
         if args.full_fp16:
             # patch accelerator for fp16 training
@@ -2456,6 +2503,20 @@ class NetworkTrainer:
                             save_file(proj_sd, proj_file)
                     except Exception as e:
                         logger.warning(f"Failed to save CREPA projector to state dir: {e}")
+                if hasattr(self, "_self_flow") and self._self_flow is not None:
+                    try:
+                        from safetensors.torch import save_file
+
+                        proj_sd = self._self_flow.state_dict()
+                        if proj_sd:
+                            proj_file = os.path.join(output_dir, "self_flow_projector.safetensors")
+                            save_file(proj_sd, proj_file)
+                        teacher_sd = self._self_flow.teacher_state_dict()
+                        if teacher_sd:
+                            teacher_file = os.path.join(output_dir, "self_flow_teacher_ema.safetensors")
+                            save_file(teacher_sd, teacher_file)
+                    except Exception as e:
+                        logger.warning(f"Failed to save Self-Flow projector to state dir: {e}")
 
         def load_model_hook(models, input_dir):
             # remove models except network
@@ -2467,19 +2528,24 @@ class NetworkTrainer:
                 models.pop(i)
             # print(f"load model hook: {len(models)} models will be loaded")
 
+            if hasattr(self, "_self_flow") and self._self_flow is not None:
+                try:
+                    from safetensors.torch import load_file
+
+                    proj_file = os.path.join(input_dir, "self_flow_projector.safetensors")
+                    if os.path.exists(proj_file):
+                        self._self_flow.load_state_dict(load_file(proj_file))
+                        logger.info("Self-Flow: loaded projector state from %s", proj_file)
+
+                    teacher_file = os.path.join(input_dir, "self_flow_teacher_ema.safetensors")
+                    if os.path.exists(teacher_file):
+                        self._self_flow.load_teacher_state_dict(load_file(teacher_file))
+                        logger.info("Self-Flow: loaded EMA teacher state from %s", teacher_file)
+                except Exception as e:
+                    logger.warning(f"Failed to load Self-Flow state from checkpoint dir: {e}")
+
         accelerator.register_save_state_pre_hook(save_model_hook)
         accelerator.register_load_state_pre_hook(load_model_hook)
-
-        # Set up CREPA (and any other pre-train hooks) BEFORE resume so that the
-        # optimizer has the correct number of param groups when load_state() restores
-        # the saved optimizer state.  Without this, resume crashes with
-        # "loaded state dict has a different number of parameter groups".
-        self.pre_train_hook(args, accelerator, transformer=transformer, network=network)
-        if hasattr(self, '_crepa') and self._crepa is not None:
-            crepa_params = self._crepa.get_trainable_params()
-            if crepa_params:
-                optimizer.add_param_group({"params": crepa_params, "lr": args.learning_rate})
-                accelerator.print(f"CREPA: added {sum(p.numel() for p in crepa_params):,} projector params to optimizer")
 
         # epoch数を計算する
         num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -2672,14 +2738,8 @@ class NetworkTrainer:
             # Call post-save hook for architecture-specific processing
             self.post_save_checkpoint_hook(args, ckpt_file, ckpt_name, accelerator, force_sync_upload)
 
-            # Dynamic state saving: check for save_state.txt indicator file
-            save_state_indicator = os.path.join(args.output_dir, "save_state.txt")
-            if os.path.exists(save_state_indicator):
-                state_dir = os.path.join(args.output_dir, f"{args.output_name}-step{steps:08d}-state")
-                accelerator.print(f"save_state.txt found - saving full state to: {state_dir}")
-                accelerator.save_state(state_dir)
-
-            if args.huggingface_repo_id is not None:
+            upload_original = (not getattr(args, "convert_to_comfy", True)) or getattr(args, "save_original_lora", True)
+            if args.huggingface_repo_id is not None and upload_original:
                 huggingface_utils.upload(args, ckpt_file, "/" + ckpt_name, force_sync_upload=force_sync_upload)
 
             if getattr(args, "save_checkpoint_metadata", False):
@@ -2722,7 +2782,7 @@ class NetworkTrainer:
             if validation_dataloader is None:
                 return
 
-            optimizer_eval_fn()
+            set_trainer_eval_mode()
             network.eval()
             transformer_was_training = transformer.training
             transformer.eval()
@@ -2779,6 +2839,8 @@ class NetworkTrainer:
                     )
 
                     dict_output = isinstance(model_pred, dict)
+                    _loss_type = getattr(args, "loss_type", "mse")
+                    _huber_delta = getattr(args, "huber_delta", 1.0)
                     if dict_output:
                         out = model_pred
                         if out.get("_skip_step"):
@@ -2794,7 +2856,7 @@ class NetworkTrainer:
                         video_weight = None
                         audio_weight = None
 
-                        def _masked_mse(
+                        def _masked_loss(
                             pred: torch.Tensor,
                             tgt: torch.Tensor,
                             mask: torch.Tensor | None,
@@ -2803,7 +2865,7 @@ class NetworkTrainer:
                                 pred = pred.to(device=tgt.device, dtype=network_dtype)
                             else:
                                 pred = pred.to(dtype=network_dtype)
-                            per_elem = torch.nn.functional.mse_loss(pred, tgt, reduction="none")
+                            per_elem = _per_element_loss(pred, tgt, _loss_type, _huber_delta)
                             if weighting is not None:
                                 w = weighting
                                 if isinstance(w, torch.Tensor) and w.dim() != per_elem.dim():
@@ -2836,7 +2898,7 @@ class NetworkTrainer:
                         video_pred = out["video_pred"]
                         video_target = out["video_target"]
                         video_loss_mask = out.get("video_loss_mask")
-                        video_loss = _masked_mse(video_pred, video_target, video_loss_mask)
+                        video_loss = _masked_loss(video_pred, video_target, video_loss_mask)
                         video_weight = float(out.get("video_loss_weight", 1.0))
                         loss = video_loss * video_weight
 
@@ -2844,7 +2906,7 @@ class NetworkTrainer:
                         audio_target = out.get("audio_target")
                         audio_loss_mask = out.get("audio_loss_mask")
                         if audio_pred is not None and audio_target is not None:
-                            audio_loss = _masked_mse(audio_pred, audio_target, audio_loss_mask)
+                            audio_loss = _masked_loss(audio_pred, audio_target, audio_loss_mask)
                             audio_weight = float(out.get("audio_loss_weight", 1.0))
                             loss = loss + audio_loss * audio_weight
                     else:
@@ -2852,7 +2914,7 @@ class NetworkTrainer:
                             model_pred = model_pred.to(device=target.device, dtype=network_dtype)
                         else:
                             model_pred = model_pred.to(dtype=network_dtype)
-                        loss = torch.nn.functional.mse_loss(model_pred, target, reduction="none")
+                        loss = _per_element_loss(model_pred, target, _loss_type, _huber_delta)
                         if weighting is not None:
                             loss = loss * weighting
                         loss = loss.mean()
@@ -2899,13 +2961,13 @@ class NetworkTrainer:
             else:
                 transformer.eval()
             network.train()
-            optimizer_train_fn()
+            set_trainer_train_mode()
 
         # For --sample_at_first (skip on resume — samples were already generated)
         if global_step == 0 and should_sample_images(args, global_step, epoch=0):
-            optimizer_eval_fn()
+            set_trainer_eval_mode()
             self.sample_images(accelerator, args, 0, global_step, vae, transformer, sample_parameters, dit_dtype)
-            optimizer_train_fn()
+            set_trainer_train_mode()
         if len(accelerator.trackers) > 0:
             # log empty object to commit the sample images to wandb
             accelerator.log({}, step=0)
@@ -2923,7 +2985,7 @@ class NetworkTrainer:
 
         # pre_train_hook and CREPA param group already called before resume (above)
 
-        optimizer_train_fn()  # Set training mode
+        set_trainer_train_mode()  # Set training mode
 
         for epoch in range(epoch_to_start, num_train_epochs):
             accelerator.print(f"\nepoch {epoch + 1}/{num_train_epochs}")
@@ -3018,10 +3080,13 @@ class NetworkTrainer:
                     audio_presence_ema_value = None
                     audio_loss_ema_value = None
                     video_loss_ema_value = None
+                    _loss_type = getattr(args, "loss_type", "mse")
+                    _huber_delta = getattr(args, "huber_delta", 1.0)
+
                     if dict_output:
                         out = model_pred
 
-                        def _masked_mse(
+                        def _masked_loss(
                             pred: torch.Tensor,
                             tgt: torch.Tensor,
                             mask: torch.Tensor | None,
@@ -3030,7 +3095,7 @@ class NetworkTrainer:
                                 pred = pred.to(device=tgt.device, dtype=network_dtype)
                             else:
                                 pred = pred.to(dtype=network_dtype)
-                            per_elem = torch.nn.functional.mse_loss(pred, tgt, reduction="none")
+                            per_elem = _per_element_loss(pred, tgt, _loss_type, _huber_delta)
                             if weighting is not None:
                                 w = weighting
                                 if isinstance(w, torch.Tensor) and w.dim() != per_elem.dim():
@@ -3063,7 +3128,7 @@ class NetworkTrainer:
                         video_pred = out["video_pred"]
                         video_target = out["video_target"]
                         video_loss_mask = out.get("video_loss_mask")
-                        video_loss = _masked_mse(video_pred, video_target, video_loss_mask)
+                        video_loss = _masked_loss(video_pred, video_target, video_loss_mask)
                         video_weight = float(out.get("video_loss_weight", 1.0))
                         loss = video_loss * video_weight
                         if audio_loss_balance_mode == "ema_mag":
@@ -3090,7 +3155,7 @@ class NetworkTrainer:
                             )
                             audio_presence_ema_value = audio_presence_ema
                         if has_audio_loss:
-                            audio_loss = _masked_mse(audio_pred, audio_target, audio_loss_mask)
+                            audio_loss = _masked_loss(audio_pred, audio_target, audio_loss_mask)
                             audio_weight = float(out.get("audio_loss_weight", 1.0))
                             if audio_loss_balance_mode == "inv_freq":
                                 audio_weight = compute_inverse_frequency_audio_weight(
@@ -3126,7 +3191,7 @@ class NetworkTrainer:
                             model_pred = model_pred.to(device=target.device, dtype=network_dtype)
                         else:
                             model_pred = model_pred.to(dtype=network_dtype)
-                        loss = torch.nn.functional.mse_loss(model_pred, target, reduction="none")
+                        loss = _per_element_loss(model_pred, target, _loss_type, _huber_delta)
 
                     if not dict_output and weighting is not None:
                         loss = loss * weighting
@@ -3157,6 +3222,24 @@ class NetworkTrainer:
                             loss = loss + crepa_loss
                         self._crepa.cleanup_step()
 
+                    # Self-Flow loss
+                    self_flow_metrics = {}
+                    if hasattr(self, "compute_self_flow_addition"):
+                        if hasattr(self, "_self_flow") and self._self_flow is not None:
+                            self._self_flow.on_step(global_step)
+                        try:
+                            self_flow_loss, self_flow_metrics = self.compute_self_flow_addition(
+                                args,
+                                accelerator,
+                                transformer,
+                                network,
+                                network_dtype,
+                            )
+                            if self_flow_loss is not None:
+                                loss = loss + self_flow_loss
+                        except Exception as e:
+                            logger.warning("Self-Flow loss computation failed: %s", e)
+
                     if _is_first_step:
                         _log_vram("FIRST_ITER: BEFORE backward", logger)
                     accelerator.backward(loss)
@@ -3168,6 +3251,8 @@ class NetworkTrainer:
                         pres_losses["loss/prior_div"] = _prior_div_value
                     if _crepa_value is not None:
                         pres_losses["loss/crepa"] = _crepa_value
+                    if self_flow_metrics:
+                        pres_losses.update(self_flow_metrics)
 
                     # DEBUG: Check if LoRA parameters have gradients (requires LTX2_DEBUG env var)
                     if os.environ.get("LTX2_DEBUG", "0") == "1":
@@ -3214,11 +3299,21 @@ class NetworkTrainer:
                             for param in network.parameters():
                                 if param.grad is not None:
                                     param.grad = accelerator.reduce(param.grad, reduction="mean")
+                            if hasattr(self, '_crepa') and self._crepa is not None:
+                                for param in self._crepa.get_trainable_params():
+                                    if param.grad is not None:
+                                        param.grad = accelerator.reduce(param.grad, reduction="mean")
+                            if hasattr(self, "_self_flow") and self._self_flow is not None:
+                                for param in self._self_flow.get_trainable_params():
+                                    if param.grad is not None:
+                                        param.grad = accelerator.reduce(param.grad, reduction="mean")
 
                         if args.max_grad_norm != 0.0:
                             params_to_clip = list(accelerator.unwrap_model(network).get_trainable_params())
                             if hasattr(self, '_crepa') and self._crepa is not None:
                                 params_to_clip.extend(self._crepa.get_trainable_params())
+                            if hasattr(self, "_self_flow") and self._self_flow is not None:
+                                params_to_clip.extend(self._self_flow.get_trainable_params())
                             accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
 
                     if _is_first_step:
@@ -3226,6 +3321,15 @@ class NetworkTrainer:
                     optimizer.step()
                     if _is_first_step:
                         _log_vram("FIRST_ITER: AFTER optimizer.step", logger)
+                    if (
+                        accelerator.sync_gradients
+                        and hasattr(self, "_self_flow")
+                        and self._self_flow is not None
+                    ):
+                        try:
+                            self._self_flow.update_teacher(accelerator.unwrap_model(network))
+                        except Exception as e:
+                            logger.warning("Self-Flow EMA update failed: %s", e)
                     lr_scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
                     if _is_first_step:
@@ -3258,7 +3362,7 @@ class NetworkTrainer:
                     should_saving = args.save_every_n_steps is not None and global_step % args.save_every_n_steps == 0
 
                     if should_sampling or should_saving:
-                        optimizer_eval_fn()
+                        set_trainer_eval_mode()
                         if should_sampling:
                             self.sample_images(accelerator, args, None, global_step, vae, transformer, sample_parameters, dit_dtype)
                             if gui_metrics is not None:
@@ -3269,6 +3373,8 @@ class NetworkTrainer:
                             if accelerator.is_main_process:
                                 ckpt_name = train_utils.get_step_ckpt_name(args.output_name, global_step)
                                 save_model(ckpt_name, accelerator.unwrap_model(network), global_step, epoch)
+                                if gui_metrics is not None:
+                                    gui_metrics.log_event("checkpoint", global_step)
 
                                 if args.save_state:
                                     train_utils.save_and_remove_state_stepwise(args, accelerator, global_step)
@@ -3277,7 +3383,7 @@ class NetworkTrainer:
                                 if remove_step_no is not None:
                                     remove_ckpt_name = train_utils.get_step_ckpt_name(args.output_name, remove_step_no)
                                     remove_model(remove_ckpt_name)
-                        optimizer_train_fn()
+                        set_trainer_train_mode()
 
                 current_loss = loss.detach().item()
                 loss_recorder.add(epoch=epoch, step=step, loss=current_loss)
@@ -3314,28 +3420,29 @@ class NetworkTrainer:
 
                     # Log automagic LR histogram directly to tracker
                     if args.optimizer_type.lower() == "automagic" and optimizer is not None:
-                        actual_optimizer = optimizer.optimizer if hasattr(optimizer, "optimizer") else optimizer
-                        if hasattr(actual_optimizer, "get_lr_tensor"):
-                            lr_tensor = actual_optimizer.get_lr_tensor()
-                            if lr_tensor is not None and lr_tensor.mean() > 0:
-                                for tracker in accelerator.trackers:
-                                    if tracker.name == "tensorboard":
-                                        tracker.writer.add_histogram("lr/automagic_lrs", lr_tensor, global_step)
-                                    elif tracker.name == "wandb":
-                                        import wandb
-                                        tracker.log({"lr/automagic_lrs": wandb.Histogram(lr_tensor.cpu().numpy())}, step=global_step)
+                        lr_tensor = optimizer.get_lr_tensor()
+                        if lr_tensor is not None and lr_tensor.mean() > 0:
+                            for tracker in accelerator.trackers:
+                                if tracker.name == "tensorboard":
+                                    tracker.writer.add_histogram("lr/automagic_lrs", lr_tensor, global_step)
+                                elif tracker.name == "wandb":
+                                    import wandb
+                                    tracker.log({"lr/automagic_lrs": wandb.Histogram(lr_tensor.cpu().numpy())}, step=global_step)
 
+                # GUI dashboard per-step metrics
                 if gui_metrics is not None:
-                    _step_elapsed = time.perf_counter() - _step_start_time
+                    step_time = time.perf_counter() - _step_start_time
                     gui_metrics.log(
-                        step=global_step, epoch=epoch, loss=current_loss, avr_loss=avr_loss,
-                        loss_v=video_loss_value, loss_a=audio_loss_value,
-                        lr=lr_scheduler.get_last_lr()[0], step_time=_step_elapsed,
+                        step=global_step,
+                        epoch=epoch,
+                        loss=current_loss,
+                        avr_loss=avr_loss,
+                        loss_v=video_loss_value,
+                        loss_a=audio_loss_value,
+                        lr=lr_scheduler.get_last_lr()[0],
+                        step_time=step_time,
                     )
-                    gui_metrics.update_status(
-                        step=global_step, max_steps=args.max_train_steps,
-                        epoch=epoch + 1, max_epochs=num_train_epochs, status="training",
-                    )
+                    gui_metrics.update_status(step=global_step, status="training")
 
                 if (
                     validation_dataloader is not None
@@ -3361,7 +3468,7 @@ class NetworkTrainer:
             accelerator.wait_for_everyone()
 
             # save model at the end of epoch if needed
-            optimizer_eval_fn()
+            set_trainer_eval_mode()
             if args.save_every_n_epochs is not None:
                 saving = (epoch + 1) % args.save_every_n_epochs == 0 and (epoch + 1) < num_train_epochs
                 if is_main_process and saving:
@@ -3377,9 +3484,7 @@ class NetworkTrainer:
                         train_utils.save_and_remove_state_on_epoch_end(args, accelerator, epoch + 1)
 
             self.sample_images(accelerator, args, epoch + 1, global_step, vae, transformer, sample_parameters, dit_dtype)
-            if gui_metrics is not None:
-                gui_metrics.log_event("epoch_sample", global_step)
-            optimizer_train_fn()
+            set_trainer_train_mode()
 
             # end of epoch
 
@@ -3387,14 +3492,14 @@ class NetworkTrainer:
         metadata["ss_training_finished_at"] = str(time.time())
 
         if gui_metrics is not None:
-            gui_metrics.update_status(step=global_step, max_steps=args.max_train_steps, status="completed")
+            gui_metrics.update_status(status="completed")
             gui_metrics.close()
 
         if is_main_process:
             network = accelerator.unwrap_model(network)
 
         accelerator.end_training()
-        optimizer_eval_fn()
+        set_trainer_eval_mode()
 
         if is_main_process and (args.save_state or args.save_state_on_train_end):
             train_utils.save_state_on_train_end(args, accelerator)
@@ -3855,6 +3960,19 @@ def setup_parser_common() -> argparse.ArgumentParser:
         help="Scale of mode weighting scheme. Only effective when using the `'mode'` as the `weighting_scheme` / モード重み付けスキームのスケール",
     )
     parser.add_argument(
+        "--loss_type",
+        type=str,
+        default="mse",
+        choices=["mse", "mae", "l1", "huber", "smooth_l1"],
+        help="Loss function type. 'mse' (default): mean squared error; 'mae'/'l1': mean absolute error; 'huber'/'smooth_l1': Huber loss (use --huber_delta to control transition point).",
+    )
+    parser.add_argument(
+        "--huber_delta",
+        type=float,
+        default=1.0,
+        help="Delta (beta) for Huber/smooth_l1 loss. Below this threshold the loss is ~MSE, above it ~MAE. Only used when --loss_type is huber or smooth_l1.",
+    )
+    parser.add_argument(
         "--min_timestep",
         type=int,
         default=None,
@@ -4117,11 +4235,6 @@ def setup_parser_common() -> argparse.ArgumentParser:
     parser.add_argument("--vae", type=str, help="VAE checkpoint path / VAEのチェックポイントのパス")
     parser.add_argument("--vae_dtype", type=str, default=None, help="data type for VAE, default is float16")
 
-    # GUI dashboard
-    parser.add_argument("--gui", action="store_true", help="enable live web training dashboard / ウェブ学習ダッシュボードを有効にする")
-    parser.add_argument("--gui_port", type=int, default=7860, help="dashboard port (default: 7860)")
-    parser.add_argument("--gui_host", type=str, default="0.0.0.0", help="dashboard host (default: 0.0.0.0)")
-
     return parser
 
 
@@ -4178,6 +4291,12 @@ def hv_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     parser.add_argument(
         "--vae_spatial_tile_sample_min_size", type=int, default=None, help="spatial tile sample min size for VAE, default 256"
     )
+
+    # GUI dashboard
+    parser.add_argument("--gui", action="store_true", help="enable live web training dashboard")
+    parser.add_argument("--gui_port", type=int, default=7860, help="port for the GUI dashboard server")
+    parser.add_argument("--gui_host", type=str, default="0.0.0.0", help="host for the GUI dashboard server")
+
     return parser
 
 

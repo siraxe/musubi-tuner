@@ -51,6 +51,11 @@ from musubi_tuner.modules.nf4_optimization_utils import (
 )
 from musubi_tuner.utils.lora_utils import load_safetensors_with_lora_and_fp8
 from musubi_tuner.ltx_2.env import apply_ltx2_tweaks
+from musubi_tuner.ltx2_text_conditioning import (
+    select_audio_text_embeds_for_audio_mode,
+    select_video_text_embeds_for_video_mode,
+    select_video_text_embeds_for_av_no_audio,
+)
 from musubi_tuner.ltx2_inference import (
     LTX2Inferencer,
     InferenceConfig,
@@ -58,6 +63,16 @@ from musubi_tuner.ltx2_inference import (
     mux_video_audio,
     cleanup_cuda,
     STAGE_2_DISTILLED_SIGMA_VALUES,
+)
+from musubi_tuner.ltx2_lycoris_runtime import (
+    apply_lycoris_preset_before_network_creation,
+    ensure_adapters_enabled_for_sampling,
+    get_adapter_norm_samples,
+    is_lycoris_requested,
+    process_lycoris_config,
+    summarize_active_adapters,
+    validate_lycoris_quantized_base_compatibility,
+    validate_lycoris_runtime,
 )
 
 # LTX-2 latent normalization defaults.
@@ -335,7 +350,7 @@ def load_ltx2_model(
     loftq_init: bool = False,
     loftq_iters: int = 1,
     lora_rank: int = 0,
-    load_weights_on_cpu: bool = False,
+    quantize_device: Optional[str] = None,
     awq_calibration: bool = False,
     awq_alpha: float = 0.25,
     awq_num_batches: int = 8,
@@ -370,6 +385,20 @@ def load_ltx2_model(
 
     target_device = torch.device(device)
     load_device = torch.device(load_device)
+
+    # Resolve quantization device: CLI flag > env var > default (cuda)
+    _qdev_raw = quantize_device or os.getenv("LTX2_NF4_CALC_DEVICE") or os.getenv("LTX2_FP8_CALC_DEVICE") or "cuda"
+    _qdev = _qdev_raw.strip().lower()
+    if _qdev in {"1", "true", "yes", "cuda", "gpu"}:
+        if target_device.type == "cuda":
+            _resolved_quant_device = target_device
+        else:
+            logger.warning("Quantize device '%s' requested GPU, but target device is %s; falling back to CPU.", _qdev_raw, target_device)
+            _resolved_quant_device = torch.device("cpu")
+    else:
+        _resolved_quant_device = torch.device("cpu")
+
+    load_weights_on_cpu = _resolved_quant_device.type != "cuda"
     state_device = torch.device("cpu") if load_weights_on_cpu else load_device
 
     from musubi_tuner.ltx_2.loader.sft_loader import SafetensorsModelStateDictLoader
@@ -386,7 +415,7 @@ def load_ltx2_model(
     if load_weights_on_cpu:
         logger.info("LTX-2 load path: load weights on CPU, then move to %s", target_device)
     else:
-        logger.info("LTX-2 load path: load weights on %s", load_device)
+        logger.info("LTX-2 load path: load weights on %s (quantize_device=%s)", load_device, _qdev_raw)
     loader = SafetensorsModelStateDictLoader()
     config = loader.metadata(model_path)
     attn_mode = (attn_mode or "torch").lower()
@@ -447,18 +476,8 @@ def load_ltx2_model(
     _awq_scales = None  # populated if AWQ calibration is used
 
     if nf4_base:
-        nf4_calc_device = target_device if (not load_weights_on_cpu and load_device == target_device) else torch.device("cpu")
-        nf4_calc_override = os.getenv("LTX2_NF4_CALC_DEVICE", "cuda").strip().lower()
-        if nf4_calc_override in {"1", "true", "yes", "cuda", "gpu"}:
-            if target_device.type == "cuda":
-                nf4_calc_device = target_device
-                logger.info("LTX-2 nf4: quantizing on %s (LTX2_NF4_CALC_DEVICE=%s).", target_device, nf4_calc_override)
-            else:
-                logger.warning(
-                    "LTX-2 nf4: LTX2_NF4_CALC_DEVICE=%s requested GPU, but target device is %s; using CPU.",
-                    nf4_calc_override,
-                    target_device,
-                )
+        nf4_calc_device = _resolved_quant_device
+        logger.info("LTX-2 nf4: quantization device = %s", nf4_calc_device)
         model_files = model_path if isinstance(model_path, list) else [model_path]
         nf4_target_keys = ["transformer_blocks"]
         nf4_exclude_keys = list(KEEP_FP8_HIGH_PRECISION_TOKENS)
@@ -466,7 +485,60 @@ def load_ltx2_model(
         # AWQ and/or LoftQ both need full-precision weights before quantization
         _needs_full_precision = (loftq_init and lora_rank > 0) or awq_calibration
 
-        if _needs_full_precision:
+        # Check for pre-quantized NF4 model (saved by ltx2_quantize_model.py)
+        _check_path = model_files[0]
+        _pre_quantized = False
+        try:
+            from safetensors import safe_open as _safe_open
+            with _safe_open(_check_path, framework="pt") as _f:
+                _meta = _f.metadata()
+                _pre_quantized = _meta is not None and _meta.get("nf4_quantized") == "true"
+        except Exception:
+            pass
+
+        if _pre_quantized:
+            if awq_calibration:
+                raise ValueError(
+                    "Pre-quantized NF4 models are incompatible with --awq_calibration "
+                    "(requires full-precision weights). Use the original model instead."
+                )
+            # Read block_size from pre-quantized metadata
+            _saved_bs = int(_meta.get("nf4_block_size", str(nf4_block_size)))
+            if _saved_bs != nf4_block_size:
+                logger.info(
+                    "Using block_size=%d from pre-quantized model (--nf4_block_size=%d ignored)",
+                    _saved_bs, nf4_block_size,
+                )
+                nf4_block_size = _saved_bs
+            logger.info("Detected pre-quantized NF4 model (block_size=%d), skipping quantization", nf4_block_size)
+            sd = {}
+            for model_file in model_files:
+                with MemoryEfficientSafeOpen(model_file) as f:
+                    for key in tqdm(f.keys(), desc=f"Loading {os.path.basename(model_file)}", unit="key"):
+                        sd[key] = f.get_tensor(key)
+            # Load pre-computed LoftQ data from companion file if --loftq_init
+            if loftq_init and lora_rank > 0:
+                from musubi_tuner.ltx2_quantize_model import loftq_path_for_model
+                from safetensors.torch import load_file as _load_file
+                _loftq_file = loftq_path_for_model(_check_path, lora_rank)
+                if os.path.isfile(_loftq_file):
+                    logger.info("Loading pre-computed LoftQ data from %s", _loftq_file)
+                    _loftq_sd = _load_file(_loftq_file, device="cpu")
+                    # Reconstruct {lora_name: (lora_A, lora_B)} dict
+                    _loftq_data = {}
+                    for k in _loftq_sd:
+                        if k.endswith(".lora_A"):
+                            lora_name = k[: -len(".lora_A")]
+                            _loftq_data[lora_name] = (_loftq_sd[f"{lora_name}.lora_A"], _loftq_sd[f"{lora_name}.lora_B"])
+                    load_ltx2_model._loftq_data = _loftq_data
+                    logger.info("LoftQ: loaded init data for %d modules (rank=%d)", len(_loftq_data), lora_rank)
+                else:
+                    raise FileNotFoundError(
+                        f"--loftq_init requires pre-computed LoftQ data but file not found: {_loftq_file}\n"
+                        f"Re-run ltx2_quantize_model.py with --loftq_init --network_dim {lora_rank} to generate it."
+                    )
+            _skip_rename = False
+        elif _needs_full_precision:
             from musubi_tuner.modules.nf4_optimization_utils import optimize_state_dict_with_nf4
 
             sd = load_safetensors_with_lora_and_fp8(
@@ -558,18 +630,8 @@ def load_ltx2_model(
             )
             _skip_rename = False
     elif fp8_scaled:
-        fp8_calc_device = target_device if (not load_weights_on_cpu and load_device == target_device) else torch.device("cpu")
-        fp8_calc_override = os.getenv("LTX2_FP8_CALC_DEVICE", "cuda").strip().lower()
-        if fp8_calc_override in {"1", "true", "yes", "cuda", "gpu"}:
-            if target_device.type == "cuda":
-                fp8_calc_device = target_device
-                logger.info("LTX-2 fp8: forcing FP8 quantization on %s (LTX2_FP8_CALC_DEVICE=%s).", target_device, fp8_calc_override)
-            else:
-                logger.warning(
-                    "LTX-2 fp8: LTX2_FP8_CALC_DEVICE=%s requested GPU, but target device is %s; using CPU.",
-                    fp8_calc_override,
-                    target_device,
-                )
+        fp8_calc_device = _resolved_quant_device
+        logger.info("LTX-2 fp8: quantization device = %s", fp8_calc_device)
         sd = load_safetensors_with_lora_and_fp8(
             model_files=model_path,
             lora_weights_list=None,
@@ -704,6 +766,30 @@ class LTX2NetworkTrainer(NetworkTrainer):
 
         # CREPA (off by default)
         self._crepa = None
+        # Self-Flow (off by default)
+        self._self_flow = None
+        self._self_flow_active: bool = False
+        self._self_flow_step_context: Optional[Dict[str, Any]] = None
+
+    @staticmethod
+    def _apply_caption_dropout(
+        text_embeds: torch.Tensor,
+        text_mask: Optional[torch.Tensor],
+        caption_dropout_rate: float,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        text_embeds = text_embeds.clone()
+        if text_mask is not None:
+            text_mask = text_mask.clone()
+
+        for i in range(text_embeds.shape[0]):
+            if random.random() < caption_dropout_rate:
+                text_embeds[i] = 0
+                if text_mask is not None:
+                    text_mask[i] = False
+                    if text_mask.shape[-1] > 0:
+                        text_mask[i, 0] = True
+
+        return text_embeds, text_mask
 
     # ------------------------------------------------------------------
     # Preservation / regularization hooks
@@ -713,7 +799,9 @@ class LTX2NetworkTrainer(NetworkTrainer):
                        transformer=None, network=None) -> None:
         self._setup_preservation(args, accelerator)
         self._setup_crepa(args, accelerator, transformer)
+        self._setup_self_flow(args, accelerator, transformer, network)
         self._apply_network_initialization(args, network)
+        validate_lycoris_runtime(args, accelerator, transformer, network, logger)
 
     def _setup_preservation(self, args: argparse.Namespace, accelerator: Accelerator) -> None:
         """Parse preservation CLI flags and prepare helper.  No-op when no flags are set."""
@@ -850,6 +938,157 @@ class LTX2NetworkTrainer(NetworkTrainer):
 
         self._crepa = module
 
+    def _setup_self_flow(
+        self,
+        args: argparse.Namespace,
+        accelerator: Accelerator,
+        transformer=None,
+        network=None,
+    ) -> None:
+        """Parse Self-Flow flags and install helper. No-op when ``--self_flow`` is not set."""
+        if not getattr(args, "self_flow", False):
+            return
+        if transformer is None or network is None:
+            logger.warning("Self-Flow enabled but transformer/network is unavailable — skipping setup")
+            return
+        if self._ltx_mode != "video":
+            raise ValueError("--self_flow currently supports only --ltx_mode video")
+
+        from musubi_tuner.self_flow import (
+            SelfFlowConfig,
+            SelfFlowModule,
+            parse_self_flow_args,
+        )
+
+        kw = parse_self_flow_args(getattr(args, "self_flow_args", None))
+
+        cfg_kwargs: Dict[str, Any] = {}
+        int_keys = {
+            "student_block_idx",
+            "teacher_block_idx",
+            "teacher_update_interval",
+            "projector_hidden_multiplier",
+            "num_neighbors",
+            "patch_spatial_radius",
+            "delta_num_steps",
+            "temporal_warmup_steps",
+            "temporal_max_steps",
+        }
+        float_keys = {
+            "student_block_ratio",
+            "teacher_block_ratio",
+            "lambda_self_flow",
+            "lambda_temporal",
+            "lambda_delta",
+            "temporal_tau",
+            "patch_match_temperature",
+            "motion_weight_strength",
+            "mask_ratio",
+            "teacher_momentum",
+            "projector_lr",
+        }
+        bool_keys = {
+            "dual_timestep",
+            "tokenwise_timestep",
+            "offload_teacher_features",
+            "offload_teacher_params",
+        }
+        for k, v in kw.items():
+            if k in int_keys:
+                cfg_kwargs[k] = int(v)
+            elif k in float_keys:
+                cfg_kwargs[k] = float(v)
+            elif k in bool_keys:
+                cfg_kwargs[k] = v.lower() in ("true", "1", "yes", "on")
+            else:
+                cfg_kwargs[k] = v
+
+        if "temporal_max_steps" not in cfg_kwargs and hasattr(args, "max_train_steps"):
+            cfg_kwargs["temporal_max_steps"] = args.max_train_steps
+
+        config = SelfFlowConfig(**cfg_kwargs)
+        if config.mask_ratio < 0.0 or config.mask_ratio > 0.5:
+            raise ValueError("Self-Flow mask_ratio must be in [0, 0.5]")
+        if config.teacher_momentum < 0.0 or config.teacher_momentum >= 1.0:
+            raise ValueError("Self-Flow teacher_momentum must be in [0, 1)")
+        if config.student_block_ratio is not None and not (0.0 < config.student_block_ratio < 1.0):
+            raise ValueError("Self-Flow student_block_ratio must be in (0, 1)")
+        if config.teacher_block_ratio is not None and not (0.0 < config.teacher_block_ratio < 1.0):
+            raise ValueError("Self-Flow teacher_block_ratio must be in (0, 1)")
+        if config.projector_lr is not None and config.projector_lr <= 0.0:
+            raise ValueError("Self-Flow projector_lr must be > 0")
+        if config.loss_type not in {"negative_cosine", "one_minus_cosine"}:
+            raise ValueError("Self-Flow loss_type must be one of: negative_cosine, one_minus_cosine")
+        if config.temporal_mode not in {"off", "frame", "delta", "hybrid"}:
+            raise ValueError("Self-Flow temporal_mode must be one of: off, frame, delta, hybrid")
+        if config.temporal_granularity not in {"frame", "patch"}:
+            raise ValueError("Self-Flow temporal_granularity must be one of: frame, patch")
+        if config.patch_spatial_radius < 0:
+            raise ValueError("Self-Flow patch_spatial_radius must be >= 0")
+        if config.patch_match_mode not in {"hard", "soft"}:
+            raise ValueError("Self-Flow patch_match_mode must be one of: hard, soft")
+        if config.patch_match_temperature <= 0.0:
+            raise ValueError("Self-Flow patch_match_temperature must be > 0")
+        if config.delta_num_steps < 1:
+            raise ValueError("Self-Flow delta_num_steps must be >= 1")
+        if config.motion_weighting not in {"none", "teacher_delta"}:
+            raise ValueError("Self-Flow motion_weighting must be one of: none, teacher_delta")
+        if config.motion_weight_strength < 0.0:
+            raise ValueError("Self-Flow motion_weight_strength must be >= 0")
+        if config.lambda_temporal < 0.0:
+            raise ValueError("Self-Flow lambda_temporal must be >= 0")
+        if config.lambda_delta < 0.0:
+            raise ValueError("Self-Flow lambda_delta must be >= 0")
+        if config.temporal_tau <= 0.0:
+            raise ValueError("Self-Flow temporal_tau must be > 0")
+        if config.num_neighbors < 0:
+            raise ValueError("Self-Flow num_neighbors must be >= 0")
+        if config.temporal_schedule not in {"constant", "linear", "cosine"}:
+            raise ValueError("Self-Flow temporal_schedule must be one of: constant, linear, cosine")
+        if config.temporal_warmup_steps < 0:
+            raise ValueError("Self-Flow temporal_warmup_steps must be >= 0")
+        if config.temporal_max_steps < 0:
+            raise ValueError("Self-Flow temporal_max_steps must be >= 0")
+
+        unwrapped_transformer = accelerator.unwrap_model(transformer)
+        unwrapped_network = accelerator.unwrap_model(network)
+        self._current_call_network = unwrapped_network
+        module = SelfFlowModule(config, unwrapped_transformer)
+
+        first_param = next(iter(unwrapped_transformer.parameters()), None)
+        dtype = first_param.dtype if first_param is not None else torch.float32
+        if isinstance(dtype, torch.dtype) and dtype.itemsize == 1:
+            if args.mixed_precision == "fp16":
+                dtype = torch.float16
+            elif args.mixed_precision == "bf16":
+                dtype = torch.bfloat16
+            else:
+                dtype = torch.float32
+        module.setup(accelerator.device, dtype)
+        module.init_teacher(unwrapped_network)
+
+        if getattr(args, "resume", None):
+            proj_path = os.path.join(args.resume, "self_flow_projector.safetensors")
+            if os.path.exists(proj_path):
+                from safetensors.torch import load_file
+
+                sd = load_file(proj_path)
+                module.load_state_dict(sd)
+                logger.info("Self-Flow: resumed projector weights from %s", proj_path)
+            teacher_path = os.path.join(args.resume, "self_flow_teacher_ema.safetensors")
+            if os.path.exists(teacher_path):
+                from safetensors.torch import load_file
+
+                teacher_sd = load_file(teacher_path)
+                module.load_teacher_state_dict(teacher_sd)
+                logger.info("Self-Flow: resumed EMA teacher state from %s", teacher_path)
+
+        self._self_flow = module
+        self._self_flow_active = True
+        logger.warning(
+            "Self-Flow is experimental and adds one extra teacher forward pass per step; expect higher VRAM/time cost."
+        )
+
     def _apply_network_initialization(self, args: argparse.Namespace, network=None) -> None:
         """Apply network initialization customizations.
 
@@ -944,6 +1183,56 @@ class LTX2NetworkTrainer(NetworkTrainer):
                     losses["loss/audio_dop"] = val
 
         return losses
+
+    def compute_self_flow_addition(
+        self,
+        args: argparse.Namespace,
+        accelerator: Accelerator,
+        transformer: torch.nn.Module,
+        network: torch.nn.Module,
+        network_dtype: torch.dtype,
+    ) -> tuple[Optional[torch.Tensor], Dict[str, float]]:
+        """Compute Self-Flow loss addition and logging values for the current step."""
+        if not self._self_flow_active or self._self_flow is None:
+            return None, {}
+        if not bool(getattr(args, "self_flow", False)):
+            return None, {}
+
+        dit_inputs = self._last_dit_inputs
+        sf_ctx = self._self_flow_step_context
+        if dit_inputs is None or sf_ctx is None:
+            self._self_flow.cleanup_step()
+            return None, {}
+        loss = self._self_flow.compute_loss_from_cached_features(
+            num_latent_frames=sf_ctx.get("num_latent_frames"),
+            latent_height=sf_ctx.get("latent_height"),
+            latent_width=sf_ctx.get("latent_width"),
+        )
+
+        metrics: Dict[str, float] = {}
+        if loss is not None:
+            metrics["loss/self_flow"] = float(loss.detach().item())
+        cosine = self._self_flow.last_cosine
+        if cosine is not None:
+            metrics["self_flow/cosine"] = float(cosine)
+        frame_cosine = self._self_flow.last_frame_cosine
+        if frame_cosine is not None:
+            metrics["self_flow/frame_cosine"] = float(frame_cosine)
+        delta_cosine = self._self_flow.last_delta_cosine
+        if delta_cosine is not None:
+            metrics["self_flow/delta_cosine"] = float(delta_cosine)
+        metrics["self_flow/lambda_temporal"] = float(self._self_flow.current_lambda_temporal)
+        metrics["self_flow/lambda_delta"] = float(self._self_flow.current_lambda_delta)
+        if "masked_token_ratio" in sf_ctx:
+            metrics["self_flow/masked_token_ratio"] = float(sf_ctx["masked_token_ratio"])
+        if "tau_mean" in sf_ctx:
+            metrics["self_flow/tau_mean"] = float(sf_ctx["tau_mean"])
+        if "tau_min_mean" in sf_ctx:
+            metrics["self_flow/tau_min_mean"] = float(sf_ctx["tau_min_mean"])
+
+        self._self_flow.cleanup_step()
+        self._self_flow_step_context = None
+        return loss, metrics
 
     def _get_audio_preview_config(self, args: argparse.Namespace, transformer) -> Dict[str, int | float]:
         if self._audio_preview_config is not None:
@@ -1489,6 +1778,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
             latents = latents.to(device=device)
         if noise.device != device:
             noise = noise.to(device=device)
+        self._self_flow_step_context = None
 
         batch_size = latents.shape[0]
         frames, height, width = latents.shape[2], latents.shape[3], latents.shape[4]
@@ -1509,63 +1799,104 @@ class LTX2NetworkTrainer(NetworkTrainer):
         if timestep_sampling == "sigma":
             timestep_sampling = "shifted_logit_normal"
 
-        if timestep_sampling == "shifted_logit_normal":
-            # Official LTX-2 implementation: shifted logit-normal distribution
-            # Shift is computed based on sequence length
-            if self._ltx_mode == "audio":
-                if audio_seq_lens is not None:
-                    shifts = self._shifted_logit_normal_shift_for_sequence_lengths(audio_seq_lens)
-                    shifts = shifts.clamp(min=0.95, max=2.05)
-                    if not self._logged_audio_only_timestep_shift:
-                        logger.info(
-                            "LTX-2 audio-only mode: shifted_logit_normal seq_len min=%s max=%s mean=%.2f, "
-                            "shift min=%.4f max=%.4f mean=%.4f.",
-                            int(audio_seq_lens.min().item()),
-                            int(audio_seq_lens.max().item()),
-                            float(audio_seq_lens.to(dtype=torch.float32).mean().item()),
-                            float(shifts.min().item()),
-                            float(shifts.max().item()),
-                            float(shifts.mean().item()),
-                        )
-                        self._logged_audio_only_timestep_shift = True
-                else:
-                    shift = self._resolve_shifted_logit_normal_shift(args, seq_len)
-                    shifts = torch.full((batch_size,), float(shift), device=device, dtype=torch.float32)
-            else:
-                shift = self._shifted_logit_normal_shift_for_sequence_length(seq_len)
-                shifts = torch.full((batch_size,), float(shift), device=device, dtype=torch.float32)
-            std = getattr(args, "logit_std", 1.0)
-            shifted_logit_mode = self._resolve_shifted_logit_mode(args)
-            shifted_logit_eps = getattr(args, "shifted_logit_eps", 1e-3)
-            shifted_logit_uniform_prob = getattr(args, "shifted_logit_uniform_prob", 0.1)
-            sigmas = self._sample_shifted_logit_normal_sigmas(
-                batch_size,
-                shifts,
-                std=std,
-                mode=shifted_logit_mode,
-                eps=shifted_logit_eps,
-                uniform_prob=shifted_logit_uniform_prob,
-            )
-        elif timestep_sampling == "uniform":
-            # Uniform sampling from [0, 1]
-            sigmas = torch.rand((batch_size,), device=device, dtype=torch.float32)
-        else:
+        if timestep_sampling not in {"shifted_logit_normal", "uniform"}:
             # For other sampling modes, use parent implementation
             return super().get_noisy_model_input_and_timesteps(args, noise, latents, timesteps, noise_scheduler, device, dtype)
 
-        # Apply min/max timestep constraints if specified
-        min_timestep = getattr(args, "min_timestep", None)
-        max_timestep = getattr(args, "max_timestep", None)
-        if min_timestep is not None or max_timestep is not None:
-            min_sigma = (min_timestep / 1000.0) if min_timestep is not None else 0.0
-            max_sigma = (max_timestep / 1000.0) if max_timestep is not None else 1.0
-            sigmas = sigmas * (max_sigma - min_sigma) + min_sigma
+        def _sample_sigmas() -> torch.Tensor:
+            if timestep_sampling == "shifted_logit_normal":
+                if self._ltx_mode == "audio":
+                    if audio_seq_lens is not None:
+                        shifts = self._shifted_logit_normal_shift_for_sequence_lengths(audio_seq_lens)
+                        shifts = shifts.clamp(min=0.95, max=2.05)
+                        if not self._logged_audio_only_timestep_shift:
+                            logger.info(
+                                "LTX-2 audio-only mode: shifted_logit_normal seq_len min=%s max=%s mean=%.2f, "
+                                "shift min=%.4f max=%.4f mean=%.4f.",
+                                int(audio_seq_lens.min().item()),
+                                int(audio_seq_lens.max().item()),
+                                float(audio_seq_lens.to(dtype=torch.float32).mean().item()),
+                                float(shifts.min().item()),
+                                float(shifts.max().item()),
+                                float(shifts.mean().item()),
+                            )
+                            self._logged_audio_only_timestep_shift = True
+                    else:
+                        shift = self._resolve_shifted_logit_normal_shift(args, seq_len)
+                        shifts = torch.full((batch_size,), float(shift), device=device, dtype=torch.float32)
+                else:
+                    shift = self._shifted_logit_normal_shift_for_sequence_length(seq_len)
+                    shifts = torch.full((batch_size,), float(shift), device=device, dtype=torch.float32)
+                std = getattr(args, "logit_std", 1.0)
+                shifted_logit_mode = self._resolve_shifted_logit_mode(args)
+                shifted_logit_eps = getattr(args, "shifted_logit_eps", 1e-3)
+                shifted_logit_uniform_prob = getattr(args, "shifted_logit_uniform_prob", 0.1)
+                sampled = self._sample_shifted_logit_normal_sigmas(
+                    batch_size,
+                    shifts,
+                    std=std,
+                    mode=shifted_logit_mode,
+                    eps=shifted_logit_eps,
+                    uniform_prob=shifted_logit_uniform_prob,
+                )
+            else:
+                sampled = torch.rand((batch_size,), device=device, dtype=torch.float32)
+
+            min_timestep = getattr(args, "min_timestep", None)
+            max_timestep = getattr(args, "max_timestep", None)
+            if min_timestep is not None or max_timestep is not None:
+                min_sigma = (min_timestep / 1000.0) if min_timestep is not None else 0.0
+                max_sigma = (max_timestep / 1000.0) if max_timestep is not None else 1.0
+                sampled = sampled * (max_sigma - min_sigma) + min_sigma
+            return sampled
+
+        sigmas = _sample_sigmas()
+
+        # Optional Self-Flow dual-timestep noising for video mode.
+        if (
+            self._self_flow_active
+            and self._self_flow is not None
+            and self._ltx_mode == "video"
+            and bool(getattr(args, "self_flow", False))
+            and bool(getattr(self._self_flow.config, "dual_timestep", True))
+        ):
+            sigmas_alt = _sample_sigmas()
+            t_tokens = sigmas.view(batch_size, 1).expand(batch_size, seq_len)
+            s_tokens = sigmas_alt.view(batch_size, 1).expand(batch_size, seq_len)
+
+            mask_ratio = float(getattr(self._self_flow.config, "mask_ratio", 0.10))
+            mask_ratio = max(0.0, min(0.5, mask_ratio))
+            mask = torch.rand((batch_size, seq_len), device=device, dtype=torch.float32) < mask_ratio
+
+            tau_tokens = torch.where(mask, s_tokens, t_tokens)
+            tau_min = torch.minimum(sigmas, sigmas_alt)
+
+            tau_latent = tau_tokens.view(batch_size, frames, height, width).unsqueeze(1)
+            tau_min_latent = tau_min.view(batch_size, 1, 1, 1, 1)
+
+            noisy_model_input = (1.0 - tau_latent) * latents.to(dtype=torch.float32) + tau_latent * noise.to(dtype=torch.float32)
+            teacher_noisy = (1.0 - tau_min_latent) * latents.to(dtype=torch.float32) + tau_min_latent * noise.to(dtype=torch.float32)
+
+            if bool(getattr(self._self_flow.config, "tokenwise_timestep", True)):
+                timesteps_out = tau_tokens.to(device=device, dtype=torch.float32) * 1000.0
+            else:
+                timesteps_out = tau_tokens.mean(dim=1).to(device=device, dtype=torch.float32) * 1000.0
+            teacher_timesteps = tau_min.to(device=device, dtype=torch.float32) * 1000.0
+
+            self._self_flow_step_context = {
+                "teacher_noisy_model_input": teacher_noisy.detach(),
+                "teacher_model_timesteps": teacher_timesteps.detach(),
+                "masked_token_ratio": float(mask.float().mean().item()),
+                "tau_mean": float(tau_tokens.mean().item()),
+                "tau_min_mean": float(tau_min.mean().item()),
+                "num_latent_frames": int(frames),
+                "latent_height": int(height),
+                "latent_width": int(width),
+            }
+            return noisy_model_input, timesteps_out
 
         sigmas_expanded = sigmas.view(-1, 1, 1, 1, 1)
-        noisy_model_input = (1.0 - sigmas_expanded) * latents.to(dtype=torch.float32) + sigmas_expanded * noise.to(
-            dtype=torch.float32
-        )
-
+        noisy_model_input = (1.0 - sigmas_expanded) * latents.to(dtype=torch.float32) + sigmas_expanded * noise.to(dtype=torch.float32)
         timesteps_out = sigmas.to(device=device, dtype=torch.float32) * 1000.0
         return noisy_model_input, timesteps_out
 
@@ -1630,6 +1961,8 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 raise ValueError("--fp8_w8a8 requires LoRA training (--network_module)")
             if getattr(args, "fp8_upcast", False):
                 raise ValueError("--fp8_w8a8 and --fp8_upcast are mutually exclusive")
+
+        validate_lycoris_quantized_base_compatibility(args, logger, DEFAULT_NF4_BLOCK_SIZE)
 
         if getattr(args, "save_original_lora", True) and not getattr(args, "convert_to_comfy", True):
             logger.info("--no_convert_to_comfy is set; original LoRA is always saved (--save_original_lora has no extra effect).")
@@ -1895,7 +2228,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
             loftq_init=bool(getattr(args, "loftq_init", False)),
             loftq_iters=int(getattr(args, "loftq_iters", 2)),
             lora_rank=int(getattr(args, "network_dim", 0) or 0),
-            load_weights_on_cpu=True,
+            quantize_device=getattr(args, "quantize_device", None),
             awq_calibration=bool(getattr(args, "awq_calibration", False)),
             awq_alpha=float(getattr(args, "awq_alpha", 0.25)),
             awq_num_batches=int(getattr(args, "awq_num_batches", 8)),
@@ -2179,56 +2512,6 @@ class LTX2NetworkTrainer(NetworkTrainer):
         container_in.close()
 
     @staticmethod
-    def _ensure_lora_enabled_for_sampling(transformer) -> int:
-        try:
-            from musubi_tuner.networks.lora import LoRAModule
-        except Exception:
-            return 0
-
-        lora_count = 0
-        for module in transformer.modules():
-            if not isinstance(module, torch.nn.Linear):
-                continue
-            bound = getattr(module.forward, "__self__", None)
-            if bound is None or not isinstance(bound, LoRAModule):
-                continue
-            bound.enabled = True
-            lora_count += 1
-        return lora_count
-
-    @staticmethod
-    def _get_lora_norm_samples(transformer, limit: int = 5) -> list[str]:
-        try:
-            from musubi_tuner.networks.lora import LoRAModule
-        except Exception:
-            return []
-
-        stats = []
-        for name, module in transformer.named_modules():
-            if not isinstance(module, torch.nn.Linear):
-                continue
-            bound = getattr(module.forward, "__self__", None)
-            if bound is None or not isinstance(bound, LoRAModule):
-                continue
-            try:
-                up = bound.lora_up
-                down = bound.lora_down
-                if isinstance(up, torch.nn.ModuleList):
-                    up_norm = sum(u.weight.norm().item() for u in up)
-                else:
-                    up_norm = up.weight.norm().item()
-                if isinstance(down, torch.nn.ModuleList):
-                    down_norm = sum(d.weight.norm().item() for d in down)
-                else:
-                    down_norm = down.weight.norm().item()
-                stats.append(f"{name}: up_norm={up_norm:.6f}, down_norm={down_norm:.6f}")
-            except Exception:
-                continue
-            if len(stats) >= limit:
-                break
-        return stats
-
-    @staticmethod
     def _override_attention_function(transformer, attention_function):
         from musubi_tuner.ltx_2.model.transformer.attention import Attention
 
@@ -2347,6 +2630,15 @@ class LTX2NetworkTrainer(NetworkTrainer):
         if not isinstance(batch, dict):
             raise TypeError(f"Expected batch to be a dict, got: {type(batch)}")
 
+        def _resolve_loss_weight(batch_key: str, arg_key: str, default: float = 1.0) -> float:
+            batch_value = batch.get(batch_key)
+            if batch_value is not None:
+                try:
+                    return float(batch_value)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(f"{batch_key} must be a float-compatible scalar, got {batch_value!r}") from exc
+            return float(getattr(args, arg_key, default))
+
         if latents is None or not isinstance(latents, torch.Tensor):
             raise TypeError(f"Expected latents to be a torch.Tensor, got: {type(latents)}")
         if latents.dim() != 5:
@@ -2380,17 +2672,6 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 audio_prompt_embeds = conditions.get("audio_prompt_embeds")
                 if video_prompt_embeds is not None and audio_prompt_embeds is not None:
                     text_embeds = torch.cat([video_prompt_embeds, audio_prompt_embeds], dim=-1)
-                elif video_prompt_embeds is not None:
-                    # Video-only batch in AV mode: use video_prompt_embeds alone
-                    text_embeds = video_prompt_embeds
-                    # Handle 1D or 2D cache format and expand to match batch
-                    batch_size = latents.shape[0]
-                    if text_embeds.dim() == 2:
-                        # 2D [seq_len, hidden] -> [batch, seq_len, hidden]
-                        text_embeds = text_embeds.unsqueeze(0).expand(batch_size, -1, -1).contiguous()
-                    elif text_embeds.dim() == 1:
-                        # 1D [hidden] -> [batch, 1, hidden] (single embedding)
-                        text_embeds = text_embeds.unsqueeze(0).unsqueeze(0).expand(batch_size, 1, -1).contiguous()
                 else:
                     text_embeds = conditions.get("prompt_embeds")
             else:
@@ -2400,8 +2681,6 @@ class LTX2NetworkTrainer(NetworkTrainer):
         else:
             text_embeds = batch.get("text")
             text_mask = batch.get("text_mask")
-            if self._ltx_mode == "audio" and isinstance(text_embeds, torch.Tensor) and text_embeds.shape[-1] % 2 == 0:
-                text_embeds = text_embeds[..., text_embeds.shape[-1] // 2 :]
 
         if text_embeds is None:
             raise ValueError(
@@ -2409,12 +2688,34 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 "or 'text'/'text_mask' (legacy musubi format)."
             )
 
+        base_model = transformer.model if hasattr(transformer, "model") else transformer
+        expected_video_dim = int(getattr(base_model, "cross_attention_dim", 0) or 0)
+        expected_audio_dim = int(getattr(base_model, "audio_cross_attention_dim", 0) or 0)
+
+        if self._ltx_mode == "video" and isinstance(text_embeds, torch.Tensor):
+            video_source = text_embeds
+            if conditions is not None:
+                prompt_embeds = conditions.get("prompt_embeds")
+                if isinstance(prompt_embeds, torch.Tensor):
+                    video_source = prompt_embeds
+            text_embeds = select_video_text_embeds_for_video_mode(
+                video_source,
+                expected_video_dim=expected_video_dim,
+                expected_audio_dim=expected_audio_dim,
+            )
+
+        if self._ltx_mode == "audio" and isinstance(text_embeds, torch.Tensor):
+            text_embeds = select_audio_text_embeds_for_audio_mode(
+                text_embeds,
+                conditions,
+                expected_audio_dim=expected_audio_dim,
+                expected_video_dim=expected_video_dim,
+            )
+
         # LTX-2.3 (caption_proj_before_connector=True) expects already-projected context
         # dimensions for each modality. In audio mode this must be audio_prompt_embeds
         # (audio_cross_attention_dim), not generic/video prompt embeds.
-        base_model = transformer.model if hasattr(transformer, "model") else transformer
         if self._ltx_mode == "audio" and bool(getattr(base_model, "caption_proj_before_connector", False)):
-            expected_audio_dim = int(getattr(base_model, "audio_cross_attention_dim", 0) or 0)
             if expected_audio_dim > 0 and text_embeds.shape[-1] != expected_audio_dim:
                 raise ValueError(
                     "Audio mode received text embeddings with incompatible hidden size for this checkpoint. "
@@ -2451,27 +2752,13 @@ class LTX2NetworkTrainer(NetworkTrainer):
 
         # Caption dropout: zero out text conditioning with probability p (for CFG training)
         caption_dropout_rate = getattr(args, "caption_dropout_rate", 0.0)
-        if caption_dropout_rate > 0.0:
-            text_embeds = text_embeds.clone()
-            if text_mask is not None:
-                text_mask = text_mask.clone()
-            for i in range(text_embeds.shape[0]):
-                if random.random() < caption_dropout_rate:
-                    text_embeds[i] = 0
-                    if text_mask is not None:
-                        # Keep the first token unmasked (e.g., BOS token) to avoid all-masked context
-                        text_mask[i] = False
-                        text_mask[i, 0] = True
+        if caption_dropout_rate > 0.0 and getattr(self, "training", False):
+            text_embeds, text_mask = self._apply_caption_dropout(text_embeds, text_mask, caption_dropout_rate)
 
         # Move latents to device
         latents = latents.to(device=accelerator.device, dtype=network_dtype)
         noise = noise.to(device=accelerator.device, dtype=network_dtype)
         noisy_model_input = noisy_model_input.to(device=accelerator.device, dtype=network_dtype)
-
-        # Extract spatial ROI mask from batch (if available)
-        spatial_mask = batch.get("spatial_mask")  # (B, H, W) in latent space
-        if spatial_mask is not None:
-            spatial_mask = spatial_mask.to(device=accelerator.device)
 
         # Check for NaN in latents
         if torch.isnan(latents).any():
@@ -2564,18 +2851,6 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 device=accelerator.device,
                 dtype=network_dtype,
             )
-            # In pure audio-only mode, we don't have real video latents
-            has_real_video = False
-            if has_real_video:
-                video_latents_for_audio = latents.to(device=accelerator.device, dtype=network_dtype)
-                print("\033[92m[Audio Mode] Using real video latents for cross-attention training (video_to_audio_attn)\033[0m")
-            else:
-                # Fall back to dummy zeros if no real video latents
-                video_latents_for_audio = torch.zeros(
-                    (latents.shape[0], latents.shape[1], 1, 1, 1),
-                    device=accelerator.device,
-                    dtype=network_dtype,
-                )
 
             if getattr(args, "fp8_base", False) or getattr(args, "fp8_scaled", False):
                 self._ensure_fp8_buffers_on_device(transformer)
@@ -2651,7 +2926,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
                     "audio_pred": audio_pred,
                     "audio_target": audio_target,
                     "audio_loss_mask": audio_loss_mask,
-                    "audio_loss_weight": float(getattr(args, "audio_loss_weight", 1.0)),
+                    "audio_loss_weight": _resolve_loss_weight("audio_loss_weight", "audio_loss_weight"),
                 }
             )
             if out_audio["audio_loss_weight"] < 0.0:
@@ -2770,14 +3045,20 @@ class LTX2NetworkTrainer(NetworkTrainer):
             )
 
             perturbations = BatchedPerturbationConfig.empty(bsz)
-            base_model = transformer.model if hasattr(transformer, "model") else transformer
+            unwrapped_transformer = accelerator.unwrap_model(transformer)
 
             if getattr(args, "fp8_base", False) or getattr(args, "fp8_scaled", False):
-                self._ensure_fp8_buffers_on_device(base_model)
+                self._ensure_fp8_buffers_on_device(unwrapped_transformer)
             elif getattr(args, "nf4_base", False):
-                self._ensure_nf4_buffers_on_device(base_model)
+                self._ensure_nf4_buffers_on_device(unwrapped_transformer)
             with accelerator.autocast():
-                pred_tokens, _ = base_model(video_modality, None, perturbations)
+                if hasattr(unwrapped_transformer, "forward_modalities"):
+                    pred_tokens, _ = unwrapped_transformer.forward_modalities(video_modality, None, perturbations)
+                else:
+                    base_model = (
+                        unwrapped_transformer.model if hasattr(unwrapped_transformer, "model") else unwrapped_transformer
+                    )
+                    pred_tokens, _ = base_model(video_modality, None, perturbations)
 
             target_pred_tokens = pred_tokens[:, ref_seq_len:, :]
             target_velocity = patchifier.patchify(noise - latents)
@@ -2787,7 +3068,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 "video_pred": target_pred_tokens,
                 "video_target": target_velocity,
                 "video_loss_mask": target_loss_mask,
-                "video_loss_weight": float(getattr(args, "video_loss_weight", 1.0)),
+                "video_loss_weight": _resolve_loss_weight("video_loss_weight", "video_loss_weight"),
             }
             if out_v2v["video_loss_weight"] < 0.0:
                 raise ValueError(f"video_loss_weight must be >= 0. Got: {out_v2v['video_loss_weight']}")
@@ -2864,20 +3145,12 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 _log_stats("noisy_audio", noisy_audio)
 
         if self._ltx_mode == "av" and not audio_enabled_for_batch:
-            # For video-only batches in AV mode, try to use video_prompt_embeds directly
-            video_prompt_embeds = conditions.get("video_prompt_embeds") if conditions is not None else None
-            if isinstance(video_prompt_embeds, torch.Tensor):
-                text_embeds = video_prompt_embeds
-                # Handle 1D or 2D cache format and expand to match batch
-                batch_size = latents.shape[0]
-                if text_embeds.dim() == 2:
-                    text_embeds = text_embeds.unsqueeze(0).expand(batch_size, -1, -1).contiguous()
-                elif text_embeds.dim() == 1:
-                    text_embeds = text_embeds.unsqueeze(0).unsqueeze(0).expand(batch_size, 1, -1).contiguous()
-            elif getattr(args, "av_use_video_prompt_embeds", False) and isinstance(text_embeds, torch.Tensor) and text_embeds.shape[-1] % 2 == 0:
-                # Legacy fallback: only slice if explicitly enabled via av_use_video_prompt_embeds
-                half = text_embeds.shape[-1] // 2
-                text_embeds = text_embeds[..., :half].contiguous()
+            text_embeds = select_video_text_embeds_for_av_no_audio(
+                text_embeds,
+                conditions,
+                expected_video_dim=expected_video_dim,
+                expected_audio_dim=expected_audio_dim,
+            )
 
         if bool(getattr(transformer, "training", False)) and self._ltx_mode == "av":
             supervision_alert = update_and_check_audio_supervision(
@@ -2929,6 +3202,16 @@ class LTX2NetworkTrainer(NetworkTrainer):
                     f"(caption_channels={caption_channels})"
                 )
 
+        if self._ltx_mode == "av" and bool(getattr(base_model, "caption_proj_before_connector", False)):
+            expected_ctx_dim = expected_video_dim + expected_audio_dim if audio_enabled_for_batch else expected_video_dim
+            if expected_ctx_dim > 0 and int(text_embeds.shape[-1]) != expected_ctx_dim:
+                mode_name = "AV (video+audio)" if audio_enabled_for_batch else "AV-no-audio (video-only)"
+                raise ValueError(
+                    f"{mode_name} received text embeddings with incompatible hidden size for this checkpoint. "
+                    f"Expected dim={expected_ctx_dim}, got dim={text_embeds.shape[-1]}. "
+                    "Ensure caches contain modality-specific embeddings generated with the same --ltx2_checkpoint."
+                )
+
         model_input = model_noisy_video
         if self._ltx_mode == "av" and audio_enabled_for_batch:
             model_input = [model_noisy_video, noisy_audio]
@@ -2937,46 +3220,28 @@ class LTX2NetworkTrainer(NetworkTrainer):
 
         video_conditioning_mask_tokens = None
         video_loss_mask = None
-        if video_conditioning_enabled is not None or spatial_mask is not None:
+        if video_conditioning_enabled is not None:
             bsz, _c, frames, height, width = latents.shape
             seq_len = frames * height * width
             first_frame_tokens = height * width
-
-            # Initialize with first-frame conditioning mask
-            if video_conditioning_enabled is not None:
-                video_conditioning_mask_tokens = torch.zeros((bsz, seq_len), device=accelerator.device, dtype=torch.bool)
-                if first_frame_tokens > 0:
-                    video_conditioning_mask_tokens[video_conditioning_enabled, :first_frame_tokens] = True
-            else:
-                # No first-frame conditioning, but we may have spatial mask
-                video_conditioning_mask_tokens = torch.ones((bsz, seq_len), device=accelerator.device, dtype=torch.bool)
-
-            # Apply spatial ROI mask if available
-            if spatial_mask is not None:
-                # spatial_mask is (B, H, W) - flatten to tokens
-                B, H, W = spatial_mask.shape
-                spatial_mask_flat = spatial_mask.view(B, H * W)  # (B, HW)
-                # Expand spatial mask across all frames
-                spatial_mask_tokens = spatial_mask_flat.unsqueeze(1).expand(-1, frames).contiguous()  # (B, F, HW)
-                spatial_mask_tokens = spatial_mask_tokens.view(B, frames * height * width)  # (B, F*H*W)
-                # Combine with first-frame conditioning mask using AND
-                video_conditioning_mask_tokens = video_conditioning_mask_tokens & spatial_mask_tokens
-
+            video_conditioning_mask_tokens = torch.zeros((bsz, seq_len), device=accelerator.device, dtype=torch.bool)
+            if first_frame_tokens > 0:
+                video_conditioning_mask_tokens[video_conditioning_enabled, :first_frame_tokens] = True
             transformer_options = {"patches_replace": {}, "video_conditioning_mask": video_conditioning_mask_tokens}
 
             if getattr(args, "video_loss_mask_5d", False):
                 video_loss_mask = torch.ones((bsz, 1, frames, 1, 1), device=accelerator.device, dtype=torch.bool)
-                if frames > 0 and video_conditioning_enabled is not None:
+                if frames > 0:
                     video_loss_mask[video_conditioning_enabled, :, 0:1, :, :] = False
             else:
                 video_loss_mask = torch.ones((bsz, frames), device=accelerator.device, dtype=torch.bool)
-                if frames > 0 and video_conditioning_enabled is not None:
+                if frames > 0:
                     video_loss_mask[video_conditioning_enabled, 0] = False
 
         resolved_transformer_options = transformer_options if video_conditioning_mask_tokens is not None else {"patches_replace": {}}
 
-        # Store inputs for preservation techniques (no-op when flag is off)
-        if self._preservation_active:
+        # Store inputs for preservation / Self-Flow techniques (no-op when both are off)
+        if self._preservation_active or self._self_flow_active:
             self._last_dit_inputs = {
                 "model_input": model_input,
                 "model_timesteps": model_timesteps,
@@ -2986,6 +3251,47 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 "frame_rate": frame_rate,
                 "transformer_options": resolved_transformer_options,
             }
+
+        if self._self_flow_active and self._self_flow is not None:
+            self._self_flow.cleanup_step()
+            network_for_self_flow = getattr(self, "_current_call_network", None)
+            is_train_step = bool(getattr(network_for_self_flow, "training", False)) if network_for_self_flow is not None else bool(
+                getattr(transformer, "training", False)
+            )
+            if is_train_step and bool(getattr(args, "self_flow", False)):
+                sf_ctx = self._self_flow_step_context
+                if sf_ctx is not None and isinstance(model_input, torch.Tensor):
+                    teacher_noisy = sf_ctx.get("teacher_noisy_model_input")
+                    teacher_timesteps = sf_ctx.get("teacher_model_timesteps")
+                    if isinstance(teacher_noisy, torch.Tensor) and isinstance(teacher_timesteps, torch.Tensor):
+                        teacher_noisy_input = teacher_noisy
+                        if video_conditioning_enabled is not None and teacher_noisy_input.shape[2] > 0:
+                            teacher_noisy_input = teacher_noisy_input.clone()
+                            teacher_noisy_input[video_conditioning_enabled, :, 0:1, :, :] = latents[
+                                video_conditioning_enabled, :, 0:1, :, :
+                            ]
+
+                        teacher_timesteps_model = self._normalize_timesteps_for_model(
+                            teacher_timesteps.to(device=accelerator.device, dtype=network_dtype)
+                        )
+                        if teacher_timesteps_model.dim() == 0:
+                            teacher_timesteps_model = teacher_timesteps_model.unsqueeze(0)
+                        if teacher_timesteps_model.dim() == 1:
+                            teacher_timesteps_model = teacher_timesteps_model.unsqueeze(1)
+
+                        if network_for_self_flow is not None:
+                            self._self_flow.prepare_teacher_features(
+                                accelerator=accelerator,
+                                transformer=transformer,
+                                network=network_for_self_flow,
+                                teacher_model_input=teacher_noisy_input.to(device=accelerator.device, dtype=network_dtype),
+                                teacher_timesteps=teacher_timesteps_model,
+                                text_embeds=text_embeds,
+                                text_mask=text_mask,
+                                frame_rate=frame_rate,
+                                transformer_options=resolved_transformer_options,
+                            )
+                self._self_flow.mark_student_forward()
 
         if getattr(args, "fp8_base", False) or getattr(args, "fp8_scaled", False):
             self._ensure_fp8_buffers_on_device(transformer)
@@ -3024,7 +3330,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
             "video_pred": video_pred,
             "video_target": video_target,
             "video_loss_mask": video_loss_mask,
-            "video_loss_weight": float(getattr(args, "video_loss_weight", 1.0)),
+            "video_loss_weight": _resolve_loss_weight("video_loss_weight", "video_loss_weight"),
         }
 
         if out["video_loss_weight"] < 0.0:
@@ -3075,7 +3381,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
                     "audio_pred": audio_pred,
                     "audio_target": audio_target,
                     "audio_loss_mask": audio_loss_mask,
-                    "audio_loss_weight": float(getattr(args, "audio_loss_weight", 1.0))
+                    "audio_loss_weight": _resolve_loss_weight("audio_loss_weight", "audio_loss_weight")
                     * (
                         float(getattr(args, "audio_silence_regularizer_weight", 1.0))
                         if audio_regularizer_active
@@ -3207,11 +3513,6 @@ class LTX2NetworkTrainer(NetworkTrainer):
                     )
                 param["negative_prompt_embeds"] = cache_entry["negative_prompt_embeds"]
                 param["negative_prompt_attention_mask"] = cache_entry["negative_prompt_attention_mask"]
-
-            # Load start_images_latents if available in cache
-            if cache_entry.get("start_images_latents") is not None:
-                param["start_images_latents"] = cache_entry["start_images_latents"]
-                logger.info("Loaded cached start_images_latents for prompt %d: %s", idx, param.get("prompt", "")[:50])
 
         return sample_params
 
@@ -3493,7 +3794,6 @@ class LTX2NetworkTrainer(NetworkTrainer):
             sample_parameter.pop("prompt_attention_mask", None)
             sample_parameter.pop("negative_prompt_embeds", None)
             sample_parameter.pop("negative_prompt_attention_mask", None)
-            sample_parameter.pop("start_images_latents", None)
 
         def prepare_all_embeddings_batch(sample_params_list: List[Dict]) -> None:
             """Load text encoder once and encode ALL prompts before unloading."""
@@ -3550,12 +3850,8 @@ class LTX2NetworkTrainer(NetworkTrainer):
                     sample_parameter["negative_prompt_embeds"] = neg_embeds
                     sample_parameter["negative_prompt_attention_mask"] = neg_mask
 
-            # Cleanup text encoder only if cache_te is disabled
-            if not getattr(args, "cache_te", False):
-                self._cleanup_text_encoder(accelerator)
-                logger.info("Sampling batch: unloaded text encoder after encoding all prompts")
-            else:
-                logger.info("Sampling batch: keeping text encoder cached (cache_te enabled)")
+            self._cleanup_text_encoder(accelerator)
+            logger.info("Sampling batch: unloaded text encoder after encoding all prompts")
             self._cleanup_cuda(accelerator.device)
 
         # Check if using precached prompts (don't cleanup precached embeddings - they're reused)
@@ -4046,10 +4342,22 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 logger.error(f"V2V: failed to load reference '{v2v_ref_path}': {e}")
                 v2v_ref_latent = None
 
-        lora_count = self._ensure_lora_enabled_for_sampling(transformer)
+        lora_count = ensure_adapters_enabled_for_sampling(transformer)
+        adapter_summary = summarize_active_adapters(transformer)
         if lora_count:
             logger.info("Sampling: LoRA modules active in transformer: %s", lora_count)
-            lora_stats = self._get_lora_norm_samples(transformer)
+            if adapter_summary["lycoris"] > 0:
+                logger.info(
+                    "Sampling LyCORIS summary: active=%d blocks=%d attn1=%d attn2=%d ff=%d audio=%d quantized_origins=%d",
+                    adapter_summary["lycoris"],
+                    adapter_summary["block_count"],
+                    adapter_summary["attn1"],
+                    adapter_summary["attn2"],
+                    adapter_summary["ff"],
+                    adapter_summary["audio"],
+                    adapter_summary["lycoris_quantized_origin"],
+                )
+            lora_stats = get_adapter_norm_samples(transformer)
             for stat in lora_stats:
                 logger.info("Sampling LoRA norm: %s", stat)
         else:
@@ -4240,24 +4548,22 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 audio_only=audio_only_preview,
             )
         else:
-            # Use the LTX-2 default sampler (Rectified Flow from LTX-2)
-            # Uses musubi-tuner's LTXModel API with Modality objects
-            logger.info("Using default sampler (Rectified Flow from LTX-2)")
-            video, audio_waveform = self.do_inference_default_sampler(
-                accelerator=accelerator,
-                args=args,
-                sample_parameter=sample_parameter,
-                vae=vae,
-                dit_dtype=dit_dtype,
-                transformer=transformer,
-                sample_steps=sample_steps,
-                width=width,
-                height=height,
-                frame_count=frame_count,
-                guidance_scale=guidance_scale,
-                cfg_scale=cfg_scale,
-                seed=seed,
-                generator=generator,
+            video, audio_waveform = self.do_inference(
+                accelerator,
+                args,
+                sample_parameter,
+                vae,
+                dit_dtype,
+                transformer,
+                discrete_flow_shift,
+                sample_steps,
+                width,
+                height,
+                frame_count,
+                generator,
+                do_classifier_free_guidance,
+                guidance_scale,
+                cfg_scale,
                 audio_decoder=audio_decoder,
                 vocoder=vocoder,
                 offload_transformer_for_decode=bool(getattr(args, "sample_with_offloading", False)),
@@ -4330,9 +4636,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
             sample_parameter.pop("prompt_attention_mask", None)
             sample_parameter.pop("negative_prompt_embeds", None)
             sample_parameter.pop("negative_prompt_attention_mask", None)
-            # Only cleanup text encoder if cache_te is disabled
-            if not getattr(args, "cache_te", False):
-                self._cleanup_text_encoder(accelerator)
+            self._cleanup_text_encoder(accelerator)
         if loaded_vae:
             vae.to_device("cpu")
             clean_memory_on_device(device)
@@ -5580,24 +5884,20 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         ),
     )
     parser.add_argument(
+        "--lycoris_quantized_base_check_mode",
+        type=str,
+        default="warn",
+        choices=["off", "warn", "error"],
+        help=(
+            "LyCORIS-only compatibility check when base-model quantization flags are enabled. "
+            "'warn' logs a warning, 'error' stops startup, 'off' disables checks."
+        ),
+    )
+    parser.add_argument(
         "--ltx2_first_frame_conditioning_p",
         type=float,
         default=0.1,
         help="Probability of first-frame conditioning during training (keep frame 0 clean and set its timestep to 0).",
-    )
-    parser.add_argument(
-        "--ltx2_enable_mask",
-        dest="enable_mask",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Enable spatial ROI masking for selective training on specific image regions. Masks are auto-detected from a 'mask/' subdirectory in the video directory.",
-    )
-    parser.add_argument(
-        "--ltx2_mask_for_others",
-        dest="default_mask_file",
-        type=str,
-        default=None,
-        help="Mask to apply for videos that don't have their own mask file in the mask/ directory.",
     )
     parser.add_argument(
         "--fp8_scaled",
@@ -5627,6 +5927,13 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         type=int,
         default=32,
         help="block size for NF4 quantization (default 32)",
+    )
+    parser.add_argument(
+        "--quantize_device",
+        type=str,
+        default=None,
+        choices=["cpu", "cuda", "gpu"],
+        help="Device for NF4/FP8 quantization math (default: cuda). Overrides LTX2_NF4_CALC_DEVICE / LTX2_FP8_CALC_DEVICE env vars.",
     )
     parser.add_argument(
         "--loftq_init",
@@ -5929,6 +6236,25 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         help="Key=value args for CREPA, e.g. student_block_idx=16 teacher_block_idx=32 "
              "lambda_crepa=0.1 tau=1.0 num_neighbors=2 schedule=constant normalize=true",
     )
+    parser.add_argument(
+        "--self_flow",
+        action="store_true",
+        help="Enable Self-Flow regularization (dual-timestep noising + EMA-teacher feature alignment). "
+             "Currently supported for --ltx_mode video.",
+    )
+    parser.add_argument(
+        "--self_flow_args",
+        type=str,
+        nargs="*",
+        help="Key=value args for Self-Flow, e.g. student_block_idx=16 teacher_block_idx=32 "
+        "lambda_self_flow=0.1 temporal_mode=hybrid lambda_temporal=0.1 lambda_delta=0.05 "
+        "temporal_tau=1.0 num_neighbors=2 temporal_granularity=patch patch_spatial_radius=1 "
+        "patch_match_mode=soft patch_match_temperature=0.2 delta_num_steps=2 "
+        "motion_weighting=teacher_delta motion_weight_strength=0.5 "
+        "temporal_schedule=linear temporal_warmup_steps=200 temporal_max_steps=2000 mask_ratio=0.1 "
+        "teacher_momentum=0.999 "
+        "dual_timestep=true student_block_ratio=0.3 teacher_block_ratio=0.7 projector_lr=5e-5",
+    )
 
     # -- Per-module learning rate groups --
     parser.add_argument(
@@ -5957,198 +6283,7 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
              "Zeros out text embeddings and mask to train unconditional generation for CFG.",
     )
 
-    parser.add_argument(
-        "--use_default_sampler",
-        action="store_true",
-        default=True,
-        help="Use the default sampler (Rectified Flow from LTX-2). This is now the default sampling method.",
-    )
-    parser.add_argument(
-        "--cache_te",
-        action="store_true",
-        default=False,
-        help="Cache text encoder embeddings in memory during sampling. Reduces redundant encoding but uses more RAM. "
-             "When enabled, text encoder stays loaded across all sampling batches.",
-    )
-    parser.add_argument(
-        "--cache_i2v",
-        action="store_true",
-        default=False,
-        help="Cache start_images latents in memory for image-to-video mode. When enabled and start_images are provided "
-             "in sample parameters, the images are encoded to latents once and reused across all sampling steps.",
-    )
-
-    parser.add_argument(
-        "--freeze_early_blocks",
-        type=int,
-        default=0,
-        help="Freeze transformer blocks [0, N) during full fine-tuning to protect base motion priors.",
-    )
-    parser.add_argument(
-        "--freeze_block_indices",
-        type=str,
-        default=None,
-        help="Additional comma-separated block indices/ranges to freeze, e.g. 0-7,10,12-15.",
-    )
-    parser.add_argument(
-        "--block_lr_scales",
-        type=str,
-        nargs="*",
-        default=None,
-        help=(
-            "Per-block LR scale rules for full fine-tuning. "
-            "Format: start-end:scale, start-:scale, or idx:scale. "
-            "Examples: 0-11:0.1 12-23:0.4 24-:1.0"
-        ),
-    )
-    parser.add_argument(
-        "--non_block_lr_scale",
-        type=float,
-        default=1.0,
-        help="LR scale for non-transformer-block parameters in full fine-tuning.",
-    )
-    parser.add_argument(
-        "--attn_geometry_lr_scale",
-        type=float,
-        default=1.0,
-        help="Additional LR scale for attention geometry params (to_q/to_k/q_norm/k_norm).",
-    )
-    parser.add_argument(
-        "--freeze_attn_geometry",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Freeze attention geometry params (to_q/to_k/q_norm/k_norm) during full fine-tuning.",
-    )
-
     return parser
-
-
-def _process_lycoris_config(args: argparse.Namespace, logger_instance: logging.Logger) -> None:
-    """Process optional LyCORIS TOML config and merge into runtime args.
-
-    Behavior:
-    - If `--lycoris_config` is set, parse TOML and apply it to LyCORIS creation.
-    - `--network_args` keeps backward compatibility and can override nested TOML keys via:
-      `modules.<name>.<param>=...` and `init.<param>=...`.
-    - `--init_lokr_norm` always overrides init values from TOML.
-    """
-    network_module_name = str(getattr(args, "network_module", "") or "")
-    uses_lycoris_module = "lycoris" in network_module_name.lower()
-
-    if args.network_args is None:
-        args.network_args = []
-
-    config = {}
-    if getattr(args, "lycoris_config", None):
-        if not uses_lycoris_module:
-            raise ValueError("--lycoris_config requires --network_module lycoris.kohya")
-
-        from musubi_tuner.networks.network_config import (
-            parse_toml_config,
-            parse_network_args_enhanced,
-            validate_network_config,
-        )
-        from musubi_tuner.networks.lycoris_extensions import (
-            build_network_kwargs_from_config,
-            log_network_config,
-            config_to_lycoris_preset,
-            get_config_init_params,
-        )
-
-        logger_instance.info("Loading LyCORIS config from: %s", args.lycoris_config)
-        config = parse_toml_config(args.lycoris_config)
-
-        # Support nested overrides through --network_args for compatibility.
-        existing_args = parse_network_args_enhanced(args.network_args)
-        for key, value in existing_args.items():
-            if "." not in key:
-                continue
-
-            parts = key.split(".")
-            if parts[0] == "modules" and len(parts) >= 3:
-                module_name = parts[1]
-                param_name = parts[2]
-                config.setdefault("modules", {}).setdefault(module_name, {})[param_name] = value
-            elif parts[0] == "init" and len(parts) >= 2:
-                param_name = parts[1]
-                config.setdefault("init", {})[param_name] = value
-
-        # Do not forward nested override keys to LyCORIS create_network kwargs.
-        filtered_network_args = []
-        stripped_count = 0
-        for arg in args.network_args:
-            if arg.startswith("modules.") or arg.startswith("init."):
-                stripped_count += 1
-                continue
-            filtered_network_args.append(arg)
-        if stripped_count > 0:
-            args.network_args = filtered_network_args
-            logger_instance.info(
-                "Consumed %d nested TOML override args from --network_args",
-                stripped_count,
-            )
-
-        validate_network_config(config)
-        log_network_config(config, logger_instance)
-
-        preset = config_to_lycoris_preset(config)
-        if preset:
-            args._network_config_preset = preset
-            logger_instance.info("LyCORIS TOML preset prepared for network creation")
-
-        config_kwargs = build_network_kwargs_from_config(
-            config,
-            base_dim=getattr(args, "network_dim", None),
-            base_alpha=getattr(args, "network_alpha", None),
-        )
-        for key, value in config_kwargs.items():
-            arg_str = f"{key}={value}"
-            if not any(arg.startswith(f"{key}=") for arg in args.network_args):
-                args.network_args.append(arg_str)
-                logger_instance.info("Added network arg from LyCORIS config: %s", arg_str)
-
-        init_params = dict(get_config_init_params(config))
-    else:
-        init_params = {}
-
-    # Explicit CLI override always wins.
-    if getattr(args, "init_lokr_norm", None) is not None:
-        init_params["lokr_norm"] = args.init_lokr_norm
-
-    if init_params:
-        args._network_init_params = init_params
-        logger_instance.info("Network initialization params: %s", args._network_init_params)
-
-
-def _apply_lycoris_preset_before_network_creation(args: argparse.Namespace, logger_instance: logging.Logger) -> None:
-    """Apply LyCORIS preset early so it affects network creation."""
-    preset = getattr(args, "_network_config_preset", None)
-    if not preset:
-        return
-
-    network_module_name = str(getattr(args, "network_module", "") or "")
-    if "lycoris" not in network_module_name.lower():
-        logger_instance.warning(
-            "Ignoring LyCORIS preset because --network_module=%s",
-            network_module_name or "<unset>",
-        )
-        return
-
-    try:
-        from lycoris.kohya import LycorisNetworkKohya
-    except Exception as e:
-        logger_instance.warning(
-            "Failed to import lycoris.kohya for preset application. "
-            "Install with: pip install lycoris-lora. Error: %s",
-            e,
-        )
-        return
-
-    try:
-        LycorisNetworkKohya.apply_preset(preset)
-        logger_instance.info("Applied LyCORIS preset before network creation")
-    except Exception as e:
-        logger_instance.warning("Failed to apply LyCORIS preset before network creation: %s", e)
 
 
 # ======== Main training entry point ========
@@ -6210,8 +6345,7 @@ def main() -> None:
     if args.vae_dtype is None:
         args.vae_dtype = "bfloat16"
 
-    network_module_name = str(getattr(args, "network_module", "") or "")
-    uses_lycoris_module = "lycoris" in network_module_name.lower()
+    uses_lycoris_module = is_lycoris_requested(args)
 
     # Inject lora_target_preset into network_args (LTX-2 specific, non-LyCORIS only)
     if getattr(args, "ltx_mode", "video") == "audio" and not explicit_lora_preset and not uses_lycoris_module:
@@ -6237,8 +6371,8 @@ def main() -> None:
             args.network_args.append(f"lora_target_preset={lora_target_preset}")
             logger.info(f"Using LoRA target preset: {lora_target_preset}")
 
-    _process_lycoris_config(args, logger)
-    _apply_lycoris_preset_before_network_creation(args, logger)
+    process_lycoris_config(args, logger)
+    apply_lycoris_preset_before_network_creation(args, logger)
 
     trainer = LTX2NetworkTrainer()
     trainer.train(args)

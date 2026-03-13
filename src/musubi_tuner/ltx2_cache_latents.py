@@ -115,19 +115,11 @@ def encode_and_save_batch(vae, batch: List[ItemInfo], tiling_config=None) -> Non
             latents = vae.tiled_encode(contents, tiling_config)
         else:
             latents = vae(contents)
-        # Move to CPU immediately to free GPU memory
-        latents = latents.cpu().to(dtype=vae_dtype)
-
-    # Free GPU memory from input tensor
-    del contents
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
+        latents = latents.to(device=device, dtype=vae_dtype)
 
     for idx, item in enumerate(batch):
         save_latent_cache_ltx2(item, latents[idx])
 
-    # Free CPU latent tensor after saving
-    del latents
 
 def _adjust_ltx2_frame_count(frame_count: int) -> int:
     frame_count = max(int(frame_count), 1)
@@ -872,10 +864,6 @@ def main() -> None:
         _precache_sample_latents(args, device)
         logger.info("I2V sample latent precaching complete; continuing with dataset latent caching")
 
-    # Check for slider mode and control_args from last_config.toml
-    from musubi_tuner.ltx2_cache_latents_utils import read_control_args_from_last_config
-    control_args = read_control_args_from_last_config(args.dataset_config)
-
     datasets = _load_datasets(args)
     if args.save_dataset_manifest:
         user_config = config_utils.load_user_config(args.dataset_config)
@@ -953,82 +941,10 @@ def main() -> None:
                 temporal_config=temporal_config,
             )
 
-        # Check if we should use i2v slider caching (control_args from last_config.toml)
-        if control_args is not None and not audio_only:
-            logger.info(f"Using I2V slider caching with control_args={control_args}")
-            from musubi_tuner.ltx2_cache_latents_utils import process_video_directory_i2v, create_bucket_selector
+        def encode_fn(batch: List[ItemInfo]) -> None:
+            encode_and_save_batch(vae, batch, tiling_config)
 
-            # Get frame extraction settings from the dataset
-            frame_extraction = "head"
-            target_frames = 17
-            frame_stride = 1
-            frame_sample = 1
-            max_frames = 128
-            vae_frame_stride = 4
-
-            # Bucket settings
-            resolution = (768, 768)
-            enable_bucket = True
-            no_upscale = False
-            enable_ar_bucket = True
-            min_ar = 0.5
-            max_ar = 2.0
-            num_ar_buckets = 5
-
-            if datasets:
-                ds = datasets[0]
-                frame_extraction = getattr(ds, "frame_extraction", frame_extraction)
-                target_frames = getattr(ds, "target_frames", target_frames)
-                frame_stride = getattr(ds, "frame_stride", frame_stride)
-                frame_sample = getattr(ds, "frame_sample", frame_sample)
-                max_frames = getattr(ds, "max_frames", max_frames)
-
-                # Get bucket settings from dataset
-                resolution = getattr(ds, "resolution", resolution)
-                enable_bucket = getattr(ds, "enable_bucket", enable_bucket)
-                no_upscale = getattr(ds, "bucket_no_upscale", no_upscale)
-                enable_ar_bucket = getattr(ds, "enable_ar_bucket", enable_ar_bucket)
-                min_ar = getattr(ds, "min_ar", min_ar)
-                max_ar = getattr(ds, "max_ar", max_ar)
-                num_ar_buckets = getattr(ds, "num_ar_buckets", num_ar_buckets)
-
-            # Create bucket selector
-            bucket_selector = create_bucket_selector(
-                resolution=resolution,
-                enable_bucket=enable_bucket,
-                no_upscale=no_upscale,
-                enable_ar_bucket=enable_ar_bucket,
-                min_ar=min_ar,
-                max_ar=max_ar,
-                num_ar_buckets=num_ar_buckets,
-            )
-            logger.info(f"Created bucket_selector: resolution={resolution}, enable_ar_bucket={enable_ar_bucket}, min_ar={min_ar}, max_ar={max_ar}, num_ar_buckets={num_ar_buckets}")
-
-            # Process each video directory with i2v slider caching
-            for ds in datasets:
-                if isinstance(ds, VideoDataset):
-                    video_dir = getattr(ds, "data_dir", getattr(ds, "video_directory", None))
-                    if video_dir:
-                        logger.info(f"Processing video directory with i2v slider caching: {video_dir}")
-                        process_video_directory_i2v(
-                            video_dir=video_dir,
-                            vae=vae,
-                            device=device,
-                            vae_dtype=vae_dtype,
-                            frame_extraction=frame_extraction,
-                            target_frames=target_frames,
-                            frame_stride=frame_stride,
-                            frame_sample=frame_sample,
-                            max_frames=max_frames,
-                            vae_frame_stride=vae_frame_stride,
-                            control_args=control_args,
-                            bucket_selector=bucket_selector,
-                        )
-        else:
-            def encode_fn(batch: List[ItemInfo]) -> None:
-                encode_and_save_batch(vae, batch, tiling_config)
-
-            cache_latents.encode_datasets(list(datasets), encode_fn, args)
+        cache_latents.encode_datasets(list(datasets), encode_fn, args)
 
         # Cache reference latents for IC-LoRA / v2v training (auto-detected from TOML config)
         # Runs when any dataset has both reference_directory and reference_cache_directory
