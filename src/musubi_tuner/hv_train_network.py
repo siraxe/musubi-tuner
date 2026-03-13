@@ -701,7 +701,7 @@ class NetworkTrainer:
             if "weight_decay" not in optimizer_kwargs:
                 optimizer_kwargs["weight_decay"] = 0.0
             if "cautious_wd" not in optimizer_kwargs:
-                optimizer_kwargs["cautious_wd"] = False
+                optimizer_kwargs["cautious_wd"] = 0.1
             optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
 
         if optimizer is None:
