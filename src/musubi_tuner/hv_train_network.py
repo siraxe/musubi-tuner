@@ -677,6 +677,24 @@ class NetworkTrainer:
             optimizer_class = Automagic
             optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
 
+        elif optimizer_type == "stiefel" or optimizer_type == "stiefel_lora":
+            try:
+                from adv_optm import Stiefel_LoRA
+            except ImportError:
+                raise ImportError(
+                    "adv_optm package is required for Stiefel-LoRA. Install with: pip install adv_optm==2.3.dev3"
+                )
+            logger.info(f"use Stiefel-LoRA optimizer | lr={lr} | {optimizer_kwargs}")
+            optimizer_class = Stiefel_LoRA
+            # Set defaults for Stiefel-LoRA if not specified
+            if "momentum" not in optimizer_kwargs:
+                optimizer_kwargs["momentum"] = 0.95
+            if "weight_decay" not in optimizer_kwargs:
+                optimizer_kwargs["weight_decay"] = 0.0
+            if "cautious_wd" not in optimizer_kwargs:
+                optimizer_kwargs["cautious_wd"] = 0.1
+            optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
+
         if optimizer is None:
             # 任意のoptimizerを使う
             case_sensitive_optimizer_type = args.optimizer_type  # not lower

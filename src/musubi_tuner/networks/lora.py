@@ -36,6 +36,7 @@ class LoRAModule(torch.nn.Module):
         rank_dropout=None,
         module_dropout=None,
         split_dims: Optional[List[int]] = None,
+        use_stiefel: bool = False,
         **kwargs,
     ):
         """
@@ -45,6 +46,7 @@ class LoRAModule(torch.nn.Module):
         """
         super().__init__()
         self.lora_name = lora_name
+        self.use_stiefel = use_stiefel
 
         if org_module.__class__.__name__ == "Conv2d":
             in_dim = org_module.in_channels
@@ -76,6 +78,19 @@ class LoRAModule(torch.nn.Module):
                 lora_A, lora_B = loftq_init_data
                 self.lora_down.weight.data.copy_(lora_A)
                 self.lora_up.weight.data.copy_(lora_B)
+            elif self.use_stiefel:
+                # Stiefel-LoRA Initialization:
+                # B-factor (lora_up) initialized as orthogonal matrix (on Stiefel Manifold)
+                # A-factor (lora_down) initialized as zeros (so adapter starts as identity)
+                torch.nn.init.orthogonal_(self.lora_up.weight)
+                torch.nn.init.zeros_(self.lora_down.weight)
+                # Mark weights for Stiefel optimizer detection
+                self.lora_down.weight._is_lora_A = True
+                self.lora_up.weight._is_lora_B = True
+            else:
+                # Standard LoRA initialization
+                torch.nn.init.kaiming_uniform_(self.lora_down.weight, a=math.sqrt(5))
+                torch.nn.init.zeros_(self.lora_up.weight)
         else:
             # conv2d not supported
             assert sum(split_dims) == out_dim, "sum of split_dims must be equal to out_dim"
@@ -85,10 +100,20 @@ class LoRAModule(torch.nn.Module):
                 [torch.nn.Linear(in_dim, self.lora_dim, bias=False) for _ in range(len(split_dims))]
             )
             self.lora_up = torch.nn.ModuleList([torch.nn.Linear(self.lora_dim, split_dim, bias=False) for split_dim in split_dims])
-            for lora_down in self.lora_down:
-                torch.nn.init.kaiming_uniform_(lora_down.weight, a=math.sqrt(5))
-            for lora_up in self.lora_up:
-                torch.nn.init.zeros_(lora_up.weight)
+
+            if self.use_stiefel:
+                # Stiefel-LoRA Initialization for split_dims
+                for lora_up in self.lora_up:
+                    torch.nn.init.orthogonal_(lora_up.weight)
+                    lora_up.weight._is_lora_B = True
+                for lora_down in self.lora_down:
+                    torch.nn.init.zeros_(lora_down.weight)
+                    lora_down.weight._is_lora_A = True
+            else:
+                for lora_down in self.lora_down:
+                    torch.nn.init.kaiming_uniform_(lora_down.weight, a=math.sqrt(5))
+                for lora_up in self.lora_up:
+                    torch.nn.init.zeros_(lora_up.weight)
 
         if type(alpha) == torch.Tensor:
             alpha = alpha.detach().float().numpy()  # without casting, bf16 causes error
@@ -175,10 +200,11 @@ class LoRAInfModule(LoRAModule):
         multiplier=1.0,
         lora_dim=4,
         alpha=1,
+        use_stiefel: bool = False,
         **kwargs,
     ):
         # no dropout for inference
-        super().__init__(lora_name, org_module, multiplier, lora_dim, alpha)
+        super().__init__(lora_name, org_module, multiplier, lora_dim, alpha, use_stiefel=use_stiefel)
 
         self.org_module_ref = [org_module]  # for reference
         self.enabled = True
@@ -369,6 +395,17 @@ def create_network(
     verbose = kwargs.get("verbose", False)
     if verbose is not None:
         verbose = True if verbose == "True" else False
+
+    # Stiefel-LoRA support
+    use_stiefel = kwargs.get("use_stiefel", False)
+    if isinstance(use_stiefel, str):
+        use_stiefel = use_stiefel.lower() in ("true", "1", "yes")
+
+    # Add use_stiefel to module_kwargs if not already present
+    if module_kwargs is None:
+        module_kwargs = {}
+    if "use_stiefel" not in module_kwargs:
+        module_kwargs["use_stiefel"] = use_stiefel
 
     # regular expression for module selection: exclude and include
     exclude_patterns = kwargs.get("exclude_patterns", None)
