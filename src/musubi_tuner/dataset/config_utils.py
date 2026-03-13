@@ -219,7 +219,8 @@ class ConfigSanitizer:
                 "general": self.general_schema,
                 "datasets": [self.dataset_schema],
                 VOptional("validation_datasets"): [self.dataset_schema],
-            }
+            },
+            extra=voluptuous.ALLOW_EXTRA,
         )
         self.argparse_schema = self.__merge_dict(
             self.ARGPARSE_SPECIFIC_SCHEMA,

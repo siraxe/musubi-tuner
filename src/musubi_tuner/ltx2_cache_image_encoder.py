@@ -273,7 +273,21 @@ def encode_prompt_images(
         images = load_images(start_images_paths)
 
         # Get target dimensions from prompt and validate
-        video_dims = prompt_dict.get("video_dims", "640, 416, 65")
+        # Support both video_dims string format ("640, 416, 65") and separate width/height/frames
+        video_dims = prompt_dict.get("video_dims", None)
+        if video_dims is None:
+            # Try to get from separate width, height, frame_count keys
+            width = prompt_dict.get("width")
+            height = prompt_dict.get("height")
+            frame_count = prompt_dict.get("frame_count")
+            if width and height:
+                # Use frames or default to 65
+                frames = frame_count or 65
+                video_dims = f"{width}, {height}, {frames}"
+            else:
+                # Default fallback
+                video_dims = "640, 416, 65"
+
         if isinstance(video_dims, str):
             dims = [int(x.strip()) for x in video_dims.split(",")]
             raw_width, raw_height, raw_frames = dims[0], dims[1], dims[2]
