@@ -2312,15 +2312,8 @@ class NetworkTrainer:
         accelerator.print("prepare optimizer, data loader etc.")
 
         network_module_name = str(getattr(args, "network_module", "") or "")
-        uses_lycoris_module = "lycoris" in network_module_name.lower()
-        if uses_lycoris_module:
-            trainable_params, lr_descriptions = prepare_optimizer_params_compat(network, args, logger)
-        else:
-            trainable_params, lr_descriptions = network.prepare_optimizer_params(
-                unet_lr=args.learning_rate,
-                audio_lr=getattr(args, "audio_lr", None),
-                lr_args=getattr(args, "lr_args", None),
-            )
+        # Always use compat wrapper for automatic Prodigy LR handling
+        trainable_params, lr_descriptions = prepare_optimizer_params_compat(network, args, logger)
 
         optimizer_name, optimizer_args, optimizer, optimizer_train_fn, optimizer_eval_fn = self.get_optimizer(
             args, trainable_params

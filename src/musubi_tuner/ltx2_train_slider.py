@@ -42,6 +42,7 @@ from musubi_tuner.hv_train_network import (
     prepare_accelerator,
     clean_memory_on_device,
 )
+from musubi_tuner.networks.optimizer_params_compat import prepare_optimizer_params_compat
 from musubi_tuner.ltx2_train_network import (
     LTX2NetworkTrainer,
     ltx2_setup_parser,
@@ -1277,7 +1278,8 @@ class LTX2SliderTrainer:
                 clean_memory_on_device(accelerator.device)
 
         # -- Optimizer & scheduler ---------------------------------------------
-        trainable_params, lr_descriptions = network.prepare_optimizer_params(unet_lr=args.learning_rate)
+        # Use compat wrapper for automatic Prodigy LR handling
+        trainable_params, lr_descriptions = prepare_optimizer_params_compat(network, args, logger)
         optimizer_name, optimizer_args_str, optimizer, optimizer_train_fn, optimizer_eval_fn = (
             NetworkTrainer().get_optimizer(args, trainable_params)
         )

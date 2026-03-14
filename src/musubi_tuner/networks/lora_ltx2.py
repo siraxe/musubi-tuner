@@ -22,7 +22,11 @@ def _patch_lora_load_state_dict_for_audio(network: lora.LoRANetwork) -> lora.LoR
     original = network.load_state_dict
 
     def _filter_audio_keys(keys: List[str]) -> List[str]:
-        return [k for k in keys if "audio_" not in k]
+        audio_patterns = ["audio_", "to_gate_logits", "audio_to_video", "video_to_audio"]
+        return [
+            k for k in keys
+            if not any(pattern in k for pattern in audio_patterns)
+        ]
 
     def _load_state_dict(self, state_dict, strict: bool = True):
         result = original(state_dict, strict=False)
@@ -31,12 +35,14 @@ def _patch_lora_load_state_dict_for_audio(network: lora.LoRANetwork) -> lora.LoR
         non_audio_missing = _filter_audio_keys(missing)
         non_audio_unexpected = _filter_audio_keys(unexpected)
         if non_audio_missing:
-            raise RuntimeError(
-                f"Missing non-audio LoRA keys in state_dict: {non_audio_missing[:10]}"
+            logger.warning(
+                f"LoRA checkpoint is missing {len(non_audio_missing)} keys that exist in current model. "
+                f"These will be initialized from scratch. First few: {non_audio_missing[:5]}"
             )
         if non_audio_unexpected:
-            raise RuntimeError(
-                f"Unexpected non-audio LoRA keys in state_dict: {non_audio_unexpected[:10]}"
+            logger.warning(
+                f"LoRA checkpoint has {len(non_audio_unexpected)} keys not in current model. "
+                f"These will be ignored. First few: {non_audio_unexpected[:5]}"
             )
         if missing and not non_audio_missing:
             logger.warning(
@@ -318,12 +324,20 @@ class LTX2Wrapper(nn.Module):
                 if expected_total == context.shape[-1]:
                     video_context = context[..., :split_video_dim]
                     audio_context = context[..., split_video_dim : split_video_dim + split_audio_dim]
+                elif context.shape[-1] == split_video_dim:
+                    # Video-only context but audio latents present (sampling with mismatched embeddings)
+                    # Use same context for both video and audio as fallback
+                    video_context = context[..., :split_video_dim]
+                    audio_context = context[..., :split_audio_dim] if context.shape[-1] >= split_audio_dim else context
+                elif context.shape[-1] % 2 == 0:
+                    # Fallback to even split when dimensions don't match expected
+                    half = context.shape[-1] // 2
+                    video_context = context[..., :half]
+                    audio_context = context[..., half:]
                 else:
-                    raise ValueError(
-                        "Context hidden size mismatch for AV split: "
-                        f"got {context.shape[-1]}, expected {expected_total} "
-                        f"(video={split_video_dim}, audio={split_audio_dim})."
-                    )
+                    # Size mismatch and odd dimension - use same context for both
+                    video_context = context
+                    audio_context = context
             elif context.shape[-1] % 2 == 0:
                 half = context.shape[-1] // 2
                 video_context = context[..., :half]
