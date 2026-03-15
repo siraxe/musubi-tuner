@@ -527,8 +527,11 @@ def _load_reference_frames(
     import av
 
     if downscale_factor > 1:
-        ref_w = max((bucket_reso[0] // downscale_factor // 32) * 32, 32)
-        ref_h = max((bucket_reso[1] // downscale_factor // 32) * 32, 32)
+        # Use divisor = 32 * downscale_factor to ensure reference latents are exactly 1/downscale_factor of target
+        # This is because VAE divides by 32, so (res // (32*downscale) * 32) / 32 = res / 32 / downscale
+        divisor = 32 * downscale_factor
+        ref_w = max((bucket_reso[0] // divisor) * 32, 32)
+        ref_h = max((bucket_reso[1] // divisor) * 32, 32)
         ref_reso = (ref_w, ref_h)
     else:
         ref_reso = bucket_reso
@@ -593,7 +596,7 @@ def encode_and_save_reference_latents(
         skipped_count = 0
         missing_count = 0
 
-        for _bucket_key, batch in ds.retrieve_latent_cache_batches(num_workers):
+        for _bucket_key, batch in ds.retrieve_latent_cache_batches(num_workers, reference_downscale=downscale_factor):
             for item_info in batch:
                 ref_cache_path = getattr(item_info, "reference_latent_cache_path", None)
                 if ref_cache_path is None:
@@ -609,6 +612,8 @@ def encode_and_save_reference_latents(
                 stem = os.path.splitext(os.path.basename(source_key))[0]
                 # bucket_size is (width, height, frame_count, ...); extract spatial dims
                 bucket_reso = (item_info.bucket_size[0], item_info.bucket_size[1])
+                # Use the video's actual frame count for reference (not the fixed reference_frames)
+                video_frame_count = item_info.bucket_size[2]
 
                 try:
                     ref_path = _find_reference_file(ref_dir, stem)
@@ -619,7 +624,7 @@ def encode_and_save_reference_latents(
                         elif missing_count == 6:
                             logger.warning("(suppressing further missing-reference warnings)")
                         continue
-                    ref_frames = _load_reference_frames(ref_path, bucket_reso, num_frames, downscale_factor)
+                    ref_frames = _load_reference_frames(ref_path, bucket_reso, video_frame_count, downscale_factor)
 
                     contents = torch.from_numpy(ref_frames).unsqueeze(0)
                     contents = contents.permute(0, 4, 1, 2, 3).contiguous()
@@ -797,8 +802,10 @@ def _precache_sample_latents(args: argparse.Namespace, device: torch.device) -> 
                 else:
                     ref_downscale = max(1, getattr(args, "reference_downscale", 1))
                     if ref_downscale > 1:
-                        ref_w = max((width // ref_downscale // 32) * 32, 32)
-                        ref_h = max((height // ref_downscale // 32) * 32, 32)
+                        # Use divisor = 32 * downscale_factor to ensure reference latents are exactly 1/downscale_factor of target
+                        divisor = 32 * ref_downscale
+                        ref_w = max((width // divisor) * 32, 32)
+                        ref_h = max((height // divisor) * 32, 32)
                     else:
                         ref_w, ref_h = width, height
                     ref_frames = max(1, getattr(args, "reference_frames", 1))
@@ -865,6 +872,7 @@ def main() -> None:
         logger.info("I2V sample latent precaching complete; continuing with dataset latent caching")
 
     datasets = _load_datasets(args)
+
     if args.save_dataset_manifest:
         user_config = config_utils.load_user_config(args.dataset_config)
         manifest = config_utils.create_cache_only_dataset_manifest(
@@ -944,7 +952,10 @@ def main() -> None:
         def encode_fn(batch: List[ItemInfo]) -> None:
             encode_and_save_batch(vae, batch, tiling_config)
 
-        cache_latents.encode_datasets(list(datasets), encode_fn, args)
+        # Only pass non-audio datasets to the video encoder; AudioDataset items have
+        # content=None (no visual frames) and are handled separately below.
+        reference_downscale = max(1, getattr(args, "reference_downscale", 1))
+        cache_latents.encode_datasets(list(non_audio_datasets), encode_fn, args, reference_downscale=reference_downscale)
 
         # Cache reference latents for IC-LoRA / v2v training (auto-detected from TOML config)
         # Runs when any dataset has both reference_directory and reference_cache_directory
@@ -1086,7 +1097,9 @@ def main() -> None:
                 if not isinstance(ds_target_fps, (int, float)) or float(ds_target_fps) <= 0:
                     ds_target_fps = float(VideoDataset.TARGET_FPS_LTX2)
             num_workers = args.num_workers if args.num_workers is not None else max(1, (os.cpu_count() or 2) - 1)
-            for _bucket_key, batch in ds.retrieve_latent_cache_batches(num_workers):
+            # Pass reference_downscale for AR bucket adjustment
+            reference_downscale = max(1, getattr(args, "reference_downscale", 1))
+            for _bucket_key, batch in ds.retrieve_latent_cache_batches(num_workers, reference_downscale=reference_downscale):
                 for item_info in batch:
                     audio_cache_path = _audio_cache_path(item_info)
                     if args.skip_existing and os.path.exists(audio_cache_path):

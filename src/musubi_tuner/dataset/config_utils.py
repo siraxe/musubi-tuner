@@ -43,6 +43,7 @@ class BaseDatasetParams:
     audio_loss_weight: Optional[float] = None
     cache_directory: Optional[str] = None
     reference_cache_directory: Optional[str] = None
+    reference_audio_cache_directory: Optional[str] = None
     separate_audio_buckets: bool = False
     cache_only: bool = False
     debug_dataset: bool = False
@@ -93,6 +94,7 @@ class VideoDatasetParams(BaseDatasetParams):
 class AudioDatasetParams(BaseDatasetParams):
     audio_directory: Optional[str] = None
     audio_jsonl_file: Optional[str] = None
+    reference_audio_directory: Optional[str] = None
     audio_bucket_strategy: str = "pad"  # "pad" (default) or "truncate"
     audio_bucket_interval: float = 2.0  # bucket step in seconds
 
@@ -142,6 +144,7 @@ class ConfigSanitizer:
         "audio_loss_weight": float,
         "cache_directory": str,
         "reference_cache_directory": str,
+        "reference_audio_cache_directory": str,
         "separate_audio_buckets": bool,
         "cache_only": bool,
         "enable_ar_bucket": bool,
@@ -164,6 +167,7 @@ class ConfigSanitizer:
     AUDIO_DATASET_DISTINCT_SCHEMA = {
         "audio_directory": str,
         "audio_jsonl_file": str,
+        "reference_audio_directory": str,
         "audio_bucket_strategy": str,
         "audio_bucket_interval": float,
     }
@@ -375,6 +379,7 @@ def generate_dataset_group_by_blueprint(
                     f"""\
         audio_directory: "{dataset.audio_directory}"
         audio_jsonl_file: "{dataset.audio_jsonl_file}"
+        reference_audio_directory: "{getattr(dataset, "reference_audio_directory", None)}"
         audio_bucket_strategy: {getattr(dataset, "audio_bucket_strategy", "pad")}
         audio_bucket_interval: {getattr(dataset, "audio_bucket_interval", 2.0)}
     \n"""
@@ -455,6 +460,7 @@ def _manifest_params_with_cache_only(dataset_type: str, params: dict) -> dict:
     if dataset_type == "audio":
         params["audio_directory"] = None
         params["audio_jsonl_file"] = None
+        params["reference_audio_directory"] = None
     elif dataset_type == "image":
         params["image_directory"] = None
         params["image_jsonl_file"] = None

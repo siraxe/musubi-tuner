@@ -181,13 +181,16 @@ def main() -> None:
     total_cached = 0
     total_skipped = 0
 
+    # Pass reference_downscale for AR bucket adjustment
+    reference_downscale = max(1, getattr(args, "reference_downscale", 1))
+
     for ds in datasets:
         if not isinstance(ds, VideoDataset):
             logger.info("Skipping non-video dataset: %s", type(ds).__name__)
             continue
 
         logger.info("Processing dataset: %s", getattr(ds, "video_directory", "unknown"))
-        for _bucket_key, batch in ds.retrieve_latent_cache_batches(num_workers):
+        for _bucket_key, batch in ds.retrieve_latent_cache_batches(num_workers, reference_downscale=reference_downscale):
             for item_info in batch:
                 cache_path = item_info.latent_cache_path
                 if cache_path is None:

@@ -1,4 +1,6 @@
-"""CREPA – Cross-frame Representation Alignment (arxiv 2506.09229).
+"""Cross-frame representation alignment regularization for video DiT fine-tuning.
+Inspired by SimpleTuner's LayerSync (https://github.com/bghira/SimpleTuner).
+Based on CREPA – Cross-frame Representation Alignment (arxiv 2506.09229).
 
 Training-time regularization that aligns DiT hidden states across video frames
 by encouraging temporal consistency in a learned feature space.

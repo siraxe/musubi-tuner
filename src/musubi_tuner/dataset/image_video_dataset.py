@@ -214,6 +214,7 @@ class ItemInfo:
         self.latent_cache_path = latent_cache_path
         self.text_encoder_output_cache_path: Optional[str] = None
         self.reference_latent_cache_path: Optional[str] = None
+        self.reference_audio_latent_cache_path: Optional[str] = None
 
         # np.ndarray for video, list[np.ndarray] for image with multiple controls
         self.control_content: Optional[Union[np.ndarray, list[np.ndarray]]] = None
@@ -718,14 +719,18 @@ class BucketSelector:
         min_ar: float = 0.5,
         max_ar: float = 2.0,
         num_ar_buckets: int = 2,
+        reso_steps: Optional[int] = None,  # Override default reso_steps (for IC-LoRA reference_downscale)
     ):
-        logger.info(f"BucketSelector.__init__: enable_bucket={enable_bucket}, enable_ar_bucket={enable_ar_bucket}, min_ar={min_ar}, max_ar={max_ar}, num_ar_buckets={num_ar_buckets}")
+        logger.info(f"BucketSelector.__init__: enable_bucket={enable_bucket}, enable_ar_bucket={enable_ar_bucket}, min_ar={min_ar}, max_ar={max_ar}, num_ar_buckets={num_ar_buckets}, reso_steps={reso_steps}")
         self.resolution = resolution
         self.bucket_area = resolution[0] * resolution[1]
         self.architecture = architecture
         self.enable_ar_bucket = enable_ar_bucket
 
-        if architecture in BucketSelector.ARCHITECTURE_STEPS_MAP:
+        if reso_steps is not None:
+            # Use provided reso_steps (for IC-LoRA with reference_downscale)
+            self.reso_steps = reso_steps
+        elif architecture in BucketSelector.ARCHITECTURE_STEPS_MAP:
             self.reso_steps = BucketSelector.ARCHITECTURE_STEPS_MAP[architecture]
         else:
             raise ValueError(f"Invalid architecture: {architecture}")
@@ -1079,6 +1084,8 @@ class BucketBatchManager:
 
         audio_latents_per_item = []
         audio_lengths_per_item = []
+        ref_audio_latents_per_item = []
+        ref_audio_lengths_per_item = []
         dino_features_per_item = []
         diag_collect_keys = os.getenv("LTX2_NAN_DIAG", "0") == "1"
         item_keys = []
@@ -1112,6 +1119,25 @@ class BucketBatchManager:
                     raise ValueError(f"No latent tensors found in reference cache: {reference_latent_cache_path}")
                 sd_latent = {**sd_latent, **sd_ref_latents}
 
+            reference_audio_latent_cache_path = getattr(item_info, "reference_audio_latent_cache_path", None)
+            if reference_audio_latent_cache_path is not None:
+                if not os.path.exists(reference_audio_latent_cache_path):
+                    raise FileNotFoundError(
+                        f"Reference audio latent cache file not found: {reference_audio_latent_cache_path}"
+                    )
+                sd_ref_audio_raw = load_file(reference_audio_latent_cache_path)
+                sd_ref_audio = {}
+                for key, value in sd_ref_audio_raw.items():
+                    if key.startswith("audio_latents_"):
+                        sd_ref_audio["ref_" + key] = value
+                    elif key.startswith("audio_lengths_"):
+                        sd_ref_audio["ref_" + key] = value
+                if not sd_ref_audio:
+                    raise ValueError(
+                        f"No audio latent tensors found in reference audio cache: {reference_audio_latent_cache_path}"
+                    )
+                sd_latent = {**sd_latent, **sd_ref_audio}
+
             sd_te = load_file(item_info.text_encoder_output_cache_path)
             sd = {**sd_latent, **sd_te}
 
@@ -1125,6 +1151,16 @@ class BucketBatchManager:
             audio_latents_per_item.append(item_audio_latents)
             audio_lengths_per_item.append(item_audio_lengths)
 
+            item_ref_audio_latents = None
+            item_ref_audio_lengths = None
+            for key, value in sd.items():
+                if key.startswith("ref_audio_latents_"):
+                    item_ref_audio_latents = value
+                elif key.startswith("ref_audio_lengths_"):
+                    item_ref_audio_lengths = value
+            ref_audio_latents_per_item.append(item_ref_audio_latents)
+            ref_audio_lengths_per_item.append(item_ref_audio_lengths)
+
             if diag_collect_keys:
                 item_keys.append(item_info.item_key)
                 latent_cache_paths.append(item_info.latent_cache_path)
@@ -1133,7 +1169,12 @@ class BucketBatchManager:
 
             # TODO refactor this
             for key in sd.keys():
-                if key.startswith("audio_latents_") or key.startswith("audio_lengths_"):
+                if (
+                    key.startswith("audio_latents_")
+                    or key.startswith("audio_lengths_")
+                    or key.startswith("ref_audio_latents_")
+                    or key.startswith("ref_audio_lengths_")
+                ):
                     continue
                 is_varlen_key = key.startswith("varlen_")  # varlen keys are not stacked
                 content_key = key
@@ -1250,6 +1291,97 @@ class BucketBatchManager:
 
                     batch_tensor_data["audio_latents"] = torch.stack(padded)
                     batch_tensor_data["audio_lengths"] = torch.tensor(lengths, device=device, dtype=torch.int32)
+
+            present_ref_audio = [x for x in ref_audio_latents_per_item if isinstance(x, torch.Tensor)]
+            if present_ref_audio:
+                ref = present_ref_audio[0]
+                if not isinstance(ref, torch.Tensor) or ref.dim() != 3:
+                    raise ValueError(
+                        "Expected cached reference audio latents to be 3D [C, T, F] before stacking, "
+                        f"got: {getattr(ref, 'shape', None)}"
+                    )
+
+                ref_channels = int(ref.shape[0])
+                ref_mel_bins = int(ref.shape[2])
+                ref_dtype = ref.dtype
+                ref_device = ref.device
+
+                if self.audio_bucket_strategy == "truncate":
+                    quantized_t = None
+                    for elem in reversed(bucket_reso):
+                        if isinstance(elem, int):
+                            quantized_t = elem
+                            break
+                    if quantized_t is None or quantized_t <= 0:
+                        quantized_t = int(ref.shape[1])
+
+                    truncated_ref = []
+                    for lat in ref_audio_latents_per_item:
+                        if isinstance(lat, torch.Tensor):
+                            if lat.dim() != 3:
+                                raise ValueError(f"Expected reference audio latents to be 3D [C, T, F], got {tuple(lat.shape)}")
+                            if int(lat.shape[0]) != ref_channels or int(lat.shape[2]) != ref_mel_bins:
+                                raise ValueError(
+                                    "Reference audio latents shape mismatch in batch: "
+                                    f"expected [C={ref_channels}, *, F={ref_mel_bins}], got {tuple(lat.shape)}"
+                                )
+                            truncated_ref.append(lat[:, :quantized_t, :].to(device=ref_device, dtype=ref_dtype))
+                        else:
+                            truncated_ref.append(
+                                torch.zeros((ref_channels, quantized_t, ref_mel_bins), device=ref_device, dtype=ref_dtype)
+                            )
+
+                    batch_tensor_data["ref_audio_latents"] = torch.stack(truncated_ref)
+                    batch_tensor_data["ref_audio_lengths"] = torch.full(
+                        (len(truncated_ref),), quantized_t, device=ref_device, dtype=torch.int32
+                    )
+                else:
+                    ref_lengths = []
+                    ref_max_t = 0
+                    for i, lat in enumerate(ref_audio_latents_per_item):
+                        if isinstance(lat, torch.Tensor):
+                            t = int(lat.shape[1])
+                            length_val = t
+                            cached_len = ref_audio_lengths_per_item[i]
+                            if isinstance(cached_len, torch.Tensor) and cached_len.numel() == 1:
+                                length_val = int(cached_len.view(-1)[0].item())
+                            length_val = max(0, min(length_val, t))
+                        else:
+                            length_val = 0
+                            t = 0
+                        ref_lengths.append(length_val)
+                        ref_max_t = max(ref_max_t, t)
+
+                    if ref_max_t <= 0:
+                        ref_max_t = 1
+
+                    padded_ref = []
+                    for i, lat in enumerate(ref_audio_latents_per_item):
+                        if isinstance(lat, torch.Tensor):
+                            if lat.dim() != 3:
+                                raise ValueError(f"Expected reference audio latents to be 3D [C, T, F], got {tuple(lat.shape)}")
+                            if int(lat.shape[0]) != ref_channels or int(lat.shape[2]) != ref_mel_bins:
+                                raise ValueError(
+                                    "Reference audio latents shape mismatch in batch: "
+                                    f"expected [C={ref_channels}, *, F={ref_mel_bins}], got {tuple(lat.shape)}"
+                                )
+
+                            t = int(lat.shape[1])
+                            use_t = min(t, ref_max_t)
+                            out = torch.zeros((ref_channels, ref_max_t, ref_mel_bins), device=ref_device, dtype=ref_dtype)
+                            if use_t > 0:
+                                out[:, :use_t, :] = lat[:, :use_t, :].to(device=ref_device, dtype=ref_dtype)
+                            padded_ref.append(out)
+                            ref_lengths[i] = int(min(max(0, ref_lengths[i]), ref_max_t))
+                        else:
+                            padded_ref.append(torch.zeros((ref_channels, ref_max_t, ref_mel_bins), device=ref_device, dtype=ref_dtype))
+
+                    batch_tensor_data["ref_audio_latents"] = torch.stack(padded_ref)
+                    batch_tensor_data["ref_audio_lengths"] = torch.tensor(ref_lengths, device=ref_device, dtype=torch.int32)
+
+            ref_audio_latents_tensor = batch_tensor_data.get("ref_audio_latents")
+            if isinstance(ref_audio_latents_tensor, torch.Tensor) and ref_audio_latents_tensor.dim() == 4:
+                batch_tensor_data["ref_audio_latents"] = {"latents": ref_audio_latents_tensor}
 
             else:
                 # Skip allocating placeholder audio tensors when the batch has no audio.
@@ -2153,6 +2285,7 @@ class BaseDataset(torch.utils.data.Dataset):
         audio_loss_weight: Optional[float] = None,
         cache_directory: Optional[str] = None,
         reference_cache_directory: Optional[str] = None,
+        reference_audio_cache_directory: Optional[str] = None,
         separate_audio_buckets: bool = False,
         debug_dataset: bool = False,
         architecture: str = "no_default",
@@ -2171,6 +2304,7 @@ class BaseDataset(torch.utils.data.Dataset):
         self.audio_loss_weight = audio_loss_weight
         self.cache_directory = cache_directory
         self.reference_cache_directory = reference_cache_directory
+        self.reference_audio_cache_directory = reference_audio_cache_directory
         self.separate_audio_buckets = separate_audio_buckets
         self.debug_dataset = debug_dataset
         self.architecture = architecture
@@ -2212,6 +2346,17 @@ class BaseDataset(torch.utils.data.Dataset):
         if not latent_cache_path:
             latent_cache_path = self.get_latent_cache_path(item_info)
         return self.get_audio_latent_cache_path_from_latent_cache_path(latent_cache_path)
+
+    def get_reference_audio_latent_cache_path(self, item_info: ItemInfo) -> str:
+        w, h = item_info.original_size
+        basename = os.path.splitext(os.path.basename(item_info.item_key))[0]
+        assert self.reference_audio_cache_directory is not None, (
+            "reference_audio_cache_directory is required / reference_audio_cache_directoryは必須です"
+        )
+        return os.path.join(
+            self.reference_audio_cache_directory,
+            f"{basename}_{w:04d}x{h:04d}_{self.architecture}_audio.safetensors",
+        )
 
     def get_dino_feature_cache_path_from_latent_cache_path(self, latent_cache_path: str) -> str:
         """Derive DINOv2 feature cache path: ``*_ltx2.safetensors`` → ``*_ltx2_dino.safetensors``."""
@@ -2269,7 +2414,7 @@ class BaseDataset(torch.utils.data.Dataset):
         assert self.cache_directory is not None, "cache_directory is required / cache_directoryは必須です"
         return os.path.join(self.cache_directory, f"{basename}_{self.architecture}_te.safetensors")
 
-    def retrieve_latent_cache_batches(self, num_workers: int):
+    def retrieve_latent_cache_batches(self, num_workers: int, reference_downscale: int = 1):
         raise NotImplementedError
 
     def retrieve_text_encoder_output_cache_batches(self, num_workers: int):
@@ -2381,6 +2526,7 @@ class ImageDataset(BaseDataset):
         cache_directory: Optional[str] = None,
         multiple_target: bool = False,
         reference_cache_directory: Optional[str] = None,
+        reference_audio_cache_directory: Optional[str] = None,
         separate_audio_buckets: bool = False,
         fp_latent_window_size: Optional[int] = 9,
         fp_1f_clean_indices: Optional[list[int]] = None,
@@ -2407,6 +2553,7 @@ class ImageDataset(BaseDataset):
             audio_loss_weight,
             cache_directory,
             reference_cache_directory,
+            reference_audio_cache_directory,
             separate_audio_buckets,
             debug_dataset,
             architecture,
@@ -2481,9 +2628,13 @@ class ImageDataset(BaseDataset):
             return None
         return len(self.datasource) if self.datasource.is_indexable() else None
 
-    def retrieve_latent_cache_batches(self, num_workers: int):
+    def retrieve_latent_cache_batches(self, num_workers: int, reference_downscale: int = 1):
         if self.datasource is None:
             raise ValueError("retrieve_latent_cache_batches is not available when cache_only=True")
+        # For IC-LoRA with reference_downscale > 1, use larger reso_steps to ensure exact halving
+        reso_steps = None
+        if reference_downscale > 1 and self.architecture == ARCHITECTURE_LTX2:
+            reso_steps = 32 * reference_downscale
         bucket_selector = BucketSelector(
             self.resolution,
             self.enable_bucket,
@@ -2493,6 +2644,7 @@ class ImageDataset(BaseDataset):
             self.min_ar,
             self.max_ar,
             self.num_ar_buckets,
+            reso_steps,  # Pass reso_steps override
         )
         executor = ThreadPoolExecutor(max_workers=num_workers)
 
@@ -2702,6 +2854,20 @@ class ImageDataset(BaseDataset):
                     logger.warning(f"Reference cache not found, skipping item: {ref_cache_path}")
                     continue
 
+            if self.reference_audio_cache_directory is not None:
+                ref_audio_cache_path = os.path.join(
+                    self.reference_audio_cache_directory,
+                    os.path.basename(cache_file).replace(
+                        f"_{self.architecture}.safetensors",
+                        f"_{self.architecture}_audio.safetensors",
+                    ),
+                )
+                if os.path.exists(ref_audio_cache_path):
+                    item_info.reference_audio_latent_cache_path = ref_audio_cache_path
+                else:
+                    logger.warning(f"Reference audio cache not found, skipping item: {ref_audio_cache_path}")
+                    continue
+
             bucket = bucketed_item_info.get(bucket_reso, [])
             for _ in range(self.num_repeats):
                 bucket.append(item_info)
@@ -2750,6 +2916,8 @@ class AudioDataset(BaseDataset):
         audio_jsonl_file: Optional[str] = None,
         cache_directory: Optional[str] = None,
         reference_cache_directory: Optional[str] = None,
+        reference_audio_directory: Optional[str] = None,
+        reference_audio_cache_directory: Optional[str] = None,
         separate_audio_buckets: bool = False,
         cache_only: bool = False,
         debug_dataset: bool = False,
@@ -2768,11 +2936,14 @@ class AudioDataset(BaseDataset):
             audio_loss_weight,
             cache_directory,
             reference_cache_directory,
+            reference_audio_cache_directory,
             separate_audio_buckets,
             debug_dataset,
             architecture,
         )
         self.audio_directory = audio_directory
+        self.reference_audio_directory = reference_audio_directory
+        self.reference_audio_cache_directory = reference_audio_cache_directory
         self.audio_jsonl_file = audio_jsonl_file
         self.cache_only = cache_only
         self.audio_bucket_strategy = audio_bucket_strategy
@@ -2819,7 +2990,7 @@ class AudioDataset(BaseDataset):
         suffix = "_0001x0001"
         return item_key[: -len(suffix)] if item_key.endswith(suffix) else item_key
 
-    def retrieve_latent_cache_batches(self, num_workers: int):
+    def retrieve_latent_cache_batches(self, num_workers: int, reference_downscale: int = 1):
         if self.datasource is None:
             raise ValueError("retrieve_latent_cache_batches is not available when cache_only=True")
         executor = ThreadPoolExecutor(max_workers=num_workers)
@@ -3044,6 +3215,7 @@ class VideoDataset(BaseDataset):
         reference_directory: Optional[str] = None,
         cache_directory: Optional[str] = None,
         reference_cache_directory: Optional[str] = None,
+        reference_audio_cache_directory: Optional[str] = None,
         separate_audio_buckets: bool = False,
         fp_latent_window_size: Optional[int] = 9,
         cache_only: bool = False,
@@ -3065,6 +3237,7 @@ class VideoDataset(BaseDataset):
             audio_loss_weight,
             cache_directory,
             reference_cache_directory,
+            reference_audio_cache_directory,
             separate_audio_buckets,
             debug_dataset,
             architecture,
@@ -3163,9 +3336,13 @@ class VideoDataset(BaseDataset):
         metadata["cache_only"] = self.cache_only
         return metadata
 
-    def retrieve_latent_cache_batches(self, num_workers: int):
+    def retrieve_latent_cache_batches(self, num_workers: int, reference_downscale: int = 1):
         if self.datasource is None:
             raise ValueError("retrieve_latent_cache_batches is not available when cache_only=True")
+        # For IC-LoRA with reference_downscale > 1, use larger reso_steps to ensure exact halving
+        reso_steps = None
+        if reference_downscale > 1 and self.architecture == ARCHITECTURE_LTX2:
+            reso_steps = 32 * reference_downscale
         buckset_selector = BucketSelector(
             self.resolution,
             self.enable_bucket,
@@ -3175,6 +3352,7 @@ class VideoDataset(BaseDataset):
             self.min_ar,
             self.max_ar,
             self.num_ar_buckets,
+            reso_steps,  # Pass reso_steps override
         )
         self.datasource.set_bucket_selector(buckset_selector)
         self.datasource.set_source_and_target_fps(self.source_fps, self.target_fps)
@@ -3391,6 +3569,20 @@ class VideoDataset(BaseDataset):
                     item_info.reference_latent_cache_path = ref_cache_path
                 else:
                     logger.warning(f"Reference cache not found, skipping item: {ref_cache_path}")
+                    continue
+
+            if self.reference_audio_cache_directory is not None:
+                ref_audio_cache_path = os.path.join(
+                    self.reference_audio_cache_directory,
+                    os.path.basename(cache_file).replace(
+                        f"_{self.architecture}.safetensors",
+                        f"_{self.architecture}_audio.safetensors",
+                    ),
+                )
+                if os.path.exists(ref_audio_cache_path):
+                    item_info.reference_audio_latent_cache_path = ref_audio_cache_path
+                else:
+                    logger.warning(f"Reference audio cache not found, skipping item: {ref_audio_cache_path}")
                     continue
 
             bucket = bucketed_item_info.get(bucket_reso, [])

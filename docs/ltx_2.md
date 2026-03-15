@@ -1,6 +1,6 @@
 # LTX-2 / LTX-2.3
 
-Supports LoRA training for both **LTX-2 (19B)** and **LTX-2.3 (22B)** models with the following training modes: text-to-video, joint audio-video, audio-only, and IC-LoRA / video-to-video (reference-conditioned generation).
+Supports LoRA training for both **LTX-2 (19B)** and **LTX-2.3 (22B)** models with the following training modes: text-to-video, joint audio-video, audio-only, IC-LoRA / video-to-video, and audio-reference IC-LoRA.
 
 ### Supported Model Versions
 
@@ -53,6 +53,7 @@ Caching scripts (`ltx2_cache_latents.py`, `ltx2_cache_text_encoder_outputs.py`) 
     - [Timestep Sampling](#timestep-sampling)
     - [LoRA Targets](#lora-targets)
     - [IC-LoRA / Video-to-Video Training](#ic-lora--video-to-video-training)
+    - [Audio-Reference IC-LoRA](#audio-reference-ic-lora-speaker-identity)
     - [Sampling with Tiled VAE](#sampling-with-tiled-vae)
     - [Precached Sample Prompts](#precached-sample-prompts)
     - [Two-Stage Sampling (WIP)](#two-stage-sampling-wip)
@@ -132,7 +133,6 @@ This step pre-processes media files into VAE latents to speed up training.
 ```bash
 python ltx2_cache_latents.py ^
   --dataset_config dataset.toml ^
-  --save_dataset_manifest dataset_manifest.json ^
   --ltx2_checkpoint /path/to/ltx-2.safetensors ^
   --device cuda ^
   --vae_dtype bf16 ^
@@ -350,6 +350,8 @@ musubi-tuner supports advanced LoRA algorithms (LoKR, LoHA, LoCoN, etc.) via:
 - `--network_args` for inline `key=value` settings
 - `--lycoris_config <path.toml>` for TOML-based settings
 
+See the [LyCORIS algorithm list](https://github.com/KohakuBlueleaf/LyCORIS/blob/main/docs/Algo-List.md) and [guidelines](https://github.com/KohakuBlueleaf/LyCORIS/blob/main/docs/Guidelines.md) for algorithm details and recommended settings.
+
 No bundled example TOML files are shipped; provide your own config path.
 
 ```bash
@@ -396,6 +398,8 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_tr
 `--lycoris_config` requires `--network_module lycoris.kohya`.
 
 ### Training Arguments
+
+All training arguments can be placed in a `.toml` config file instead of on the command line via `--config_file config.toml`. See the upstream [configuration files guide](https://github.com/kohya-ss/musubi-tuner/blob/main/docs/advanced_config.md#using-configuration-files-to-specify-training-options--設定ファイルを使用した学習オプションの指定) for format details.
 
 #### Memory Optimization
 
@@ -669,7 +673,7 @@ Result:
 - Other `audio_*` modules (e.g. `audio_ff`) → 1e-5 (`--audio_lr`)
 - Video modules → 1e-4 (`--learning_rate`)
 
-Works with LoRA+ (`loraplus_lr_ratio`): the up/down split applies within each LR group. Both flags default to `None` and are fully backward-compatible.
+Works with LoRA+ (`loraplus_lr_ratio`): the up/down split applies within each LR group. Both flags default to `None` and are fully backward-compatible. See [LoRA+ in the upstream advanced configuration guide](https://github.com/kohya-ss/musubi-tuner/blob/main/docs/advanced_config.md#lora) for setup details.
 
 #### Preservation & Regularization
 
@@ -706,7 +710,7 @@ The `class` parameter should be a general description without your trigger word 
 > [!CAUTION]
 > Each preservation technique adds transformer forward passes per step. Audio DOP costs apply only on non-audio steps.
 
-**CREPA (Cross-frame Representation Alignment)** — Encourages temporal consistency across video frames by aligning DiT hidden states across frames via a small projector MLP. Based on [arxiv 2506.09229](https://arxiv.org/abs/2506.09229). Only the projector is trained; all other modules stay frozen. CREPA uses hooks to capture intermediate features from the existing forward pass (no extra forward passes).
+**CREPA (Cross-frame Representation Alignment)** — Encourages temporal consistency across video frames by aligning DiT hidden states across frames via a small projector MLP. Only the projector is trained; all other modules stay frozen. CREPA uses hooks to capture intermediate features from the existing forward pass (no extra forward passes). Two modes are available: `dino` (based on [arXiv 2506.09229](https://arxiv.org/abs/2506.09229), aligns to pre-cached DINOv2 features from neighboring frames) and `backbone` (inspired by [SimpleTuner LayerSync](https://github.com/bghira/SimpleTuner), aligns to a deeper block of the same transformer).
 
 Enable with `--crepa`. All parameters are passed via `--crepa_args` as `key=value` pairs:
 
@@ -889,6 +893,7 @@ Use `--lora_target_preset` to control which layers LoRA targets:
 | `t2v` (default) | Attention only (`to_q`, `to_k`, `to_v`, `to_out.0`) | Text-to-video, matches official LTX-2 trainer |
 | `v2v` | Attention + FFN | Video-to-video / IC-LoRA style |
 | `audio` | Audio attention/FFN + audio-side cross-modal attention | Audio-only training (auto-selected when `--ltx2_mode audio`) |
+| `audio_ref_only_ic` | Audio attn/FFN + bidirectional AV cross-modal | Audio-reference IC-LoRA |
 | `full` | All linear layers | All layers targeted, larger file size |
 
 All presets apply to all relevant attention types: self-attention, cross-attention, and cross-modal attention (in AV mode). Connector layers are always excluded.
@@ -1044,7 +1049,182 @@ The `--sample_include_reference` flag shows the reference side-by-side with the 
 - **Downscale factor metadata**: Saved in LoRA safetensors as `ss_reference_downscale_factor` when factor != 1.
 - **Two-stage inference**: Not supported with V2V; a warning is emitted and the reference is ignored.
 
+#### Audio-Reference IC-LoRA
+
+> This approach is based on [ID-LoRA](https://github.com/ID-LoRA/ID-LoRA), adapted for audio-video conditioning in the LTX-2 transformer.
+
+Trains a LoRA using in-context audio-reference conditioning. Reference audio latents (clean, timestep=0) are concatenated with noisy target audio latents during training. Loss is computed only on the target portion. In AV mode the LoRA targets audio self/cross-attention, audio FFN, and bidirectional audio-video cross-modal attention layers; in audio-only mode the `audio` preset is auto-selected, which omits cross-modal layers that connect to the (dummy) video branch.
+
+Supported modes:
+- **`--ltx2_mode av`** — full audio-video model; trains both video and audio IC-LoRA layers.
+- **`--ltx2_mode audio`** — audio-only mode; trains only audio layers (video is a dummy zero tensor). `--lora_target_preset audio` is auto-selected (cross-modal layers that affect the dummy video branch are omitted).
+
+##### How it works
+
+1. Reference audio is encoded to latents and concatenated with noisy target audio along the temporal axis.
+2. Reference tokens receive timestep=0 (no noise); target tokens receive the sampled sigma.
+3. Loss is masked to exclude the reference portion — the model only learns to predict the target.
+4. Three optional attention overrides control how the reference interacts with the rest of the model:
+   - **Negative positions**: shifts reference tokens into negative RoPE time, creating clean positional separation from target tokens.
+   - **A2V cross-attention mask**: blocks video from attending to reference audio (video syncs with target audio only).
+   - **Text attention mask**: blocks reference audio from attending to text (reference provides identity, not content).
+
+##### Step 1: Prepare Data
+
+Organize training videos with matching reference audio files (same filename stem):
+
+```
+videos/                    reference_audio/
+  speaker_001.mp4            speaker_001.wav    # reference clip for speaker_001
+  speaker_002.mp4            speaker_002.flac
+```
+
+Reference audio files are matched to training videos by filename stem.
+
+##### Step 2: Dataset Config
+
+```toml
+[general]
+resolution = [768, 512]
+caption_extension = ".txt"
+batch_size = 1
+enable_bucket = true
+cache_directory = "cache"
+reference_audio_cache_directory = "cache_ref_audio"
+separate_audio_buckets = true
+
+[[datasets]]
+video_directory = "videos"
+reference_audio_directory = "reference_audio"
+target_frames = [1, 17, 33]
+```
+
+##### Step 3: Cache Latents
+
+```bash
+python ltx2_cache_latents.py ^
+  --dataset_config dataset.toml ^
+  --ltx2_checkpoint /path/to/ltxav-2.safetensors ^
+  --ltx2_mode av ^
+  --device cuda ^
+  --vae_dtype bf16
+```
+
+For audio-only mode, replace `--ltx2_mode av` with `--ltx2_mode audio` (no video latents are cached, only audio and reference audio latents).
+
+Reference audio latents are automatically cached to `reference_audio_cache_directory`.
+
+##### Step 4: Cache Text Encoder Outputs
+
+No special flags — use whichever mode you are training:
+
+```bash
+python ltx2_cache_text_encoder_outputs.py ^
+  --dataset_config dataset.toml ^
+  --ltx2_checkpoint /path/to/ltxav-2.safetensors ^
+  --ltx2_mode av ^
+  --gemma_root /path/to/gemma ^
+  --gemma_load_in_8bit ^
+  --device cuda
+```
+
+For audio-only mode, replace `--ltx2_mode av` with `--ltx2_mode audio`.
+
+##### Step 5: Train
+
+```bash
+accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_train_network.py ^
+  --mixed_precision bf16 ^
+  --dataset_config dataset.toml ^
+  --ltx2_checkpoint /path/to/ltxav-2.safetensors ^
+  --ltx2_mode av ^
+  --fp8_base --fp8_scaled ^
+  --blocks_to_swap 10 ^
+  --sdpa ^
+  --gradient_checkpointing ^
+  --network_module networks.lora_ltx2 ^
+  --network_dim 128 --network_alpha 128 ^
+  --lora_target_preset audio_ref_only_ic ^
+  --audio_ref_use_negative_positions ^
+  --audio_ref_mask_cross_attention_to_reference ^
+  --audio_ref_mask_reference_from_text_attention ^
+  --ltx2_first_frame_conditioning_p 0.9 ^
+  --timestep_sampling shifted_logit_normal ^
+  --learning_rate 2e-4 ^
+  --sample_at_first ^
+  --sample_every_n_epochs 5 ^
+  --sample_prompts sampling_prompts.txt ^
+  --output_dir output ^
+  --output_name ltx2_audio_ref_ic_lora
+```
+
+**Audio-only mode** — replace `--ltx2_mode av` with `--ltx2_mode audio` and omit `--lora_target_preset` (auto-selected as `audio`):
+
+```bash
+accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_train_network.py ^
+  --mixed_precision bf16 ^
+  --dataset_config dataset.toml ^
+  --ltx2_checkpoint /path/to/ltxav-2.safetensors ^
+  --ltx2_mode audio ^
+  --ic_lora_strategy audio_ref_only_ic ^
+  --fp8_base --fp8_scaled ^
+  --blocks_to_swap 10 ^
+  --sdpa ^
+  --gradient_checkpointing ^
+  --network_module networks.lora_ltx2 ^
+  --network_dim 128 --network_alpha 128 ^
+  --audio_ref_use_negative_positions ^
+  --audio_ref_mask_reference_from_text_attention ^
+  --timestep_sampling shifted_logit_normal ^
+  --learning_rate 2e-4 ^
+  --sample_at_first ^
+  --sample_every_n_epochs 5 ^
+  --sample_prompts sampling_prompts.txt ^
+  --output_dir output ^
+  --output_name ltx2_audio_ref_ic_lora_audioonly
+```
+
+##### Step 6: Sample Prompts
+
+Use `--ra <path>` in your sampling prompts file to specify the reference audio:
+
+```
+--ra reference_audio/speaker_001.wav A person speaking about nature --n blurry, low quality
+--ra reference_audio/speaker_002.flac A woman laughing in a park
+```
+
+Reference audio latents are precached automatically when using `--precache_sample_latents` during latent caching.
+
+##### Audio-Reference IC-LoRA Arguments
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--ic_lora_strategy audio_ref_only_ic` | auto | Activates audio-reference IC-LoRA mode (auto-inferred from `--lora_target_preset audio_ref_only_ic`) |
+| `--lora_target_preset audio_ref_only_ic` | — | Targets audio attn/FFN + bidirectional AV cross-modal layers |
+| `--audio_ref_use_negative_positions` | off | Place reference audio in negative RoPE time for positional separation |
+| `--audio_ref_mask_cross_attention_to_reference` | off | Block video from attending to reference audio tokens (AV mode only; no effect in audio-only mode) |
+| `--audio_ref_mask_reference_from_text_attention` | off | Block reference audio from attending to text tokens |
+| `--audio_ref_identity_guidance_scale` | 0.0 | Override CFG scale for target-audio branch during `audio_ref_only_ic` sampling (0 = use standard guidance scale) |
+
+##### Dataset Config Options
+
+| Option | Type | Description |
+|--------|------|-------------|
+| `reference_audio_directory` | string | Path to reference audio files (matched by filename stem) |
+| `reference_audio_cache_directory` | string | Output directory for cached reference audio latents |
+
+##### Notes
+
+- **Checkpoint**: requires an LTXAV checkpoint for both `--ltx2_mode av` and `--ltx2_mode audio`.
+- **Bucket separation**: `separate_audio_buckets = true` keeps audio/non-audio items in separate batches (avoids shape mismatches in collation).
+- **Attention overrides**: the three `--audio_ref_*` flags default to off. The reference ID-LoRA configuration enables all three.
+- **LoRA rank**: the reference ID-LoRA configuration uses rank 128 with alpha 128.
+- **First-frame conditioning**: the reference ID-LoRA configuration uses `first_frame_conditioning_p = 0.9`.
+- `--ic_lora_strategy auto` (default) infers the strategy from `--lora_target_preset` via `infer_ic_lora_strategy_from_preset()`.
+
 #### Sampling with Tiled VAE
+
+The prompt file format (`--sample_prompts`) — including guidance scale, negative prompt, and per-prompt inference parameters — is documented in the upstream [Sampling During Training guide](https://github.com/kohya-ss/musubi-tuner/blob/main/docs/sampling_during_training.md). LTX-2 extends this with `--v <path>` (IC-LoRA reference) and `--ra <path>` (audio-reference IC-LoRA) prompt prefixes.
 
 | Argument | Default | Description |
 |----------|---------|-------------|
@@ -1138,7 +1318,7 @@ python ltx2_merge_lora.py ^
 
 ## Dataset Configuration
 
-The dataset config is a TOML file with `[general]` defaults and `[[datasets]]` entries.
+The dataset config is a TOML file with `[general]` defaults and `[[datasets]]` entries. Common options shared across all musubi-tuner architectures — including `frame_extraction` modes, JSONL metadata format, control image support, and resolution bucketing — are documented in the upstream [Dataset Configuration guide](https://github.com/kohya-ss/musubi-tuner/blob/main/docs/dataset_config.md). The options below are LTX-2-specific or supplement upstream defaults.
 
 ### Video Dataset Options
 
@@ -1159,6 +1339,8 @@ The dataset config is a TOML file with `[general]` defaults and `[[datasets]]` e
 | `cache_directory` | string | — | Latent cache output directory |
 | `reference_directory` | string | — | Reference images/videos for IC-LoRA (matched by filename) |
 | `reference_cache_directory` | string | — | Output directory for cached reference latents (IC-LoRA) |
+| `reference_audio_directory` | string | — | Reference audio files for audio-reference IC-LoRA (matched by filename stem) |
+| `reference_audio_cache_directory` | string | — | Output directory for cached reference audio latents |
 | `separate_audio_buckets` | bool | false | Keep audio/non-audio items in separate batches |
 
 ### Audio Dataset Options
@@ -1427,11 +1609,13 @@ Alternative: `--audio_loss_balance_mode ema_mag` matches audio loss magnitude to
 ### Technical Notes
 
 - **Float32 AdaLN**: The transformer applies Adaptive Layer Norm (AdaLN) shift/scale operations in float32, then casts back to the working dtype. This prevents overflow that can occur when bf16 scale values multiply bf16 hidden states. The fix is always active and requires no flags.
-- **Float32 loss**: Per-element loss (`MSE`, `L1`, `Huber`) is computed in float32 regardless of `--mixed_precision` to avoid precision loss in gradient computation.
+- **Loss dtype**: The LTX-2 training path computes the task loss (MSE, L1, Huber) in `trainer.dit_dtype` (typically bf16 with `--mixed_precision bf16`). Internal regularization losses (motion preservation, CREPA, Self-Flow) always use MSE and are unaffected by `--loss_type`.
 
 ---
 
 ## 4. Slider LoRA Training
+
+> Slider LoRA training is based on the [ai-toolkit](https://github.com/ostris/ai-toolkit) implementation by ostris, adapted for LTX-2.
 
 Slider LoRAs learn a controllable direction in model output space (e.g., "detailed" vs "blurry"). At inference, you scale the LoRA multiplier to control the effect strength and direction: `+1.0` enhances, `-1.0` erases, `0.0` is the base model, and values like `+2.0` or `-0.5` work too.
 
@@ -1591,7 +1775,40 @@ Note: `--gemma_root` is not needed for reference mode (text embeddings are loade
 
 ## References
 
-- [Installation Guide](https://github.com/AkaneTendo25/musubi-tuner/discussions/19) — Setup instructions, dependencies, flash-attn, troubleshooting
-- [Optimizers Guide](https://github.com/AkaneTendo25/musubi-tuner/discussions/21) — Optimizer comparison, recommended settings, memory usage tips
-- [LTX-2 Audio Dataset Builder](https://github.com/dorpxam/LTX-2-Audio-Dataset-Builder) — Specialized tool to automate high-quality audio dataset creation: transforms raw audio into clean, curated, captioned segments optimized for LTX-2 audio-only training
+**Upstream musubi-tuner Documentation**
+- [Dataset Configuration](https://github.com/kohya-ss/musubi-tuner/blob/main/docs/dataset_config.md) — TOML format, `frame_extraction` modes, JSONL metadata, control images, resolution bucketing
+- [Sampling During Training](https://github.com/kohya-ss/musubi-tuner/blob/main/docs/sampling_during_training.md) — Prompt file format, per-prompt guidance scale, negative prompts, sampling CLI flags
+- [Advanced Configuration](https://github.com/kohya-ss/musubi-tuner/blob/main/docs/advanced_config.md) — `--config_file` TOML training configuration, `--network_args` format, LoRA+, TensorBoard/WandB logging, PyTorch Dynamo, timestep bucketing, Schedule-Free optimizer
+- [LyCORIS Algorithm List](https://github.com/KohakuBlueleaf/LyCORIS/blob/main/docs/Algo-List.md) and [Guidelines](https://github.com/KohakuBlueleaf/LyCORIS/blob/main/docs/Guidelines.md) — LoKR, LoHA, LoCoN and other algorithm details (used via `pip install lycoris-lora`)
+- [Tools](https://github.com/kohya-ss/musubi-tuner/blob/main/docs/tools.md) — Post-hoc EMA LoRA merging, image captioning with Qwen2.5-VL
+
+**Research**
+- [ID-LoRA](https://github.com/ID-LoRA/ID-LoRA) — In-context identity LoRA; the audio-reference IC-LoRA implementation in this trainer is based on this approach
+- [CREPA (arXiv 2506.09229)](https://arxiv.org/abs/2506.09229) — Cross-frame Representation Alignment; basis for `--crepa dino` mode (DINOv2 teacher from neighboring frames)
+- [Self-Flow (arXiv 2603.06507)](https://arxiv.org/abs/2603.06507) — Self-supervised flow matching regularization; basis for `--self_flow`
+
+**Official LTX Resources**
+- [LTX-2](https://github.com/Lightricks/LTX-2) — Official Lightricks LTX-2 repository; contains the well-structured `ltx-trainer` and `ltx-pipelines` packages that served as the upstream source and reference for this implementation
+- [LTX-Video](https://github.com/Lightricks/LTX-Video) — Official Lightricks model repository (inference, ComfyUI nodes, model weights)
+- [LTX Documentation](https://docs.ltx.video/open-source-model/getting-started/overview) — Unified docs hub: open-source model, API reference, ComfyUI integration, LoRA usage, and LTX-2 trainer guide
+
+**Alternative Trainers**
+- [ai-toolkit](https://github.com/ostris/ai-toolkit) (ostris) — General diffusion fine-tuning toolkit with LTX-2 LoRA support; slider LoRA training is based on its implementation
+- [SimpleTuner](https://github.com/bghira/SimpleTuner) — Multi-model fine-tuning framework with LTX-Video support; `--crepa backbone` mode is inspired by its LayerSync regularizer
+- [DiffSynth-Studio](https://github.com/modelscope/DiffSynth-Studio) — ModelScope diffusion synthesis framework with LTX-Video support
+
+**Community Resources**
+- [awesome-ltx2](https://github.com/wildminder/awesome-ltx2) — Curated list of LTX-2 resources, tools, models, and guides
+- [Banodoco Discord](https://discord.gg/banodoco) — Active AI video generation community; discussions on LTX-2 training, workflows, and research
+- [Windows Installation Guide](https://github.com/AkaneTendo25/musubi-tuner/discussions/19) — Windows-specific setup (Python 3.12, CUDA, Flash Attention 2), dependencies, troubleshooting
+- [LTX-2 Training Optimizers](https://github.com/AkaneTendo25/musubi-tuner/discussions/21) — Optimizer comparison for LTX-2 training: AdamW, Prodigy, Muon, CAME, and recommended settings
+- [LTX-2 Audio Dataset Builder](https://github.com/dorpxam/LTX-2-Audio-Dataset-Builder) — Tool to automate audio dataset creation: transforms raw audio into clean, captioned segments optimized for LTX-2 audio-only training
+
+**Tutorials & Guides**
+- [LTX-2 LoRA Training Complete Guide](https://apatero.com/blog/ltx-2-lora-training-fine-tuning-complete-guide-2025) (Apatero) — Dataset preparation, training configuration, and LoRA deployment walkthrough
+- [How to Train a LTX-2 Character LoRA](https://ghost.oxen.ai/how-to-train-a-ltx-2-character-lora-with-oxen-ai/) (Oxen.ai) — Character-consistency LoRA training with dataset prep tips for audio clips
+
+**Cloud Platforms**
+- [fal.ai LTX-2 Trainer](https://fal.ai/models/fal-ai/ltx2-video-trainer) — Cloud-based LTX-2 LoRA training via API (~$0.005/step)
+- [WaveSpeedAI LTX-2](https://wavespeed.ai/landing/ltx2) — Hosted LTX-2 inference (T2V, I2V, video extend, lipsync)
 

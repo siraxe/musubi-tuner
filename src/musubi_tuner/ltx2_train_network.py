@@ -2819,12 +2819,17 @@ class LTX2NetworkTrainer(NetworkTrainer):
             else:
                 h_ratio = tgt_h / ref_h
                 w_ratio = tgt_w / ref_w
-                if abs(h_ratio - w_ratio) > 0.01 or abs(h_ratio - round(h_ratio)) > 0.01:
+                # Relaxed tolerance: allow ~10% variance from exact integer to handle VAE rounding
+                # For IC-LoRA with reference_downscale=2, use resolutions that are multiples of 64 (e.g., 384x640, 512x896)
+                if abs(h_ratio - w_ratio) > 0.15 or abs(h_ratio - round(h_ratio)) > 0.15:
                     raise ValueError(
                         f"Spatial mismatch: latents HxW={tgt_h}x{tgt_w} vs ref_latents HxW={ref_h}x{ref_w}. "
-                        f"Ratios h={h_ratio:.2f} w={w_ratio:.2f} are not consistent integer downscale factors."
+                        f"Ratios h={h_ratio:.2f} w={w_ratio:.2f} are not consistent integer downscale factors. "
+                        f"For IC-LoRA with reference_downscale=2, ensure your dataset resolutions are multiples of 64 "
+                        f"(e.g., 384x640, 512x768, 512x896). Set resolution in dataset config or use fixed resolution."
                     )
-                reference_downscale_factor = round(h_ratio)
+                # Use average ratio to handle minor rounding differences
+                reference_downscale_factor = round((h_ratio + w_ratio) / 2)
 
         if self._ltx_mode == "audio":
             audio_latents = batch.get("audio_latents")
@@ -3176,8 +3181,9 @@ class LTX2NetworkTrainer(NetworkTrainer):
         caption_channels = getattr(transformer, "caption_channels", None)
         if caption_channels is None:
             base_model = transformer.model if hasattr(transformer, "model") else transformer
-            if hasattr(base_model, "caption_projection"):
-                caption_channels = getattr(getattr(base_model, "caption_projection", None), "in_features", None)
+            _caption_proj = getattr(base_model, "caption_projection", None)
+            if _caption_proj is not None:
+                caption_channels = getattr(getattr(_caption_proj, "linear_1", None), "in_features", None)
         if caption_channels is not None:
             expected_last_dim = int(caption_channels) * (2 if audio_enabled_for_batch else 1)
             if text_embeds.shape[-1] != expected_last_dim:
@@ -3187,7 +3193,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
                     and audio_regularizer_active
                     and text_embeds.shape[-1] * 2 == expected_last_dim
                 ):
-                    text_embeds = torch.cat([text_embeds, text_embeds], dim=-1)
+                    text_embeds = torch.cat([text_embeds, torch.zeros_like(text_embeds)], dim=-1)
                     expected_last_dim = text_embeds.shape[-1]
                 else:
                     raise ValueError(
@@ -3200,6 +3206,14 @@ class LTX2NetworkTrainer(NetworkTrainer):
                     f"Text embedding dim mismatch for {'LTXAV' if self._audio_video else 'LTXV'}: "
                     f"got {text_embeds.shape[-1]}, expected {expected_last_dim}. "
                     f"(caption_channels={caption_channels})"
+                )
+
+        if self._ltx_mode == "video" and bool(getattr(base_model, "caption_proj_before_connector", False)):
+            if expected_video_dim > 0 and int(text_embeds.shape[-1]) != expected_video_dim:
+                raise ValueError(
+                    f"Video mode received text embeddings with incompatible hidden size for this checkpoint. "
+                    f"Expected dim={expected_video_dim}, got dim={text_embeds.shape[-1]}. "
+                    "Ensure text encoder caches were generated with the same --ltx2_checkpoint."
                 )
 
         if self._ltx_mode == "av" and bool(getattr(base_model, "caption_proj_before_connector", False)):
@@ -5206,12 +5220,14 @@ class LTX2NetworkTrainer(NetworkTrainer):
         else:
             h_ratio = tgt_height / ref_height
             w_ratio = tgt_width / ref_width
-            if abs(h_ratio - w_ratio) > 0.01 or abs(h_ratio - round(h_ratio)) > 0.01:
+            # Relaxed tolerance: allow ~10% variance from exact integer to handle VAE rounding
+            if abs(h_ratio - w_ratio) > 0.15 or abs(h_ratio - round(h_ratio)) > 0.15:
                 raise ValueError(
                     f"V2V spatial mismatch: target HxW={tgt_height}x{tgt_width} vs ref HxW={ref_height}x{ref_width}. "
-                    f"Ratios h={h_ratio:.2f} w={w_ratio:.2f} are not consistent integer downscale factors."
+                    f"Ratios h={h_ratio:.2f} w={w_ratio:.2f} are not consistent integer downscale factors. "
+                    f"For IC-LoRA with reference_downscale=2, ensure your sampling resolutions are multiples of 64."
                 )
-            reference_downscale_factor = round(h_ratio)
+            reference_downscale_factor = round((h_ratio + w_ratio) / 2)
 
         # Patchify reference tokens (constant across denoising steps)
         ref_tokens = patchifier.patchify(v2v_ref_latents)  # [B, ref_seq, D]
@@ -5678,6 +5694,44 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
             "'full' = all linear layers. "
             "Can be overridden by --network_args include_patterns=..."
         ),
+    )
+    parser.add_argument(
+        "--ic_lora_strategy",
+        type=str,
+        default=None,
+        choices=["auto", "none", "t2v", "v2v", "audio_ref_only_ic"],
+        help=(
+            "IC-LoRA strategy (independent of lora_target_preset): "
+            "'auto' = infer from preset (t2v->t2v, v2v->v2v, audio->audio_ref_only_ic), "
+            "'none' = disable IC-LoRA, "
+            "'v2v' = video-reference IC-LoRA, "
+            "'audio_ref_only_ic' = audio-reference IC-LoRA (requires --ltx2_mode av). "
+            "Defaults to 'auto' if not specified."
+        ),
+    )
+    parser.add_argument(
+        "--audio_ref_use_negative_positions",
+        action="store_true",
+        default=False,
+        help="Use negative positions for audio reference in IC-LoRA (audio_ref_only_ic mode).",
+    )
+    parser.add_argument(
+        "--audio_ref_mask_cross_attention_to_reference",
+        action="store_true",
+        default=False,
+        help="Mask cross-attention to reference audio in IC-LoRA (audio_ref_only_ic mode).",
+    )
+    parser.add_argument(
+        "--audio_ref_mask_reference_from_text_attention",
+        action="store_true",
+        default=False,
+        help="Mask reference audio from text attention in IC-LoRA (audio_ref_only_ic mode).",
+    )
+    parser.add_argument(
+        "--audio_ref_identity_guidance_scale",
+        type=float,
+        default=0.0,
+        help="Identity guidance scale for audio reference in IC-LoRA (audio_ref_only_ic mode).",
     )
     parser.add_argument(
         "--separate_audio_buckets",
