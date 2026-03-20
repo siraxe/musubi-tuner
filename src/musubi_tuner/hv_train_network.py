@@ -585,12 +585,21 @@ class NetworkTrainer:
                     logs[f"lr/d*eff_lr/{lr_desc}"] = optimizer.param_groups[i]["d"] * optimizer.param_groups[i]["effective_lr"]
 
             if args.optimizer_type.lower() == "automagic" and optimizer is not None:
-                logs[f"lr/automagic_avg"] = optimizer.get_avg_learning_rate()
-                lr_tensor = optimizer.get_lr_tensor()
-                if lr_tensor is not None and len(lr_tensor) > 1:
-                    logs["lr/automagic_min"] = float(lr_tensor.min())
-                    logs["lr/automagic_max"] = float(lr_tensor.max())
-                    logs["lr/automagic_std"] = float(lr_tensor.std())
+                # Handle wrapped optimizer (AcceleratedOptimizer)
+                actual_optimizer = optimizer
+                if hasattr(optimizer, "optimizer"):
+                    actual_optimizer = optimizer.optimizer
+                elif hasattr(optimizer, "_optimizer"):
+                    actual_optimizer = optimizer._optimizer
+
+                if hasattr(actual_optimizer, "get_avg_learning_rate"):
+                    logs[f"lr/automagic_avg"] = actual_optimizer.get_avg_learning_rate()
+                if hasattr(actual_optimizer, "get_lr_tensor"):
+                    lr_tensor = actual_optimizer.get_lr_tensor()
+                    if lr_tensor is not None and len(lr_tensor) > 1:
+                        logs["lr/automagic_min"] = float(lr_tensor.min())
+                        logs["lr/automagic_max"] = float(lr_tensor.max())
+                        logs["lr/automagic_std"] = float(lr_tensor.std())
 
         return logs
 
@@ -3436,14 +3445,22 @@ class NetworkTrainer:
 
                     # Log automagic LR histogram directly to tracker
                     if args.optimizer_type.lower() == "automagic" and optimizer is not None:
-                        lr_tensor = optimizer.get_lr_tensor()
-                        if lr_tensor is not None and lr_tensor.mean() > 0:
-                            for tracker in accelerator.trackers:
-                                if tracker.name == "tensorboard":
-                                    tracker.writer.add_histogram("lr/automagic_lrs", lr_tensor, global_step)
-                                elif tracker.name == "wandb":
-                                    import wandb
-                                    tracker.log({"lr/automagic_lrs": wandb.Histogram(lr_tensor.cpu().numpy())}, step=global_step)
+                        # Handle wrapped optimizer (AcceleratedOptimizer)
+                        actual_optimizer = optimizer
+                        if hasattr(optimizer, "optimizer"):
+                            actual_optimizer = optimizer.optimizer
+                        elif hasattr(optimizer, "_optimizer"):
+                            actual_optimizer = optimizer._optimizer
+
+                        if hasattr(actual_optimizer, "get_lr_tensor"):
+                            lr_tensor = actual_optimizer.get_lr_tensor()
+                            if lr_tensor is not None and lr_tensor.mean() > 0:
+                                for tracker in accelerator.trackers:
+                                    if tracker.name == "tensorboard":
+                                        tracker.writer.add_histogram("lr/automagic_lrs", lr_tensor, global_step)
+                                    elif tracker.name == "wandb":
+                                        import wandb
+                                        tracker.log({"lr/automagic_lrs": wandb.Histogram(lr_tensor.cpu().numpy())}, step=global_step)
 
                 # GUI dashboard per-step metrics
                 if gui_metrics is not None:
