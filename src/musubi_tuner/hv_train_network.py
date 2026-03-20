@@ -2577,7 +2577,47 @@ class NetworkTrainer:
         num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
 
         # resume from local or huggingface — must be after num_update_steps_per_epoch is known
-        initial_global_step = self.resume_from_local_or_hf_if_specified(accelerator, args)
+        initial_global_step = 0
+        if args.resume:
+            reset_optimizer = getattr(args, "reset_optimizer", False)
+            reset_optimizer_params = getattr(args, "reset_optimizer_params", False)
+
+            if reset_optimizer:
+                # Load only model and scheduler, skip optimizer to avoid param group mismatch
+                logger.info(f"resume training from local state (skipping optimizer): {args.resume}")
+
+                # Load random states
+                random_path = os.path.join(args.resume, "random_states.pth")
+                if os.path.exists(random_path):
+                    random_state = torch.load(random_path)
+                    if random_state:
+                        random.setstate(random_state.get("python", None))
+                        if hasattr(torch, "cuda"):
+                            torch.cuda.set_rng_state_all(random_state.get("cuda", None))
+                        np.random.set_state(random_state.get("numpy", None))
+
+                # Load model state manually (skip optimizer)
+                model_path = os.path.join(args.resume, "pytorch_model.bin")
+                if os.path.exists(model_path):
+                    state_dict = torch.load(model_path, map_location="cpu")
+                    # Get the unwrapped model to load state
+                    unwrapped_model = accelerator.unwrap_model(network)
+                    unwrapped_model.load_state_dict(state_dict)
+                    accelerator.print(f"loaded model state from {model_path}")
+
+                # Load scheduler state
+                scheduler_path = os.path.join(args.resume, "scheduler.bin")
+                if os.path.exists(scheduler_path):
+                    scheduler_state = torch.load(scheduler_path, map_location="cpu")
+                    if isinstance(scheduler_state, dict) and "state" in scheduler_state:
+                        lr_scheduler.load_state_dict(scheduler_state)
+                        accelerator.print(f"loaded scheduler state from {scheduler_path}")
+
+                initial_global_step = self._recover_global_step(args.resume)
+                accelerator.print(f"resumed from step {initial_global_step} (optimizer state reset)")
+            else:
+                initial_global_step = self.resume_from_local_or_hf_if_specified(accelerator, args)
+
         epoch_to_start = initial_global_step // num_update_steps_per_epoch if initial_global_step > 0 else 0
 
         # 学習する
@@ -4126,6 +4166,16 @@ def setup_parser_common() -> argparse.ArgumentParser:
         help="base name of trained model file / 学習後のモデルの拡張子を除くファイル名",
     )
     parser.add_argument("--resume", type=str, default=None, help="saved state to resume training / 学習再開するモデルのstate")
+    parser.add_argument(
+        "--reset_optimizer",
+        action="store_true",
+        help="clear optimizer state (momentum/variance) when resuming, keeping only model weights",
+    )
+    parser.add_argument(
+        "--reset_optimizer_params",
+        action="store_true",
+        help="reset optimizer param groups (lr, weight_decay, etc.) to CLI values when resuming, keeping momentum/variance",
+    )
 
     parser.add_argument(
         "--save_every_n_epochs",
