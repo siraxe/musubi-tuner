@@ -2000,12 +2000,23 @@ class NetworkTrainer:
         audio_loss_balance_eps = float(getattr(args, "audio_loss_balance_eps", 0.05))
         audio_loss_balance_min = float(getattr(args, "audio_loss_balance_min", 0.05))
         audio_loss_balance_max = float(getattr(args, "audio_loss_balance_max", 4.0))
-        audio_presence_ema = float(getattr(args, "audio_loss_balance_ema_init", 1.0))
-        audio_presence_ema = min(max(audio_presence_ema, 1e-6), 1.0)
         audio_loss_balance_target_ratio = float(getattr(args, "audio_loss_balance_target_ratio", 0.33))
         audio_loss_balance_ema_decay = float(getattr(args, "audio_loss_balance_ema_decay", 0.99))
-        audio_loss_ema = max(float(getattr(args, "audio_loss_balance_ema_init", 1.0)), 1e-6)
-        video_loss_ema = max(float(getattr(args, "audio_loss_balance_ema_init", 1.0)), 1e-6)
+
+        # EMA state container for persistence across resumes
+        class EMAState:
+            def __init__(self):
+                self.audio_presence_ema = float(getattr(args, "audio_loss_balance_ema_init", 1.0))
+                self.audio_presence_ema = min(max(self.audio_presence_ema, 1e-6), 1.0)
+                self.audio_loss_ema = max(float(getattr(args, "audio_loss_balance_ema_init", 1.0)), 1e-6)
+                self.video_loss_ema = max(float(getattr(args, "audio_loss_balance_ema_init", 1.0)), 1e-6)
+
+        ema_state = EMAState()
+
+        # For backward compatibility with existing code
+        audio_presence_ema = ema_state.audio_presence_ema
+        audio_loss_ema = ema_state.audio_loss_ema
+        video_loss_ema = ema_state.video_loss_ema
         if audio_loss_balance_mode == "inv_freq":
             logger.info(
                 "Audio inverse-frequency weighting enabled: beta=%.4f eps=%.4f min=%.4f max=%.4f ema_init=%.4f",
@@ -2544,6 +2555,20 @@ class NetworkTrainer:
                     except Exception as e:
                         logger.warning(f"Failed to save Self-Flow projector to state dir: {e}")
 
+                # Save EMA state for loss balancing persistence across resumes
+                try:
+                    ema_state_data = {
+                        "audio_loss_ema": ema_state.audio_loss_ema,
+                        "video_loss_ema": ema_state.video_loss_ema,
+                        "audio_presence_ema": ema_state.audio_presence_ema,
+                    }
+                    ema_file = os.path.join(output_dir, "ema_state.json")
+                    with open(ema_file, "w") as f:
+                        json.dump(ema_state_data, f, indent=2)
+                    logger.debug(f"Saved EMA state to {ema_file}: {ema_state_data}")
+                except Exception as e:
+                    logger.warning(f"Failed to save EMA state: {e}")
+
         def load_model_hook(models, input_dir):
             # remove models except network
             remove_indices = []
@@ -2569,6 +2594,23 @@ class NetworkTrainer:
                         logger.info("Self-Flow: loaded EMA teacher state from %s", teacher_file)
                 except Exception as e:
                     logger.warning(f"Failed to load Self-Flow state from checkpoint dir: {e}")
+
+            # Load EMA state for loss balancing persistence across resumes
+            try:
+                ema_file = os.path.join(input_dir, "ema_state.json")
+                if os.path.exists(ema_file):
+                    with open(ema_file, "r") as f:
+                        ema_state_data = json.load(f)
+                    ema_state.audio_loss_ema = ema_state_data.get("audio_loss_ema", ema_state.audio_loss_ema)
+                    ema_state.video_loss_ema = ema_state_data.get("video_loss_ema", ema_state.video_loss_ema)
+                    ema_state.audio_presence_ema = ema_state_data.get("audio_presence_ema", ema_state.audio_presence_ema)
+                    # Update local vars for backward compatibility
+                    audio_loss_ema = ema_state.audio_loss_ema
+                    video_loss_ema = ema_state.video_loss_ema
+                    audio_presence_ema = ema_state.audio_presence_ema
+                    logger.info(f"Loaded EMA state from {ema_file}: audio_loss_ema={audio_loss_ema:.4f}, video_loss_ema={video_loss_ema:.4f}, audio_presence_ema={audio_presence_ema:.4f}")
+            except Exception as e:
+                logger.warning(f"Failed to load EMA state from checkpoint dir: {e}")
 
         accelerator.register_save_state_pre_hook(save_model_hook)
         accelerator.register_load_state_pre_hook(load_model_hook)
@@ -2614,10 +2656,34 @@ class NetworkTrainer:
                         lr_scheduler.load_state_dict(scheduler_state)
                         accelerator.print(f"loaded scheduler state from {scheduler_path}")
 
+                # Load EMA state for loss balancing persistence
+                ema_path = os.path.join(args.resume, "ema_state.json")
+                if os.path.exists(ema_path):
+                    try:
+                        with open(ema_path, "r") as f:
+                            ema_state_data = json.load(f)
+                        ema_state.audio_loss_ema = ema_state_data.get("audio_loss_ema", ema_state.audio_loss_ema)
+                        ema_state.video_loss_ema = ema_state_data.get("video_loss_ema", ema_state.video_loss_ema)
+                        ema_state.audio_presence_ema = ema_state_data.get("audio_presence_ema", ema_state.audio_presence_ema)
+                        # Update local vars for backward compatibility
+                        audio_loss_ema = ema_state.audio_loss_ema
+                        video_loss_ema = ema_state.video_loss_ema
+                        audio_presence_ema = ema_state.audio_presence_ema
+                        accelerator.print(f"loaded EMA state from {ema_path}: audio_loss_ema={audio_loss_ema:.4f}, video_loss_ema={video_loss_ema:.4f}, audio_presence_ema={audio_presence_ema:.4f}")
+                    except Exception as e:
+                        accelerator.print(f"warning: failed to load EMA state: {e}")
+
                 initial_global_step = self._recover_global_step(args.resume)
                 accelerator.print(f"resumed from step {initial_global_step} (optimizer state reset)")
             else:
                 initial_global_step = self.resume_from_local_or_hf_if_specified(accelerator, args)
+
+        # Sync local vars after resume (in case EMA state was loaded via load_model_hook)
+        audio_loss_ema = ema_state.audio_loss_ema
+        video_loss_ema = ema_state.video_loss_ema
+        audio_presence_ema = ema_state.audio_presence_ema
+        if initial_global_step > 0 and audio_loss_balance_mode != "none":
+            accelerator.print(f"EMA loss balancing state: audio_loss_ema={audio_loss_ema:.4f}, video_loss_ema={video_loss_ema:.4f}, audio_presence_ema={audio_presence_ema:.4f}")
 
         epoch_to_start = initial_global_step // num_update_steps_per_epoch if initial_global_step > 0 else 0
 
@@ -3204,6 +3270,7 @@ class NetworkTrainer:
                                 loss_value=video_loss_item,
                                 ema_decay=audio_loss_balance_ema_decay,
                             )
+                            ema_state.video_loss_ema = video_loss_ema
                             video_loss_ema_value = video_loss_ema
                         # Capture video loss for logging (only if weight > 0)
                         if video_weight > 0:
@@ -3219,6 +3286,7 @@ class NetworkTrainer:
                                 balance_beta=audio_loss_balance_beta,
                                 has_audio_loss=has_audio_loss,
                             )
+                            ema_state.audio_presence_ema = audio_presence_ema
                             audio_presence_ema_value = audio_presence_ema
                         if has_audio_loss:
                             audio_loss = _masked_loss(audio_pred, audio_target, audio_loss_mask)
@@ -3238,6 +3306,7 @@ class NetworkTrainer:
                                     loss_value=audio_loss_item,
                                     ema_decay=audio_loss_balance_ema_decay,
                                 )
+                                ema_state.audio_loss_ema = audio_loss_ema
                                 audio_loss_ema_value = audio_loss_ema
                                 audio_weight = compute_ema_magnitude_audio_weight(
                                     base_audio_weight=audio_weight,
