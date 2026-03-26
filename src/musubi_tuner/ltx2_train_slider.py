@@ -1695,7 +1695,17 @@ class LTX2SliderTrainer:
                 accelerator.log(logs, step=global_step)
 
             # Sampling
-            should_sampling = should_sample_images(args, global_step, epoch=current_epoch)
+            # For --sample_at_first: skip sampling at epoch 0 if sample_at_first is False
+            # (Same check as normal training to avoid buggy should_sample_images behavior)
+            if current_epoch == 0 and not getattr(args, "sample_at_first", False):
+                should_sampling = False
+            else:
+                # Check step-based sampling
+                should_sampling = should_sample_images(args, global_step, epoch=None)  # Pass None to skip epoch check
+                # Handle epoch-based sampling separately: only sample on first step of qualifying epochs
+                if not should_sampling and getattr(args, "sample_every_n_epochs", None) is not None:
+                    if current_epoch % args.sample_every_n_epochs == 0 and steps_in_current_epoch == 0:
+                        should_sampling = True
             should_saving_steps = (
                 getattr(args, "save_every_n_steps", None) is not None
                 and global_step % args.save_every_n_steps == 0
