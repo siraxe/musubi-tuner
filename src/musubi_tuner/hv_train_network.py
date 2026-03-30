@@ -3605,9 +3605,40 @@ class NetworkTrainer:
                                         import wandb
                                         tracker.log({"lr/automagic_lrs": wandb.Histogram(lr_tensor.cpu().numpy())}, step=global_step)
 
+                    # Log schedulefree optimizer LR
+                    if optimizer is not None and "schedulefree" in args.optimizer_type.lower():
+                        # Handle wrapped optimizer (AcceleratedOptimizer)
+                        actual_optimizer = optimizer
+                        if hasattr(optimizer, "optimizer"):
+                            actual_optimizer = optimizer.optimizer
+                        elif hasattr(optimizer, "_optimizer"):
+                            actual_optimizer = optimizer._optimizer
+
+                        # schedulefree stores scheduled_lr in param_groups
+                        if hasattr(actual_optimizer, "param_groups") and len(actual_optimizer.param_groups) > 0:
+                            scheduled_lr = actual_optimizer.param_groups[0].get("scheduled_lr")
+                            if scheduled_lr is not None:
+                                for tracker in accelerator.trackers:
+                                    if tracker.name == "tensorboard":
+                                        tracker.writer.add_scalar("lr", scheduled_lr, global_step)
+                                    elif tracker.name == "wandb":
+                                        import wandb
+                                        tracker.log({"lr": scheduled_lr}, step=global_step)
+
                 # GUI dashboard per-step metrics
                 if gui_metrics is not None:
                     step_time = time.perf_counter() - _step_start_time
+                    # Get current LR for GUI metrics
+                    if "schedulefree" in args.optimizer_type.lower() and optimizer is not None:
+                        actual_optimizer = optimizer
+                        if hasattr(optimizer, "optimizer"):
+                            actual_optimizer = optimizer.optimizer
+                        elif hasattr(optimizer, "_optimizer"):
+                            actual_optimizer = optimizer._optimizer
+                        current_lr = actual_optimizer.param_groups[0].get("scheduled_lr", 0.0) if hasattr(actual_optimizer, "param_groups") else 0.0
+                    else:
+                        current_lr = lr_scheduler.get_last_lr()[0] if lr_scheduler else 0.0
+
                     gui_metrics.log(
                         step=global_step,
                         epoch=epoch,
@@ -3615,7 +3646,7 @@ class NetworkTrainer:
                         avr_loss=avr_loss,
                         loss_v=video_loss_value,
                         loss_a=audio_loss_value,
-                        lr=lr_scheduler.get_last_lr()[0],
+                        lr=current_lr,
                         step_time=step_time,
                     )
                     gui_metrics.update_status(step=global_step, status="training")
