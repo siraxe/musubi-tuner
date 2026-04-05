@@ -3259,6 +3259,8 @@ class VideoDataset(BaseDataset):
         self.cache_only = cache_only
 
         self.vae_frame_stride = 4  # all architectures require frames to be divisible by 4
+        if self.architecture == ARCHITECTURE_FRAMEPACK:
+            self.vae_frame_stride = 8  # FramePack VAE has temporal stride of 8 (produces n*8+1 frames)
         if self.architecture == ARCHITECTURE_HUNYUAN_VIDEO:
             self.target_fps = VideoDataset.TARGET_FPS_HUNYUAN
         elif self.architecture == ARCHITECTURE_WAN:

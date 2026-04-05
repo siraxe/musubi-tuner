@@ -57,13 +57,13 @@ def encode_and_save_batch(
         item = batch[0]  # other items should have the same size
         raise ValueError(f"Image or video size too small: {item.item_key} and {len(batch) - 1} more, size: {item.original_size}")
 
-    # calculate latent frame count from original frame count (4n+1)
-    latent_f = (batch[0].frame_count - 1) // 4 + 1
+    # calculate latent frame count from original frame count (8n+1)
+    latent_f = (batch[0].frame_count - 1) // 8 + 1
 
     # calculate the total number of sections (excluding the first frame, divided by window size)
     total_latent_sections = math.floor((latent_f - 1) / latent_window_size)
     if total_latent_sections < 1:
-        min_frames_needed = latent_window_size * 4 + 1
+        min_frames_needed = latent_window_size * 8 + 1
         raise ValueError(
             f"Not enough frames for FramePack: {batch[0].frame_count} frames ({latent_f} latent frames), minimum required: {min_frames_needed} frames ({latent_window_size + 1} latent frames)"
         )
@@ -72,7 +72,7 @@ def encode_and_save_batch(
     latent_f_aligned = total_latent_sections * latent_window_size + 1 if not one_frame else 1
 
     # actual video frame count
-    frame_count_aligned = (latent_f_aligned - 1) * 4 + 1
+    frame_count_aligned = (latent_f_aligned - 1) * 8 + 1
     if frame_count_aligned != batch[0].frame_count:
         logger.info(
             f"Frame count mismatch: required={frame_count_aligned} != actual={batch[0].frame_count}, trimming to {frame_count_aligned}"
@@ -461,7 +461,7 @@ def encode_datasets_framepack(datasets: list[BaseDataset], encode: callable, arg
                     all_latent_cache_paths.append(item.latent_cache_path)
                     all_existing = os.path.exists(item.latent_cache_path)
                 else:
-                    latent_f = (item.frame_count - 1) // 4 + 1
+                    latent_f = (item.frame_count - 1) // 8 + 1
                     num_sections = max(1, math.floor((latent_f - 1) / item.fp_latent_window_size))  # min 1 section
                     all_existing = True
                     for sec in range(num_sections):

@@ -165,7 +165,7 @@ def extract_frames(
     frame_stride: int = 1,
     frame_sample: int = 1,
     max_frames: int = 128,
-    vae_frame_stride: int = 4,
+    vae_frame_stride: int = 8,
 ) -> List[Tuple[int, int, np.ndarray]]:
     """Extract frame chunks from video based on frame_extraction mode.
 
@@ -572,7 +572,7 @@ def process_single_video_create_negative_mp4(
     frame_stride: int = 1,
     frame_sample: int = 1,
     max_frames: int = 128,
-    vae_frame_stride: int = 4,
+    vae_frame_stride: int = 8,
     control_args: Optional[List[str]] = None,
 ) -> List[str]:
     """Step 1: Create negative/control MP4 videos from source video.
@@ -782,7 +782,7 @@ def process_single_video_i2v(
     frame_stride: int = 1,
     frame_sample: int = 1,
     max_frames: int = 128,
-    vae_frame_stride: int = 4,
+    vae_frame_stride: int = 8,
     control_args: Optional[List[str]] = None,
     bucket_selector: BucketSelector = None,
 ) -> None:
@@ -922,7 +922,7 @@ def process_video_directory_i2v(
     frame_stride: int = 1,
     frame_sample: int = 1,
     max_frames: int = 128,
-    vae_frame_stride: int = 4,
+    vae_frame_stride: int = 8,
     control_args: Optional[List[str]] = None,
     bucket_selector: BucketSelector = None,
 ) -> None:
