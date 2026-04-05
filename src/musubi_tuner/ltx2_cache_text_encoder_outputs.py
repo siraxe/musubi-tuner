@@ -84,6 +84,59 @@ def encode_and_save_batch_official_gemma(
             )
 
 
+def encode_and_save_batch_pre_connector(
+    text_encoder,
+    batch: list[ItemInfo],
+    *,
+    device: torch.device,
+    autocast_dtype: torch.dtype | None,
+    audio_video: bool,
+) -> None:
+    """Encode and save with both pre-connector features and post-connector embeddings.
+
+    Calls _preprocess_text() to get pre-connector features, then _run_connectors()
+    to get standard embeddings. Both are saved in the same cache file.
+    """
+    if autocast_dtype is not None and device.type == "cuda":
+        autocast_context = torch.amp.autocast("cuda", dtype=autocast_dtype)
+    else:
+        autocast_context = nullcontext()
+
+    with torch.no_grad(), autocast_context:
+        for item in batch:
+            # Phase 1: Gemma + feature extractor (pre-connector)
+            projected, attention_mask = text_encoder._preprocess_text(item.caption, padding_side="left")
+
+            if isinstance(projected, tuple):
+                video_feat, audio_feat = projected
+            else:
+                video_feat, audio_feat = projected, None
+
+            # Phase 2: run connectors for standard embeddings
+            if audio_video:
+                video_embed, audio_embed, mask = text_encoder._run_connectors(projected, attention_mask)
+            else:
+                video_embed, mask = text_encoder._run_connector(projected, attention_mask)
+                audio_embed = None
+
+            # Squeeze batch dim and detach
+            video_embed = video_embed.squeeze(0).detach().cpu()
+            mask = mask.squeeze(0).detach().cpu()
+            audio_embed_out = audio_embed.squeeze(0).detach().cpu() if audio_embed is not None else None
+
+            video_feat_out = video_feat.squeeze(0).detach().cpu()
+            audio_feat_out = audio_feat.squeeze(0).detach().cpu() if audio_feat is not None else None
+
+            save_text_encoder_output_cache_ltx2_official(
+                item,
+                video_prompt_embeds=video_embed,
+                audio_prompt_embeds=audio_embed_out,
+                prompt_attention_mask=mask,
+                video_features=video_feat_out,
+                audio_features=audio_feat_out,
+            )
+
+
 def _encode_prompt_text_ltx2(
     text_encoder,
     prompt_text: str,
@@ -677,6 +730,63 @@ def _precache_preservation_prompts(
     logger.info("Saved preservation prompt cache to %s", cache_path)
 
 
+def _precache_preservation_prompts(
+    args: argparse.Namespace,
+    *,
+    datasets: list,
+    text_encoder,
+    audio_video: bool,
+    autocast_dtype: torch.dtype | None,
+    device: torch.device,
+) -> None:
+    """Encode blank/class prompts for preservation techniques and save to disk."""
+    blank = getattr(args, "blank_preservation", False)
+    dop = getattr(args, "dop", False)
+    dop_class = getattr(args, "dop_class_prompt", "") or ""
+
+    if not blank and not dop:
+        logger.warning("--precache_preservation_prompts set but neither --blank_preservation nor --dop enabled, skipping.")
+        return
+
+    cache_path = getattr(args, "preservation_prompts_cache", None)
+    if not cache_path:
+        if not datasets:
+            raise ValueError("No datasets available to resolve preservation cache directory")
+        cache_dir = getattr(datasets[0], "cache_directory", None)
+        if not cache_dir:
+            raise ValueError("First dataset has no cache_directory; set cache_directory in dataset config")
+        cache_path = os.path.join(cache_dir, DEFAULT_PRESERVATION_CACHE)
+
+    payload: dict = {"version": 1, "audio_video": audio_video}
+
+    # Always encode as video-only for preservation (even in AV mode)
+    def _encode_video_only(prompt_text: str) -> tuple[torch.Tensor, torch.Tensor]:
+        embed, mask = _encode_prompt_text_ltx2(
+            text_encoder, prompt_text,
+            audio_video=audio_video, ltx_mode="video",  # force video-only encoding
+            autocast_dtype=autocast_dtype, device=device,
+        )
+        return embed, mask
+
+    if blank:
+        embed, mask = _encode_video_only("")
+        payload["blank_embed"] = embed
+        payload["blank_mask"] = mask
+        logger.info("Preservation cache: encoded blank prompt  embed=%s", tuple(embed.shape))
+
+    if dop:
+        if not dop_class:
+            logger.warning("--dop set but no --dop_class_prompt provided, encoding empty string.")
+        embed, mask = _encode_video_only(dop_class)
+        payload["dop_embed"] = embed
+        payload["dop_mask"] = mask
+        payload["dop_class_prompt"] = dop_class
+        logger.info("Preservation cache: encoded DOP class prompt %r  embed=%s", dop_class, tuple(embed.shape))
+
+    torch.save(payload, cache_path)
+    logger.info("Saved preservation prompt cache to %s", cache_path)
+
+
 def main() -> None:
     parser = cache_text_encoder_outputs.setup_parser_common()
     parser = ltx2_setup_parser(parser)
@@ -803,14 +913,25 @@ def main() -> None:
             f"meta_params={meta_params[:10]} meta_bufs={meta_bufs[:10]}"
         )
 
+    cache_before_connector = bool(getattr(args, "cache_before_connector", False))
+
     def encode_fn(batch: list[ItemInfo]) -> None:
-        encode_and_save_batch_official_gemma(
-            text_encoder,
-            batch,
-            device=device,
-            autocast_dtype=autocast_dtype,
-            audio_video=audio_video,
-        )
+        if cache_before_connector:
+            encode_and_save_batch_pre_connector(
+                text_encoder,
+                batch,
+                device=device,
+                autocast_dtype=autocast_dtype,
+                audio_video=audio_video,
+            )
+        else:
+            encode_and_save_batch_official_gemma(
+                text_encoder,
+                batch,
+                device=device,
+                autocast_dtype=autocast_dtype,
+                audio_video=audio_video,
+            )
 
     # Text caching is CPU-heavy (tokenization, python-side preprocessing). On Windows, high num_workers
     # often hurts throughput or appears to hang due to thread contention. Default to 1 unless specified.
@@ -829,6 +950,16 @@ def main() -> None:
         # When only precaching sample prompts, skip dataset item caching
         logger.info("Sample prompts precaching complete. Skipping dataset item caching.")
         return
+
+    if getattr(args, "precache_preservation_prompts", False):
+        _precache_preservation_prompts(
+            args,
+            datasets=datasets,
+            text_encoder=text_encoder,
+            audio_video=audio_video,
+            autocast_dtype=autocast_dtype,
+            device=device,
+        )
 
     if getattr(args, "precache_preservation_prompts", False):
         _precache_preservation_prompts(
@@ -1046,6 +1177,12 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         default=None,
         choices=["float32", "float16", "bfloat16"],
         help="Data type for VAE encoder when caching start_images latents.",
+    )
+    parser.add_argument(
+        "--cache_before_connector",
+        action="store_true",
+        help="Also cache pre-connector features (for --train_connectors training). "
+        "Saves both pre-connector features and standard post-connector embeddings.",
     )
     return parser
 

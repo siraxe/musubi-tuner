@@ -534,6 +534,8 @@ def save_text_encoder_output_cache_ltx2_official(
     video_prompt_embeds: torch.Tensor,
     prompt_attention_mask: torch.Tensor,
     audio_prompt_embeds: Optional[torch.Tensor] = None,
+    video_features: Optional[torch.Tensor] = None,
+    audio_features: Optional[torch.Tensor] = None,
 ):
     assert video_prompt_embeds.dim() == 1 or video_prompt_embeds.dim() == 2, (
         f"video_prompt_embeds should be 2D tensor (feature, hidden_size) or (hidden_size,), got {video_prompt_embeds.shape}"
@@ -554,6 +556,12 @@ def save_text_encoder_output_cache_ltx2_official(
         sd[f"audio_prompt_embeds_{dtype_str}"] = audio_prompt_embeds.detach().cpu()
     if prompt_attention_mask is not None:
         sd["prompt_attention_mask"] = prompt_attention_mask.detach().cpu()
+
+    # Pre-connector features for --train_connectors training
+    if video_features is not None:
+        sd[f"video_features_{dtype_str}"] = video_features.detach().cpu()
+    if audio_features is not None:
+        sd[f"audio_features_{dtype_str}"] = audio_features.detach().cpu()
 
     text = video_prompt_embeds
     if audio_prompt_embeds is not None:
@@ -1143,13 +1151,21 @@ class BucketBatchManager:
 
             item_audio_latents = None
             item_audio_lengths = None
+            item_ref_audio_latents = None
+            item_ref_audio_lengths = None
             for key, value in sd.items():
                 if key.startswith("audio_latents_"):
                     item_audio_latents = value
                 elif key.startswith("audio_lengths_"):
                     item_audio_lengths = value
+                elif key.startswith("ref_audio_latents_"):
+                    item_ref_audio_latents = value
+                elif key.startswith("ref_audio_lengths_"):
+                    item_ref_audio_lengths = value
             audio_latents_per_item.append(item_audio_latents)
             audio_lengths_per_item.append(item_audio_lengths)
+            ref_audio_latents_per_item.append(item_ref_audio_latents)
+            ref_audio_lengths_per_item.append(item_ref_audio_lengths)
 
             item_ref_audio_latents = None
             item_ref_audio_lengths = None
@@ -1292,6 +1308,10 @@ class BucketBatchManager:
                     batch_tensor_data["audio_latents"] = torch.stack(padded)
                     batch_tensor_data["audio_lengths"] = torch.tensor(lengths, device=device, dtype=torch.int32)
 
+            else:
+                # Skip allocating placeholder audio tensors when the batch has no audio.
+                pass
+
             present_ref_audio = [x for x in ref_audio_latents_per_item if isinstance(x, torch.Tensor)]
             if present_ref_audio:
                 ref = present_ref_audio[0]
@@ -1379,14 +1399,6 @@ class BucketBatchManager:
                     batch_tensor_data["ref_audio_latents"] = torch.stack(padded_ref)
                     batch_tensor_data["ref_audio_lengths"] = torch.tensor(ref_lengths, device=ref_device, dtype=torch.int32)
 
-            ref_audio_latents_tensor = batch_tensor_data.get("ref_audio_latents")
-            if isinstance(ref_audio_latents_tensor, torch.Tensor) and ref_audio_latents_tensor.dim() == 4:
-                batch_tensor_data["ref_audio_latents"] = {"latents": ref_audio_latents_tensor}
-
-            else:
-                # Skip allocating placeholder audio tensors when the batch has no audio.
-                pass
-
         if self.timestep_pool is not None:
             batch_tensor_data["timesteps"] = self.timestep_pool[idx][: end - start]  # use the pre-generated timesteps
         else:
@@ -1446,6 +1458,10 @@ class BucketBatchManager:
             if isinstance(audio_latents_tensor, torch.Tensor) and audio_latents_tensor.dim() == 4:
                 batch_tensor_data["audio_latents"] = {"latents": audio_latents_tensor}
 
+            ref_audio_latents_tensor = batch_tensor_data.get("ref_audio_latents")
+            if isinstance(ref_audio_latents_tensor, torch.Tensor) and ref_audio_latents_tensor.dim() == 4:
+                batch_tensor_data["ref_audio_latents"] = {"latents": ref_audio_latents_tensor}
+
             video_prompt_embeds = batch_tensor_data.get("video_prompt_embeds")
             audio_prompt_embeds = batch_tensor_data.get("audio_prompt_embeds")
             prompt_attention_mask = batch_tensor_data.get("prompt_attention_mask")
@@ -1457,6 +1473,14 @@ class BucketBatchManager:
                     conditions["audio_prompt_embeds"] = audio_prompt_embeds
                 if isinstance(prompt_attention_mask, torch.Tensor):
                     conditions["prompt_attention_mask"] = prompt_attention_mask
+
+            # Pre-connector features for --train_connectors training
+            video_features = batch_tensor_data.get("video_features")
+            if isinstance(video_features, torch.Tensor):
+                conditions["video_features"] = video_features
+            audio_features = batch_tensor_data.get("audio_features")
+            if isinstance(audio_features, torch.Tensor):
+                conditions["audio_features"] = audio_features
 
             if not conditions:
                 text = batch_tensor_data.get("text")
@@ -2347,17 +2371,6 @@ class BaseDataset(torch.utils.data.Dataset):
             latent_cache_path = self.get_latent_cache_path(item_info)
         return self.get_audio_latent_cache_path_from_latent_cache_path(latent_cache_path)
 
-    def get_reference_audio_latent_cache_path(self, item_info: ItemInfo) -> str:
-        w, h = item_info.original_size
-        basename = os.path.splitext(os.path.basename(item_info.item_key))[0]
-        assert self.reference_audio_cache_directory is not None, (
-            "reference_audio_cache_directory is required / reference_audio_cache_directoryは必須です"
-        )
-        return os.path.join(
-            self.reference_audio_cache_directory,
-            f"{basename}_{w:04d}x{h:04d}_{self.architecture}_audio.safetensors",
-        )
-
     def get_dino_feature_cache_path_from_latent_cache_path(self, latent_cache_path: str) -> str:
         """Derive DINOv2 feature cache path: ``*_ltx2.safetensors`` → ``*_ltx2_dino.safetensors``."""
         base_dir = os.path.dirname(latent_cache_path)
@@ -2407,6 +2420,17 @@ class BaseDataset(torch.utils.data.Dataset):
         return os.path.join(
             self.reference_cache_directory,
             f"{basename}_{w:04d}x{h:04d}_{self.architecture}.safetensors",
+        )
+
+    def get_reference_audio_latent_cache_path(self, item_info: ItemInfo) -> str:
+        w, h = item_info.original_size
+        basename = os.path.splitext(os.path.basename(item_info.item_key))[0]
+        assert self.reference_audio_cache_directory is not None, (
+            "reference_audio_cache_directory is required / reference_audio_cache_directoryは必須です"
+        )
+        return os.path.join(
+            self.reference_audio_cache_directory,
+            f"{basename}_{w:04d}x{h:04d}_{self.architecture}_audio.safetensors",
         )
 
     def get_text_encoder_output_cache_path(self, item_info: ItemInfo) -> str:
@@ -2916,7 +2940,6 @@ class AudioDataset(BaseDataset):
         audio_jsonl_file: Optional[str] = None,
         cache_directory: Optional[str] = None,
         reference_cache_directory: Optional[str] = None,
-        reference_audio_directory: Optional[str] = None,
         reference_audio_cache_directory: Optional[str] = None,
         separate_audio_buckets: bool = False,
         cache_only: bool = False,
@@ -2990,7 +3013,7 @@ class AudioDataset(BaseDataset):
         suffix = "_0001x0001"
         return item_key[: -len(suffix)] if item_key.endswith(suffix) else item_key
 
-    def retrieve_latent_cache_batches(self, num_workers: int, reference_downscale: int = 1):
+    def retrieve_latent_cache_batches(self, num_workers: int):
         if self.datasource is None:
             raise ValueError("retrieve_latent_cache_batches is not available when cache_only=True")
         executor = ThreadPoolExecutor(max_workers=num_workers)
@@ -3213,6 +3236,7 @@ class VideoDataset(BaseDataset):
         video_jsonl_file: Optional[str] = None,
         control_directory: Optional[str] = None,
         reference_directory: Optional[str] = None,
+        reference_audio_directory: Optional[str] = None,
         cache_directory: Optional[str] = None,
         reference_cache_directory: Optional[str] = None,
         reference_audio_cache_directory: Optional[str] = None,
@@ -3250,6 +3274,7 @@ class VideoDataset(BaseDataset):
         self.video_jsonl_file = video_jsonl_file
         self.control_directory = control_directory
         self.reference_directory = reference_directory
+        self.reference_audio_directory = reference_audio_directory
         self.frame_extraction = frame_extraction
         self.frame_stride = frame_stride
         self.frame_sample = frame_sample
@@ -3453,6 +3478,8 @@ class VideoDataset(BaseDataset):
 
                         if self.reference_cache_directory is not None:
                             item_info.reference_latent_cache_path = self.get_reference_latent_cache_path(item_info)
+                        if self.reference_audio_cache_directory is not None:
+                            item_info.reference_audio_latent_cache_path = self.get_reference_audio_latent_cache_path(item_info)
                         item_info.control_content = cropped_control  # None is allowed
                         item_info.fp_latent_window_size = self.fp_latent_window_size
 
@@ -3572,7 +3599,6 @@ class VideoDataset(BaseDataset):
                 else:
                     logger.warning(f"Reference cache not found, skipping item: {ref_cache_path}")
                     continue
-
             if self.reference_audio_cache_directory is not None:
                 ref_audio_cache_path = os.path.join(
                     self.reference_audio_cache_directory,

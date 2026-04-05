@@ -182,12 +182,19 @@ def _masked_mse(
     *,
     weighting: Optional[torch.Tensor],
     dtype: torch.dtype,
+    loss_type: str = "mse",
+    huber_delta: float = 1.0,
 ) -> torch.Tensor:
     if isinstance(tgt, torch.Tensor):
         pred = pred.to(device=tgt.device, dtype=dtype)
     else:
         pred = pred.to(dtype=dtype)
-    per_elem = torch.nn.functional.mse_loss(pred, tgt, reduction="none")
+    if loss_type in ("mae", "l1"):
+        per_elem = torch.nn.functional.l1_loss(pred, tgt, reduction="none")
+    elif loss_type in ("huber", "smooth_l1"):
+        per_elem = torch.nn.functional.smooth_l1_loss(pred, tgt, reduction="none", beta=huber_delta)
+    else:
+        per_elem = torch.nn.functional.mse_loss(pred, tgt, reduction="none")
     if weighting is not None:
         w = weighting
         if isinstance(w, torch.Tensor) and w.dim() != per_elem.dim():
@@ -470,6 +477,7 @@ def _build_motion_anchor_cache_signature(
         "synthetic_frames": int(getattr(args, "motion_preservation_synthetic_frames", 8) or 8),
         "synthetic_temporal_corr": float(getattr(args, "motion_preservation_synthetic_temporal_corr", 0.92)),
         "synthetic_dataset_mix": float(getattr(args, "motion_preservation_synthetic_dataset_mix", 0.25)),
+        "synthetic_content_seeded": bool(getattr(args, "motion_preservation_synthetic_content_seeded", True)),
         "attention_preservation": bool(use_attn_pres),
         "attention_queries": int(max_queries),
         "attention_keys": int(max_keys),
@@ -873,7 +881,7 @@ def _resolve_motion_anchor_cache_size(args: argparse.Namespace, *, num_train_ite
 
     ratio = float(getattr(args, "motion_preservation_anchor_cache_auto_ratio", 0.2) or 0.2)
     min_size = int(getattr(args, "motion_preservation_anchor_cache_auto_min", 8) or 8)
-    max_size = int(getattr(args, "motion_preservation_anchor_cache_auto_max", 64) or 64)
+    max_size = int(getattr(args, "motion_preservation_anchor_cache_auto_max", 256) or 256)
     derived = int(math.ceil(max(1, int(num_train_items)) * ratio))
     resolved = max(min_size, min(max_size, derived))
     return resolved
@@ -1147,12 +1155,16 @@ def _build_fisher_ewc_stats(
                     skipped_batches += 1
                     optimizer.zero_grad(set_to_none=True)
                     continue
+                _ewc_loss_type = getattr(args, "loss_type", "mse")
+                _ewc_huber_delta = float(getattr(args, "huber_delta", 1.0))
                 loss = _masked_mse(
                     out["video_pred"],
                     out["video_target"],
                     out.get("video_loss_mask"),
                     weighting=weighting,
                     dtype=trainer.dit_dtype,
+                    loss_type=_ewc_loss_type,
+                    huber_delta=_ewc_huber_delta,
                 ) * float(out.get("video_loss_weight", 1.0))
                 audio_pred = out.get("audio_pred")
                 audio_target = out.get("audio_target")
@@ -1163,10 +1175,19 @@ def _build_fisher_ewc_stats(
                         out.get("audio_loss_mask"),
                         weighting=weighting,
                         dtype=trainer.dit_dtype,
+                        loss_type=_ewc_loss_type,
+                        huber_delta=_ewc_huber_delta,
                     ) * float(out.get("audio_loss_weight", 1.0))
             else:
+                _ewc_loss_type = getattr(args, "loss_type", "mse")
+                _ewc_huber_delta = float(getattr(args, "huber_delta", 1.0))
                 pred = model_pred.to(device=target.device, dtype=trainer.dit_dtype)
-                loss = torch.nn.functional.mse_loss(pred, target, reduction="none")
+                if _ewc_loss_type in ("mae", "l1"):
+                    loss = torch.nn.functional.l1_loss(pred, target, reduction="none")
+                elif _ewc_loss_type in ("huber", "smooth_l1"):
+                    loss = torch.nn.functional.smooth_l1_loss(pred, target, reduction="none", beta=_ewc_huber_delta)
+                else:
+                    loss = torch.nn.functional.mse_loss(pred, target, reduction="none")
                 if weighting is not None:
                     w = weighting
                     if isinstance(w, torch.Tensor) and w.dim() != loss.dim():
@@ -1292,8 +1313,19 @@ def _build_synthetic_motion_latents(
     *,
     target_frames: int,
     temporal_corr: float,
+    content_seeded: bool = True,
 ) -> torch.Tensor:
-    """Create synthetic multi-frame latents with temporally-correlated noise."""
+    """Create synthetic multi-frame latents with temporally-correlated noise.
+
+    When *content_seeded* is True the first frame is the actual image latent from
+    the dataset and subsequent frames evolve from it via an AR(1) process.  This
+    gives the base model semantically-structured multi-frame input so its temporal
+    response encodes content-aware motion priors rather than generic noise routing.
+
+    When *content_seeded* is False the original behaviour is used: all frames are
+    pure temporally-correlated Gaussian noise rescaled to match the image latent
+    statistics.
+    """
     if base_latents.dim() != 5:
         raise ValueError(f"Expected 5D base latents, got shape={tuple(base_latents.shape)}")
 
@@ -1301,32 +1333,48 @@ def _build_synthetic_motion_latents(
     frames = max(2, int(target_frames))
     corr = max(0.0, min(0.999, float(temporal_corr)))
 
-    prev = torch.randn((batch_size, channels, height, width), device=base_latents.device, dtype=base_latents.dtype)
     synth = torch.empty(
         (batch_size, channels, frames, height, width),
         device=base_latents.device,
         dtype=base_latents.dtype,
     )
-    synth[:, :, 0, :, :] = prev
 
-    if corr >= 0.999:
-        for frame_idx in range(1, frames):
-            synth[:, :, frame_idx, :, :] = prev
+    if content_seeded:
+        # Seed from the actual image latent so the base model processes content-
+        # aware input.  The AR(1) process naturally drifts from the image toward
+        # noise, creating a smooth temporal evolution the model can reason about.
+        prev = base_latents[:, :, 0, :, :].clone()
+        synth[:, :, 0, :, :] = prev
+        if corr >= 0.999:
+            for frame_idx in range(1, frames):
+                synth[:, :, frame_idx, :, :] = prev
+        else:
+            noise_scale = math.sqrt(max(1e-6, 1.0 - corr * corr))
+            for frame_idx in range(1, frames):
+                prev = corr * prev + noise_scale * torch.randn_like(prev)
+                synth[:, :, frame_idx, :, :] = prev
+        # No mean/std rescaling needed — already in the correct latent distribution.
     else:
-        noise_scale = math.sqrt(max(1e-6, 1.0 - corr * corr))
-        for frame_idx in range(1, frames):
-            prev = corr * prev + noise_scale * torch.randn_like(prev)
-            synth[:, :, frame_idx, :, :] = prev
-
-    # Match mean/std to real cached latents so replay operates on similar magnitude.
-    base_f32 = base_latents.to(torch.float32)
-    synth_f32 = synth.to(torch.float32)
-    base_mean = base_f32.mean()
-    base_std = base_f32.std(unbiased=False).clamp_min(1e-6)
-    synth_mean = synth_f32.mean()
-    synth_std = synth_f32.std(unbiased=False).clamp_min(1e-6)
-    synth = (synth - synth_mean.to(dtype=synth.dtype)) * (base_std / synth_std).to(dtype=synth.dtype)
-    synth = synth + base_mean.to(dtype=synth.dtype)
+        # Original behaviour: pure random noise with temporal correlation.
+        prev = torch.randn((batch_size, channels, height, width), device=base_latents.device, dtype=base_latents.dtype)
+        synth[:, :, 0, :, :] = prev
+        if corr >= 0.999:
+            for frame_idx in range(1, frames):
+                synth[:, :, frame_idx, :, :] = prev
+        else:
+            noise_scale = math.sqrt(max(1e-6, 1.0 - corr * corr))
+            for frame_idx in range(1, frames):
+                prev = corr * prev + noise_scale * torch.randn_like(prev)
+                synth[:, :, frame_idx, :, :] = prev
+        # Match mean/std to real cached latents so replay operates on similar magnitude.
+        base_f32 = base_latents.to(torch.float32)
+        synth_f32 = synth.to(torch.float32)
+        base_mean = base_f32.mean()
+        base_std = base_f32.std(unbiased=False).clamp_min(1e-6)
+        synth_mean = synth_f32.mean()
+        synth_std = synth_f32.std(unbiased=False).clamp_min(1e-6)
+        synth = (synth - synth_mean.to(dtype=synth.dtype)) * (base_std / synth_std).to(dtype=synth.dtype)
+        synth = synth + base_mean.to(dtype=synth.dtype)
     return synth
 
 
@@ -1365,6 +1413,7 @@ def _build_motion_anchor_cache(
     synthetic_frames = int(getattr(args, "motion_preservation_synthetic_frames", 8) or 8)
     synthetic_temporal_corr = float(getattr(args, "motion_preservation_synthetic_temporal_corr", 0.92))
     synthetic_dataset_mix = float(getattr(args, "motion_preservation_synthetic_dataset_mix", 0.25))
+    synthetic_content_seeded = bool(getattr(args, "motion_preservation_synthetic_content_seeded", True))
 
     entries: list[dict[str, Any]] = []
     max_attempts = max(cache_size * 4, cache_size)
@@ -1396,10 +1445,11 @@ def _build_motion_anchor_cache(
     )
     if anchor_source in {"synthetic", "hybrid"}:
         logger.info(
-            "Motion prior synthetic anchors: frames=%d temporal_corr=%.3f dataset_mix=%.2f",
+            "Motion prior synthetic anchors: frames=%d temporal_corr=%.3f dataset_mix=%.2f content_seeded=%s",
             synthetic_frames,
             synthetic_temporal_corr,
             synthetic_dataset_mix,
+            synthetic_content_seeded,
         )
     anchor_start_time = time.time()
     if replay_sigmas:
@@ -1446,6 +1496,7 @@ def _build_motion_anchor_cache(
                         latents_tensor,
                         target_frames=synthetic_frames,
                         temporal_corr=synthetic_temporal_corr,
+                        content_seeded=synthetic_content_seeded,
                     )
                     synthetic_anchor_count += 1
                 else:
@@ -2072,7 +2123,7 @@ def ltx2_finetune_setup_parser(parser: argparse.ArgumentParser) -> argparse.Argu
     parser.add_argument(
         "--motion_preservation_anchor_cache_auto_max",
         type=int,
-        default=64,
+        default=256,
         help="When auto-size is enabled: maximum anchor cache size.",
     )
     parser.add_argument(
@@ -2115,6 +2166,28 @@ def ltx2_finetune_setup_parser(parser: argparse.ArgumentParser) -> argparse.Argu
         type=float,
         default=0.25,
         help="For hybrid source, probability of selecting dataset anchors vs synthetic anchors.",
+    )
+    parser.add_argument(
+        "--motion_preservation_synthetic_content_seeded",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Seed synthetic motion priors from the actual image latent instead of pure random noise. "
+            "The image becomes frame 0 and subsequent frames evolve from it via the AR(1) process, "
+            "giving the base model semantically-structured input so its temporal response encodes "
+            "content-aware motion priors. Disable with --no-motion_preservation_synthetic_content_seeded "
+            "to revert to the original pure-noise behaviour."
+        ),
+    )
+    parser.add_argument(
+        "--motion_preservation_warmup_steps",
+        type=int,
+        default=0,
+        help=(
+            "Linearly ramp the motion preservation multiplier from 0 to its full value over this many "
+            "global optimizer steps. Allows the model to learn appearance freely in early training "
+            "before motion constraints tighten. 0 disables warmup (full multiplier from step 0)."
+        ),
     )
     parser.add_argument(
         "--motion_preservation_interval",
@@ -2276,7 +2349,11 @@ def ltx2_finetune_setup_parser(parser: argparse.ArgumentParser) -> argparse.Argu
         "--ewc_num_batches",
         type=int,
         default=8,
-        help="Number of batches used to estimate Fisher statistics at training start.",
+        help=(
+            "Number of batches used to estimate Fisher statistics at training start. "
+            "Fisher is computed on whatever data is in the training dataloader, so provide a "
+            "video-only dataset config if you want motion-focused Fisher statistics."
+        ),
     )
     parser.add_argument(
         "--ewc_target",
@@ -2298,7 +2375,11 @@ def ltx2_finetune_setup_parser(parser: argparse.ArgumentParser) -> argparse.Argu
         "--ewc_cache_path",
         type=str,
         default=None,
-        help="Optional on-disk cache file (.pt) for EWC Fisher/theta stats. Signature mismatch auto-rebuilds.",
+        help=(
+            "Optional on-disk cache file (.pt) for EWC Fisher/theta stats. Signature mismatch auto-rebuilds. "
+            "Note: Fisher is computed on whatever data is in the training dataloader, so if you want "
+            "motion-focused Fisher statistics, provide a video-only dataset config."
+        ),
     )
     parser.add_argument(
         "--ewc_cache_rebuild",
@@ -2838,7 +2919,7 @@ def main() -> None:
                 "(override with --self_flow_args offload_teacher_params=false)."
             )
 
-        trainer._setup_self_flow(args, accelerator, transformer=transformer, network=transformer)
+        trainer._setup_self_flow(args, accelerator, transformer=transformer, network=None)
         self_flow_module = getattr(trainer, "_self_flow", None)
         if self_flow_module is not None:
             self_flow_params = [p for p in self_flow_module.get_trainable_params() if p.requires_grad]
@@ -2907,7 +2988,7 @@ def main() -> None:
     optimizer, train_dataloader, lr_scheduler = accelerator.prepare(optimizer, train_dataloader, lr_scheduler)
 
     if getattr(trainer, "_self_flow", None) is not None:
-        trainer._current_call_network = accelerator.unwrap_model(transformer)
+        trainer._self_flow_network = accelerator.unwrap_model(transformer)
 
     # Prepare validation dataloader if exists
     if val_dataloader is not None:
@@ -3031,6 +3112,7 @@ def main() -> None:
         "ss_shifted_logit_mode": getattr(args, "shifted_logit_mode", None),
         "ss_shifted_logit_eps": getattr(args, "shifted_logit_eps", 1e-3),
         "ss_shifted_logit_uniform_prob": getattr(args, "shifted_logit_uniform_prob", 0.1),
+        "ss_shifted_logit_shift": getattr(args, "shifted_logit_shift", None),
         "ss_ltx_mode": args.ltx_mode,
         "ss_split_av_passes": bool(getattr(args, "split_av_passes", False)),
         "ss_video_loss_weight": getattr(args, "video_loss_weight", 1.0),
@@ -3066,6 +3148,10 @@ def main() -> None:
         "ss_motion_preservation_synthetic_dataset_mix": getattr(
             args, "motion_preservation_synthetic_dataset_mix", 0.25
         ),
+        "ss_motion_preservation_synthetic_content_seeded": getattr(
+            args, "motion_preservation_synthetic_content_seeded", True
+        ),
+        "ss_motion_preservation_warmup_steps": getattr(args, "motion_preservation_warmup_steps", 0),
         "ss_motion_preservation_interval": getattr(args, "motion_preservation_interval", 1),
         "ss_motion_preservation_probability": getattr(args, "motion_preservation_probability", None),
         "ss_motion_preservation_num_sigmas": getattr(args, "motion_preservation_num_sigmas", 1),
@@ -3412,9 +3498,12 @@ def main() -> None:
                     video_pred = out["video_pred"]
                     video_target = out["video_target"]
                     video_loss_mask = out.get("video_loss_mask")
+                    _val_loss_type = getattr(args, "loss_type", "mse")
+                    _val_huber_delta = float(getattr(args, "huber_delta", 1.0))
                     video_loss = _masked_mse(
                         video_pred, video_target, video_loss_mask,
-                        weighting=weighting, dtype=trainer.dit_dtype
+                        weighting=weighting, dtype=trainer.dit_dtype,
+                        loss_type=_val_loss_type, huber_delta=_val_huber_delta,
                     )
                     val_video_losses.append(video_loss.item())
 
@@ -3424,16 +3513,24 @@ def main() -> None:
                         audio_loss_mask = out.get("audio_loss_mask")
                         audio_loss = _masked_mse(
                             audio_pred, audio_target, audio_loss_mask,
-                            weighting=weighting, dtype=trainer.dit_dtype
+                            weighting=weighting, dtype=trainer.dit_dtype,
+                            loss_type=_val_loss_type, huber_delta=_val_huber_delta,
                         )
                         val_audio_losses.append(audio_loss.item())
                         val_losses.append(video_loss.item() * args.video_loss_weight + audio_loss.item() * args.audio_loss_weight)
                     else:
                         val_losses.append(video_loss.item())
                 else:
+                    _val_loss_type = getattr(args, "loss_type", "mse")
+                    _val_huber_delta = float(getattr(args, "huber_delta", 1.0))
                     if isinstance(target, torch.Tensor):
                         model_pred = model_pred.to(device=target.device, dtype=trainer.dit_dtype)
-                    loss = torch.nn.functional.mse_loss(model_pred, target)
+                    if _val_loss_type in ("mae", "l1"):
+                        loss = torch.nn.functional.l1_loss(model_pred, target)
+                    elif _val_loss_type in ("huber", "smooth_l1"):
+                        loss = torch.nn.functional.smooth_l1_loss(model_pred, target, beta=_val_huber_delta)
+                    else:
+                        loss = torch.nn.functional.mse_loss(model_pred, target)
                     val_losses.append(loss.item())
 
                 num_batches += 1
@@ -3709,6 +3806,8 @@ def main() -> None:
                         optimizer.zero_grad(set_to_none=True)
                         continue
 
+                    _loss_type = getattr(args, "loss_type", "mse")
+                    _huber_delta = float(getattr(args, "huber_delta", 1.0))
                     video_pred = out["video_pred"]
                     video_target = out["video_target"]
                     video_loss_mask = out.get("video_loss_mask")
@@ -3718,6 +3817,8 @@ def main() -> None:
                         video_loss_mask,
                         weighting=weighting,
                         dtype=trainer.dit_dtype,
+                        loss_type=_loss_type,
+                        huber_delta=_huber_delta,
                     )
                     video_weight = float(out.get("video_loss_weight", 1.0))
                     loss = video_loss * video_weight
@@ -3732,15 +3833,24 @@ def main() -> None:
                             audio_loss_mask,
                             weighting=weighting,
                             dtype=trainer.dit_dtype,
+                            loss_type=_loss_type,
+                            huber_delta=_huber_delta,
                         )
                         audio_weight = float(out.get("audio_loss_weight", 1.0))
                         loss = loss + audio_loss * audio_weight
                 else:
+                    _loss_type = getattr(args, "loss_type", "mse")
+                    _huber_delta = float(getattr(args, "huber_delta", 1.0))
                     if isinstance(target, torch.Tensor):
                         model_pred = model_pred.to(device=target.device, dtype=trainer.dit_dtype)
                     else:
                         model_pred = model_pred.to(dtype=trainer.dit_dtype)
-                    loss = torch.nn.functional.mse_loss(model_pred, target, reduction="none")
+                    if _loss_type in ("mae", "l1"):
+                        loss = torch.nn.functional.l1_loss(model_pred, target, reduction="none")
+                    elif _loss_type in ("huber", "smooth_l1"):
+                        loss = torch.nn.functional.smooth_l1_loss(model_pred, target, reduction="none", beta=_huber_delta)
+                    else:
+                        loss = torch.nn.functional.mse_loss(model_pred, target, reduction="none")
                     if weighting is not None:
                         w = weighting
                         if isinstance(w, torch.Tensor) and w.dim() != loss.dim():
@@ -3852,12 +3962,22 @@ def main() -> None:
                         )
                         if isinstance(anchor_model_timesteps, torch.Tensor) and anchor_model_timesteps.numel() > 0:
                             replay_sigma_value = float(anchor_model_timesteps.view(-1)[0].detach().float().item() / 1000.0)
-                        teacher_video_pred = anchor["teacher_video_pred"]
+                        teacher_video_pred = anchor.get("teacher_video_pred")
+                        if not isinstance(teacher_video_pred, torch.Tensor):
+                            logger.warning(
+                                "Motion replay: teacher_video_pred is %s instead of Tensor, skipping replay this step",
+                                type(teacher_video_pred).__name__,
+                            )
                     anchor_batch = _move_to_device(
                         anchor["anchor_batch"], accelerator.device, dtype=trainer.dit_dtype
                     )
 
                     original_first_frame_p = float(getattr(args, "ltx2_first_frame_conditioning_p", 0.0))
+                    # Force first-frame conditioning probability to 0 during motion replay so that
+                    # the student prediction is generated under the same conditions as the cached
+                    # teacher prediction (which was recorded with p=0).  A mismatch would introduce
+                    # a systematic bias between student and teacher outputs, degrading the motion
+                    # preservation loss signal.
                     setattr(args, "ltx2_first_frame_conditioning_p", 0.0)
                     try:
                         if args.motion_attention_preservation and motion_attention_modules:
@@ -3903,7 +4023,7 @@ def main() -> None:
                     finally:
                         setattr(args, "ltx2_first_frame_conditioning_p", original_first_frame_p)
 
-                    if isinstance(motion_pred, dict) and not motion_pred.get("_skip_step"):
+                    if isinstance(motion_pred, dict) and not motion_pred.get("_skip_step") and isinstance(teacher_video_pred, torch.Tensor):
                         student_video_pred = motion_pred["video_pred"]
                         motion_pres_loss_raw = _compute_motion_preservation_loss(
                             args,
@@ -3912,7 +4032,11 @@ def main() -> None:
                             motion_pred.get("video_loss_mask"),
                             dtype=trainer.dit_dtype,
                         )
-                        motion_pres_loss = motion_pres_loss_raw * float(args.motion_preservation_multiplier)
+                        motion_multiplier = float(args.motion_preservation_multiplier)
+                        motion_warmup = int(getattr(args, "motion_preservation_warmup_steps", 0) or 0)
+                        if motion_warmup > 0 and global_step < motion_warmup:
+                            motion_multiplier = motion_multiplier * (global_step / motion_warmup)
+                        motion_pres_loss = motion_pres_loss_raw * motion_multiplier
                         motion_total_loss = motion_pres_loss
 
                         teacher_attn_maps = anchor.get("teacher_attention_maps")
@@ -3943,6 +4067,10 @@ def main() -> None:
                                 if not isinstance(teacher_map, torch.Tensor):
                                     continue
                                 if teacher_map.shape != student_map.shape:
+                                    logger.warning(
+                                        "Motion preservation: attention map shape mismatch for module %s (student=%s teacher=%s), skipping",
+                                        module_name, student_map.shape, teacher_map.shape,
+                                    )
                                     continue
 
                                 student_dist = student_map.to(torch.float32)
@@ -4072,6 +4200,12 @@ def main() -> None:
                     logs.update(self_flow_metrics)
                 if motion_pres_loss_raw is not None:
                     logs["motion/pres_raw"] = motion_pres_loss_raw.detach().item()
+                if motion_pres_loss is not None:
+                    _mw = int(getattr(args, "motion_preservation_warmup_steps", 0) or 0)
+                    _mm = float(args.motion_preservation_multiplier)
+                    if _mw > 0 and global_step < _mw:
+                        _mm = _mm * (global_step / _mw)
+                    logs["motion/effective_multiplier"] = _mm
                 if attn_pres_loss is not None:
                     logs["attn_pres"] = attn_pres_loss.detach().item()
                     logs["motion/attn_weighted"] = attn_pres_loss.detach().item()

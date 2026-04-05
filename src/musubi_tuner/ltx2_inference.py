@@ -9,13 +9,10 @@ from __future__ import annotations
 import gc
 import logging
 import os
-import subprocess
-import sys
-import tempfile
 import wave
 from dataclasses import dataclass, field
 from fractions import Fraction
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -817,7 +814,9 @@ class LTX2Inferencer:
             audio_decoder.to(self.device)
             vocoder.to(self.device)
             with torch.no_grad():
-                audio_latents = audio_latents.to(device=self.device, dtype=torch.bfloat16)
+                first_param = next(audio_decoder.parameters(), None)
+                decode_dtype = first_param.dtype if first_param is not None else audio_latents.dtype
+                audio_latents = audio_latents.to(device=self.device, dtype=decode_dtype)
                 decoded_audio = audio_decoder(audio_latents)
                 audio_waveform = vocoder(decoded_audio).squeeze(0).float().cpu()
             audio_decoder.to("cpu")

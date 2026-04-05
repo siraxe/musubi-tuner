@@ -5,7 +5,7 @@ Trains a LoRA that shifts model output in a controllable direction
 
 Supports two modes:
   - text-only: learns direction from positive/negative prompt pairs (no dataset needed)
-  - reference: learns direction from paired positive/negative latent examples
+  - reference: learns direction from paired positive/negative video or audio latent examples
 """
 
 import argparse
@@ -24,8 +24,6 @@ import torch
 import torch.nn.functional as F_torch
 from accelerate import Accelerator
 from accelerate.utils import set_seed
-import json
-from safetensors import safe_open
 from safetensors.torch import load_file
 from tqdm import tqdm
 
@@ -42,7 +40,6 @@ from musubi_tuner.hv_train_network import (
     prepare_accelerator,
     clean_memory_on_device,
 )
-from musubi_tuner.networks.optimizer_params_compat import prepare_optimizer_params_compat
 from musubi_tuner.ltx2_train_network import (
     LTX2NetworkTrainer,
     ltx2_setup_parser,
@@ -66,20 +63,15 @@ class SliderTargetConfig:
 
 @dataclass
 class SliderConfig:
-    mode: str  # "text", "reference", or "i2v"
+    mode: str  # "text" or "reference"
+    reference_modality: str = "video"  # "video" or "audio" for reference mode
     targets: List[SliderTargetConfig] = field(default_factory=list)
     guidance_strength: float = 1.0
     frame_rate: int = 25
     sample_slider_range: List[float] = field(default_factory=lambda: [-2.0, -1.0, 0.0, 1.0, 2.0])
-    batch_size: int = 1
-    # Multiple directories support (required for reference mode)
-    pos_cache_dirs: List[str] = field(default_factory=list)
-    neg_cache_dirs: List[str] = field(default_factory=list)
-    text_cache_dirs: List[str] = field(default_factory=list)
-    # i2v mode: video cache directories containing original/control subdirs
-    i2v_cache_dirs: List[str] = field(default_factory=list)
-    # i2v mode: first frame conditioning probability (typically 1.0 for i2v)
-    first_frame_conditioning_p: float = 1.0
+    pos_cache_dir: Optional[str] = None
+    neg_cache_dir: Optional[str] = None
+    text_cache_dir: Optional[str] = None  # defaults to pos_cache_dir if not set
 
 
 def load_slider_config(path: str) -> SliderConfig:
@@ -88,10 +80,10 @@ def load_slider_config(path: str) -> SliderConfig:
         raw = toml.load(f)
 
     mode = raw.get("mode", "text")
+    reference_modality = str(raw.get("reference_modality", "video")).lower()
     guidance_strength = float(raw.get("guidance_strength", 1.0))
     frame_rate = int(raw.get("frame_rate", 25))
     sample_slider_range = raw.get("sample_slider_range", [-2.0, -1.0, 0.0, 1.0, 2.0])
-    batch_size = int(raw.get("batch_size", 1))
 
     targets = []
     for t in raw.get("targets", []):
@@ -104,27 +96,20 @@ def load_slider_config(path: str) -> SliderConfig:
             )
         )
 
-    # Load multi-dataset directories
-    pos_cache_dirs = raw.get("pos_cache_dirs", [])
-    neg_cache_dirs = raw.get("neg_cache_dirs", [])
-    text_cache_dirs = raw.get("text_cache_dirs", pos_cache_dirs)  # Default to pos_cache_dirs
-
-    # Load i2v mode directories
-    i2v_cache_dirs = raw.get("i2v_cache_dirs", [])
-    first_frame_conditioning_p = float(raw.get("first_frame_conditioning_p", 1.0))
+    pos_cache_dir = raw.get("pos_cache_dir", None)
+    neg_cache_dir = raw.get("neg_cache_dir", None)
+    text_cache_dir = raw.get("text_cache_dir", None) or pos_cache_dir
 
     return SliderConfig(
         mode=mode,
+        reference_modality=reference_modality,
         targets=targets,
         guidance_strength=guidance_strength,
         frame_rate=frame_rate,
         sample_slider_range=[float(v) for v in sample_slider_range],
-        batch_size=batch_size,
-        pos_cache_dirs=pos_cache_dirs,
-        neg_cache_dirs=neg_cache_dirs,
-        text_cache_dirs=text_cache_dirs,
-        i2v_cache_dirs=i2v_cache_dirs,
-        first_frame_conditioning_p=first_frame_conditioning_p,
+        pos_cache_dir=pos_cache_dir,
+        neg_cache_dir=neg_cache_dir,
+        text_cache_dir=text_cache_dir,
     )
 
 
@@ -186,6 +171,14 @@ def _find_latent_tensor(sd: dict) -> torch.Tensor:
     raise KeyError(f"No latents key found in {list(sd.keys())}")
 
 
+def _find_audio_latent_tensor(sd: dict) -> torch.Tensor:
+    """Extract the audio latent tensor from a safetensors state dict with dynamic keys."""
+    for key, val in sd.items():
+        if key.startswith("audio_latents_"):
+            return val
+    raise KeyError(f"No audio latents key found in {list(sd.keys())}")
+
+
 def _find_text_tensor(sd: dict) -> torch.Tensor:
     """Extract the text embedding tensor from a safetensors state dict with dynamic keys."""
     for key, val in sd.items():
@@ -194,136 +187,139 @@ def _find_text_tensor(sd: dict) -> torch.Tensor:
     raise KeyError(f"No text key found in {list(sd.keys())}")
 
 
-def _get_latent_shape_from_file(file_path: str) -> tuple:
-    """Get latent tensor shape from safetensors file without loading the full data.
-
-    Reads only the safetensors header (JSON metadata) to get shape information.
-    """
-    try:
-        # Safetensors format:
-        # - First 8 bytes: header length (little endian uint64)
-        # - Next N bytes: JSON metadata containing tensor names, shapes, dtypes, offsets
-        with open(file_path, "rb") as f:
-            # Read header length
-            header_len_bytes = f.read(8)
-            if len(header_len_bytes) < 8:
-                raise ValueError("Invalid safetensors file: too short")
-            header_len = int.from_bytes(header_len_bytes, byteorder="little", signed=False)
-
-            # Read header JSON
-            header_bytes = f.read(header_len)
-            header_json = json.loads(header_bytes.decode("utf-8"))
-
-            # Find the latent tensor (not text_ tensors) and get its shape
-            for tensor_name, tensor_info in header_json.items():
-                if not tensor_name.startswith("text_"):
-                    shape = tensor_info.get("shape")
-                    if shape:
-                        return tuple(shape)
-
-            raise ValueError(f"No latent tensor found in {file_path}")
-    except Exception as e:
-        logger.warning(f"Failed to read shape from header of {file_path}: {e}")
-        # Last resort: load full file
-        sd = load_file(file_path)
-        tensor = _find_latent_tensor(sd)
-        return tuple(tensor.shape)
+_LATENT_BASENAME_RE = re.compile(r"^(.+)_\d{4}x\d{4}_ltx2\.safetensors$")
+_AUDIO_BASENAME_RE = re.compile(r"^(.+)_ltx2_audio\.safetensors$")
 
 
-# Match both formats:
-# 1. With dimensions: {stem}_{W:04d}x{H:04d}_ltx2.safetensors
-# 2. Without dimensions (for i2v preprocessed): {stem}_ltx2.safetensors
-# 3. Chunk format: {stem}_{start:05d}-{frames:03d}_ltx2.safetensors
-_LATENT_BASENAME_RE = re.compile(r"^(.+?)(?:_\d{4}x\d{4})?(?:_\d{5}-\d{3})?_ltx2\.safetensors$")
+def _find_length_tensor(sd: dict, prefix: str) -> Optional[torch.Tensor]:
+    for key, val in sd.items():
+        if key.startswith(prefix):
+            return val
+    return None
+
+
+def _find_virtual_latent_cache_path(cache_dir: str, stem: str) -> Optional[str]:
+    pattern = os.path.join(cache_dir, f"{stem}_*_ltx2.safetensors")
+    matches = sorted(
+        path for path in glob.glob(pattern) if not path.endswith("_te.safetensors") and not path.endswith("_audio.safetensors")
+    )
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        logger.warning("Multiple virtual latent caches found for %s in %s, using %s", stem, cache_dir, os.path.basename(matches[0]))
+        return matches[0]
+    return None
 
 
 class PairedSliderDataset(torch.utils.data.Dataset):
-    """Loads matched positive/negative latent pairs from multiple cache directories."""
+    """Loads matched positive/negative latent pairs from cache directories."""
 
-    def __init__(self, pos_cache_dirs: List[str], neg_cache_dirs: List[str],
-                 text_cache_dirs: Optional[List[str]] = None):
-        if not pos_cache_dirs:
-            raise ValueError("pos_cache_dirs cannot be empty")
-        if not neg_cache_dirs:
-            raise ValueError("neg_cache_dirs cannot be empty")
+    def __init__(
+        self,
+        pos_cache_dir: str,
+        neg_cache_dir: str,
+        text_cache_dir: Optional[str] = None,
+        reference_modality: str = "video",
+    ):
+        self.text_cache_dir = text_cache_dir or pos_cache_dir
+        self.reference_modality = reference_modality
 
-        self.pos_cache_dirs = pos_cache_dirs
-        self.neg_cache_dirs = neg_cache_dirs
-        self.text_cache_dirs = text_cache_dirs if text_cache_dirs else pos_cache_dirs
-
-        # Ensure all lists have the same length
-        n_dirs = len(self.pos_cache_dirs)
-        if len(self.neg_cache_dirs) != n_dirs:
-            raise ValueError(f"pos_cache_dirs has {n_dirs} entries but neg_cache_dirs has {len(self.neg_cache_dirs)}")
-        if len(self.text_cache_dirs) != n_dirs:
-            raise ValueError(f"pos_cache_dirs has {n_dirs} entries but text_cache_dirs has {len(self.text_cache_dirs)}")
-
-        self.pairs = []
-        # Store pairs with their shapes for bucket batching: (shape_key, pos_path, neg_path, te_path)
-        self.buckets = {}  # shape -> list of indices
-
-        for i, (pos_dir, neg_dir, text_dir) in enumerate(zip(self.pos_cache_dirs, self.neg_cache_dirs, self.text_cache_dirs)):
-            # Find latent cache files in pos_cache_dir
-            pos_files = sorted(glob.glob(os.path.join(pos_dir, "*_ltx2.safetensors")))
-            # Exclude text encoder caches (*_te.safetensors) and audio (*_audio.safetensors)
+        if self.reference_modality == "audio":
+            pos_files = sorted(glob.glob(os.path.join(pos_cache_dir, "*_ltx2_audio.safetensors")))
+        else:
+            pos_files = sorted(glob.glob(os.path.join(pos_cache_dir, "*_ltx2.safetensors")))
             pos_files = [f for f in pos_files if not f.endswith("_te.safetensors") and not f.endswith("_audio.safetensors")]
 
-            for pos_path in pos_files:
-                basename = os.path.basename(pos_path)
-                neg_path = os.path.join(neg_dir, basename)
-                if not os.path.exists(neg_path):
-                    logger.warning("No negative match for %s in %s, skipping", basename, neg_dir)
-                    continue
+        self.pairs = []
+        for pos_path in pos_files:
+            basename = os.path.basename(pos_path)
+            neg_path = os.path.join(neg_cache_dir, basename)
+            if not os.path.exists(neg_path):
+                logger.warning("No negative match for %s, skipping", basename)
+                continue
 
-                # Text cache uses stem without WxH dimensions:
-                #   latent: {stem}_{W:04d}x{H:04d}_ltx2.safetensors
-                #   text:   {stem}_ltx2_te.safetensors
+            if self.reference_modality == "audio":
+                m = _AUDIO_BASENAME_RE.match(basename)
+                if not m:
+                    logger.warning("Cannot parse audio latent filename %s, skipping", basename)
+                    continue
+                stem = m.group(1)
+                pos_virtual_path = _find_virtual_latent_cache_path(pos_cache_dir, stem)
+                neg_virtual_path = _find_virtual_latent_cache_path(neg_cache_dir, stem)
+                if pos_virtual_path is None or neg_virtual_path is None:
+                    logger.warning("Missing virtual latent cache for %s, skipping", stem)
+                    continue
+            else:
                 m = _LATENT_BASENAME_RE.match(basename)
                 if not m:
                     logger.warning("Cannot parse latent filename %s, skipping", basename)
                     continue
-                te_basename = f"{m.group(1)}_ltx2_te.safetensors"
-                te_path = os.path.join(text_dir, te_basename)
-                if not os.path.exists(te_path):
-                    logger.warning("No text cache for %s in %s, skipping", basename, text_dir)
-                    continue
+                stem = m.group(1)
+                pos_virtual_path = None
+                neg_virtual_path = None
 
-                # Get the shape of this pair for bucketing (read header only, no data loading)
-                shape = _get_latent_shape_from_file(pos_path)
-                shape_key = shape  # Use full shape as bucket key
+            # Text cache uses stem without WxH dimensions:
+            #   latent: {stem}_{W:04d}x{H:04d}_ltx2.safetensors
+            #   text:   {stem}_ltx2_te.safetensors
+            te_basename = f"{stem}_ltx2_te.safetensors"
+            te_path = os.path.join(self.text_cache_dir, te_basename)
+            if not os.path.exists(te_path):
+                logger.warning("No text cache for %s, skipping", basename)
+                continue
 
-                idx = len(self.pairs)
-                self.pairs.append((shape_key, pos_path, neg_path, te_path))
-
-                if shape_key not in self.buckets:
-                    self.buckets[shape_key] = []
-                self.buckets[shape_key].append(idx)
+            self.pairs.append((pos_path, neg_path, te_path, pos_virtual_path, neg_virtual_path))
 
         if len(self.pairs) == 0:
-            raise ValueError(f"No matched pairs found in the provided cache directories")
-        logger.info("PairedSliderDataset: found %d matched pairs from %d dataset(s) in %d shape buckets",
-                   len(self.pairs), n_dirs, len(self.buckets))
-        # Log bucket info
-        for shape, indices in sorted(self.buckets.items()):
-            # shape is (C, F, H, W) where C=128, F=latent_frames, H=latent_height, W=latent_width
-            # Convert latent frames to actual video frames: actual = (latent - 1) * 8 + 1
-            # Convert latent resolution to pixels: H*32 x W*32
-            c, latent_f, h, w = shape
-            actual_f = (latent_f - 1) * 8 + 1
-            pixel_h = h * 32
-            pixel_w = w * 32
-            logger.info("  Bucket shape %s: %d items (frames: %d, resolution: %dx%d)",
-                       shape, len(indices), actual_f, pixel_h, pixel_w)
+            raise ValueError(f"No matched pairs found in {pos_cache_dir} and {neg_cache_dir}")
+        logger.info("PairedSliderDataset (%s): found %d matched pairs", self.reference_modality, len(self.pairs))
 
     def __len__(self):
         return len(self.pairs)
 
     def __getitem__(self, idx):
-        shape_key, pos_path, neg_path, te_path = self.pairs[idx]
+        pos_path, neg_path, te_path, pos_virtual_path, neg_virtual_path = self.pairs[idx]
 
         pos_sd = load_file(pos_path)
         neg_sd = load_file(neg_path)
         te_sd = load_file(te_path)
+
+        text_embeds = _find_text_tensor(te_sd)        # [seq_len, dim]
+        text_mask = te_sd.get("text_mask", torch.ones(text_embeds.shape[0]))  # [seq_len]
+
+        if self.reference_modality == "audio":
+            pos_audio_latents = _find_audio_latent_tensor(pos_sd)
+            neg_audio_latents = _find_audio_latent_tensor(neg_sd)
+            if pos_audio_latents.shape != neg_audio_latents.shape:
+                raise ValueError(
+                    f"Audio shape mismatch for {os.path.basename(pos_path)}: "
+                    f"pos {pos_audio_latents.shape} vs neg {neg_audio_latents.shape}"
+                )
+
+            pos_lengths = _find_length_tensor(pos_sd, "audio_lengths_")
+            neg_lengths = _find_length_tensor(neg_sd, "audio_lengths_")
+            if pos_lengths is None or neg_lengths is None:
+                raise ValueError(f"Missing audio lengths for {os.path.basename(pos_path)}")
+
+            pos_virtual_sd = load_file(pos_virtual_path)
+            neg_virtual_sd = load_file(neg_virtual_path)
+            pos_virtual_latents = _find_latent_tensor(pos_virtual_sd)
+            neg_virtual_latents = _find_latent_tensor(neg_virtual_sd)
+            if pos_virtual_latents.shape != neg_virtual_latents.shape:
+                raise ValueError(
+                    f"Virtual geometry mismatch for {os.path.basename(pos_virtual_path)}: "
+                    f"pos {pos_virtual_latents.shape} vs neg {neg_virtual_latents.shape}"
+                )
+
+            return {
+                "pos_audio_latents": pos_audio_latents,
+                "neg_audio_latents": neg_audio_latents,
+                "audio_lengths": pos_lengths,
+                "neg_audio_lengths": neg_lengths,
+                "pos_virtual_latents": pos_virtual_latents,
+                "neg_virtual_latents": neg_virtual_latents,
+                "text_embeds": text_embeds,
+                "text_mask": text_mask,
+            }
 
         pos_latents = _find_latent_tensor(pos_sd)    # [C, F, H, W]
         neg_latents = _find_latent_tensor(neg_sd)     # [C, F, H, W]
@@ -332,8 +328,6 @@ class PairedSliderDataset(torch.utils.data.Dataset):
                 f"Shape mismatch for {os.path.basename(pos_path)}: "
                 f"pos {pos_latents.shape} vs neg {neg_latents.shape}"
             )
-        text_embeds = _find_text_tensor(te_sd)        # [seq_len, dim]
-        text_mask = te_sd.get("text_mask", torch.ones(text_embeds.shape[0]))  # [seq_len]
 
         return {
             "pos_latents": pos_latents,
@@ -341,214 +335,6 @@ class PairedSliderDataset(torch.utils.data.Dataset):
             "text_embeds": text_embeds,
             "text_mask": text_mask,
         }
-
-
-class SliderBucketBatchSampler:
-    """Sampler that groups batches by latent shape to enable true batching."""
-
-    def __init__(self, dataset: PairedSliderDataset, batch_size: int, shuffle: bool = True):
-        self.dataset = dataset
-        self.batch_size = batch_size
-        self.shuffle = shuffle
-
-        # Build batch indices for each bucket
-        self.bucket_batches = []  # list of (shape, [indices])
-
-        for shape, indices in dataset.buckets.items():
-            # Create batches within this bucket
-            for i in range(0, len(indices), batch_size):
-                batch_indices = indices[i:i + batch_size]
-                self.bucket_batches.append((shape, batch_indices))
-
-        if shuffle:
-            import random
-            random.shuffle(self.bucket_batches)
-
-    def __iter__(self):
-        for shape, indices in self.bucket_batches:
-            yield indices
-
-    def __len__(self):
-        return len(self.bucket_batches)
-
-
-class I2VSliderDataset(torch.utils.data.Dataset):
-    """Loads original/control video pairs for i2v slider training.
-
-    Expected file structure for each cache_dir:
-        {cache_dir}/{basename}_ltx2.safetensors        # Original video latents
-        {cache_dir}/{basename}_control_ltx2.safetensors # Control video latents (repeated first frame)
-        {cache_dir}/{basename}_ltx2_te.safetensors      # Text encoder outputs (optional)
-    """
-
-    def __init__(self, i2v_cache_dirs: List[str], text_cache_dirs: Optional[List[str]] = None):
-        if not i2v_cache_dirs:
-            raise ValueError("i2v_cache_dirs cannot be empty")
-
-        self.i2v_cache_dirs = i2v_cache_dirs
-        self.text_cache_dirs = text_cache_dirs if text_cache_dirs else i2v_cache_dirs
-
-        # Ensure all lists have the same length
-        n_dirs = len(self.i2v_cache_dirs)
-        if len(self.text_cache_dirs) != n_dirs:
-            raise ValueError(f"i2v_cache_dirs has {n_dirs} entries but text_cache_dirs has {len(self.text_cache_dirs)}")
-
-        self.pairs = []
-        self.buckets = {}  # shape -> list of indices
-
-        for i, (i2v_dir, text_dir) in enumerate(zip(self.i2v_cache_dirs, self.text_cache_dirs)):
-            if not os.path.exists(i2v_dir):
-                logger.warning("Cache directory not found: %s, skipping", i2v_dir)
-                continue
-
-            # Find original latent files (not control files)
-            original_files = sorted(glob.glob(os.path.join(i2v_dir, "*_ltx2.safetensors")))
-            # Filter out control files
-            original_files = [f for f in original_files if "_control_" not in os.path.basename(f)]
-
-            for original_path in original_files:
-                basename = os.path.basename(original_path)
-                # Create control filename by inserting _control before _ltx2
-                control_basename = basename.replace("_ltx2.safetensors", "_control_ltx2.safetensors")
-                control_path = os.path.join(i2v_dir, control_basename)
-
-                if not os.path.exists(control_path):
-                    logger.warning("No control match for %s (expected %s), skipping", basename, control_basename)
-                    continue
-
-                # Text cache uses stem without WxH dimensions
-                m = _LATENT_BASENAME_RE.match(basename)
-                if not m:
-                    logger.warning("Cannot parse latent filename %s, skipping", basename)
-                    continue
-
-                stem = m.group(1)
-                # Try to find matching text encoder cache
-                # Text cache can be: {stem}_ltx2_te.safetensors or {stem}_{WxH}_ltx2_te.safetensors
-                # For chunked files (e.g., H1_47_00001_00000-049), also try without chunk suffix (H1_47_00001)
-                te_path = None
-                te_stems_to_try = [stem]
-
-                # For chunked files, also try the base stem without chunk suffix (_XXXXX-XXX)
-                chunk_suffix_match = re.match(r"^(.+?)_\d{5}-\d{3}$", stem)
-                if chunk_suffix_match:
-                    base_stem = chunk_suffix_match.group(1)
-                    te_stems_to_try.append(base_stem)
-
-                import glob as glob_module
-                for te_stem in te_stems_to_try:
-                    # First try without dimensions
-                    te_basename = f"{te_stem}_ltx2_te.safetensors"
-                    te_candidate = os.path.join(text_dir, te_basename)
-                    if os.path.exists(te_candidate):
-                        te_path = te_candidate
-                        break
-
-                    # Try with dimensions wildcard
-                    te_pattern = os.path.join(text_dir, f"{te_stem}_*_ltx2_te.safetensors")
-                    te_matches = glob_module.glob(te_pattern)
-                    if te_matches:
-                        te_path = te_matches[0]
-                        break
-
-                if not te_path:
-                    logger.warning("No text cache for %s in %s, skipping", basename, text_dir)
-                    continue
-
-                # Get the shape of this pair for bucketing (read header only, no data loading)
-                shape = _get_latent_shape_from_file(original_path)
-                shape_key = shape
-
-                idx = len(self.pairs)
-                self.pairs.append((shape_key, original_path, control_path, te_path))
-
-                if shape_key not in self.buckets:
-                    self.buckets[shape_key] = []
-                self.buckets[shape_key].append(idx)
-
-        if len(self.pairs) == 0:
-            raise ValueError(f"No matched pairs found in the provided i2v cache directories")
-        logger.info("I2VSliderDataset: found %d matched pairs from %d dataset(s) in %d shape buckets",
-                   len(self.pairs), n_dirs, len(self.buckets))
-        for shape, indices in sorted(self.buckets.items()):
-            # shape is (C, F, H, W) where C=128, F=latent_frames, H=latent_height, W=latent_width
-            # Convert latent frames to actual video frames: actual = (latent - 1) * 8 + 1
-            # Convert latent resolution to pixels: H*32 x W*32
-            c, latent_f, h, w = shape
-            actual_f = (latent_f - 1) * 8 + 1
-            pixel_h = h * 32
-            pixel_w = w * 32
-            logger.info("  Bucket shape %s: %d items (frames: %d, resolution: %dx%d)",
-                       shape, len(indices), actual_f, pixel_h, pixel_w)
-
-    def __len__(self):
-        return len(self.pairs)
-
-    def __getitem__(self, idx):
-        shape_key, original_path, control_path, te_path = self.pairs[idx]
-
-        original_sd = load_file(original_path)
-        control_sd = load_file(control_path)
-        te_sd = load_file(te_path)
-
-        original_latents = _find_latent_tensor(original_sd)  # [C, F, H, W]
-        control_latents = _find_latent_tensor(control_sd)    # [C, F, H, W]
-        if original_latents.shape != control_latents.shape:
-            raise ValueError(
-                f"Shape mismatch for {os.path.basename(original_path)}: "
-                f"original {original_latents.shape} vs control {control_latents.shape}"
-            )
-        text_embeds = _find_text_tensor(te_sd)  # [seq_len, dim]
-        text_mask = te_sd.get("text_mask", torch.ones(text_embeds.shape[0]))  # [seq_len]
-
-        return {
-            "pos_latents": original_latents,   # Use original as "positive" (motion)
-            "neg_latents": control_latents,    # Use control as "negative" (no motion)
-            "text_embeds": text_embeds,
-            "text_mask": text_mask,
-        }
-
-
-def _slider_collate_fn(batch):
-    """Collate function that stacks tensors from the same shape bucket."""
-    # batch is a list of dicts with pos_latents, neg_latents, text_embeds, text_mask
-    # All items in the batch have the same latent shape (due to bucketing)
-
-    pos_latents = torch.stack([item["pos_latents"] for item in batch])  # [B, C, F, H, W]
-    neg_latents = torch.stack([item["neg_latents"] for item in batch])  # [B, C, F, H, W]
-
-    # Text embeddings may have different seq lengths, so pad them
-    text_embeds_list = [item["text_embeds"] for item in batch]
-    text_mask_list = [item["text_mask"] for item in batch]
-
-    # Find max seq length
-    max_seq_len = max(embed.shape[0] for embed in text_embeds_list)
-
-    # Pad to max length
-    padded_embeds = []
-    padded_masks = []
-    for embed, mask in zip(text_embeds_list, text_mask_list):
-        seq_len = embed.shape[0]
-        if seq_len < max_seq_len:
-            # Pad with zeros
-            pad_size = max_seq_len - seq_len
-            embed_pad = torch.nn.functional.pad(embed, (0, 0, 0, pad_size))
-            mask_pad = torch.nn.functional.pad(mask, (0, pad_size))
-            padded_embeds.append(embed_pad)
-            padded_masks.append(mask_pad)
-        else:
-            padded_embeds.append(embed)
-            padded_masks.append(mask)
-
-    text_embeds = torch.stack(padded_embeds)  # [B, seq_len, dim]
-    text_mask = torch.stack(padded_masks)  # [B, seq_len]
-
-    return {
-        "pos_latents": pos_latents,
-        "neg_latents": neg_latents,
-        "text_embeds": text_embeds,
-        "text_mask": text_mask,
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -561,6 +347,105 @@ class LTX2SliderTrainer:
         self._net_trainer = LTX2NetworkTrainer()
         self.slider_config: Optional[SliderConfig] = None
         self.cached_embeds: Dict[str, Tuple[torch.Tensor, torch.Tensor]] = {}
+
+    def _prepare_first_frame_conditioning(
+        self,
+        latents: torch.Tensor,
+        noisy_latents: torch.Tensor,
+        accelerator: Accelerator,
+        args: argparse.Namespace,
+        conditioning_enabled: Optional[bool] = None,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], Optional[torch.Tensor], bool]:
+        first_frame_p = float(getattr(args, "ltx2_first_frame_conditioning_p", 0.0))
+        if not (0.0 <= first_frame_p <= 1.0):
+            raise ValueError(f"ltx2_first_frame_conditioning_p must be in [0,1]. Got: {first_frame_p}")
+
+        if latents.dim() != 5 or latents.shape[2] <= 1 or first_frame_p <= 0.0:
+            return noisy_latents, {"patches_replace": {}}, None, False
+
+        if conditioning_enabled is None:
+            conditioning_enabled = bool(torch.rand((), device=accelerator.device) < first_frame_p)
+        if not conditioning_enabled:
+            return noisy_latents, {"patches_replace": {}}, None, False
+
+        conditioned_noisy = noisy_latents.clone()
+        conditioned_noisy[:, :, 0:1, :, :] = latents[:, :, 0:1, :, :].to(dtype=noisy_latents.dtype)
+
+        batch_size, _channels, frames, height, width = latents.shape
+        seq_len = frames * height * width
+        first_frame_tokens = height * width
+        video_conditioning_mask = torch.zeros(
+            (batch_size, seq_len), device=accelerator.device, dtype=torch.bool
+        )
+        if first_frame_tokens > 0:
+            video_conditioning_mask[:, :first_frame_tokens] = True
+
+        video_loss_mask = torch.ones(
+            (batch_size, 1, frames, 1, 1), device=accelerator.device, dtype=torch.bool
+        )
+        video_loss_mask[:, :, 0:1, :, :] = False
+
+        transformer_options = {
+            "patches_replace": {},
+            "video_conditioning_mask": video_conditioning_mask,
+        }
+        return conditioned_noisy, transformer_options, video_loss_mask, True
+
+    @staticmethod
+    def _compute_masked_mse_loss(
+        prediction: torch.Tensor,
+        target: torch.Tensor,
+        loss_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        squared_error = (prediction.float() - target.float()) ** 2
+        if loss_mask is None:
+            return squared_error.mean()
+
+        mask = loss_mask.to(device=prediction.device)
+        if mask.dtype != torch.bool:
+            mask = mask != 0
+        if mask.dim() == 2 and squared_error.dim() >= 4:
+            mask = mask.unsqueeze(1)
+        while mask.dim() < squared_error.dim():
+            mask = mask.unsqueeze(-1)
+        mask = mask.expand_as(squared_error)
+        masked_error = squared_error[mask]
+        if masked_error.numel() == 0:
+            return squared_error.new_zeros(())
+        return masked_error.mean()
+
+    @staticmethod
+    def _resolve_transformer_in_channels(transformer) -> int:
+        in_channels = getattr(transformer, "in_channels", None)
+        if in_channels is None and hasattr(transformer, "patchify_proj"):
+            in_channels = getattr(getattr(transformer, "patchify_proj", None), "in_features", None)
+        if in_channels is None:
+            raise ValueError("Could not determine transformer input channels for dummy video latents")
+        return int(in_channels)
+
+    @staticmethod
+    def _build_audio_loss_mask(
+        audio_latents: torch.Tensor,
+        audio_lengths: Optional[torch.Tensor],
+        device: torch.device,
+    ) -> torch.Tensor:
+        audio_seq_len = int(audio_latents.shape[2])
+        audio_loss_mask = torch.ones((audio_latents.shape[0], audio_seq_len), device=device, dtype=torch.bool)
+        if audio_lengths is None:
+            return audio_loss_mask
+
+        if audio_lengths.dim() == 0:
+            audio_lengths = audio_lengths.view(1)
+        if audio_lengths.numel() == 1 and audio_latents.shape[0] != 1:
+            audio_lengths = audio_lengths.expand(audio_latents.shape[0])
+        if audio_lengths.dim() != 1 or audio_lengths.shape[0] != audio_latents.shape[0]:
+            raise ValueError(
+                f"Expected audio_lengths to be [B] matching audio latents batch size, got shape {tuple(audio_lengths.shape)}"
+            )
+
+        audio_lengths = audio_lengths.to(device=device, dtype=torch.int64).clamp(min=0, max=audio_seq_len)
+        t = torch.arange(audio_seq_len, device=device).view(1, -1)
+        return t < audio_lengths.view(-1, 1)
 
     # -- Prompt pre-caching --------------------------------------------------
 
@@ -606,7 +491,11 @@ class LTX2SliderTrainer:
 
         # Sample sigma from shifted logit-normal
         seq_len = latent_frames * latent_height * latent_width
-        shift = LTX2NetworkTrainer._shifted_logit_normal_shift_for_sequence_length(seq_len)
+        shifted_logit_shift_override = getattr(args, "shifted_logit_shift", None)
+        if shifted_logit_shift_override is not None:
+            shift = float(shifted_logit_shift_override)
+        else:
+            shift = LTX2NetworkTrainer._shifted_logit_normal_shift_for_sequence_length(seq_len)
         shifted_logit_mode = self._net_trainer._resolve_shifted_logit_mode(args)
         sigma = LTX2NetworkTrainer._sample_shifted_logit_normal_sigmas(
             1,
@@ -665,23 +554,6 @@ class LTX2SliderTrainer:
         tgt_text, tgt_mask = _pad_and_batch([(tgt_e, tgt_m)], device, dit_dtype)
         noisy_dit = noisy.to(dtype=dit_dtype)
 
-        # Store inputs for preservation (blank_preservation, dop)
-        if self._net_trainer._preservation_active:
-            self._net_trainer._last_dit_inputs = {
-                "model_input": noisy_dit,
-                "model_timesteps": model_ts,
-                "audio_model_timesteps": None,
-                "text_embeds": tgt_text,
-                "text_mask": tgt_mask,
-                "video_conditioning": None,
-                "video_conditioning_mask": None,
-                "audio_latents": None,
-                "video_loss_weight": 1.0,
-                "audio_loss_weight": 0.0,
-                "frame_rate": self.slider_config.frame_rate,
-                "transformer_options": {},
-            }
-
         # Training pass 1: positive direction (multiplier=+1)
         network.set_multiplier(1.0)
         with accelerator.autocast():
@@ -731,37 +603,29 @@ class LTX2SliderTrainer:
         args: argparse.Namespace,
         dit_dtype: torch.dtype,
     ) -> float:
-        """One training step for reference-based slider mode.
-
-        Supports batched training with multiple positive/negative pairs per batch.
-        """
+        """One training step for reference-based slider mode."""
         device = accelerator.device
 
-        pos_latents = batch["pos_latents"].to(device=device, dtype=torch.float32)  # [B, 128, F, H, W]
+        pos_latents = batch["pos_latents"].to(device=device, dtype=torch.float32)  # [1, 128, F, H, W]
         neg_latents = batch["neg_latents"].to(device=device, dtype=torch.float32)
         text_embeds = batch["text_embeds"].to(device=device, dtype=dit_dtype)
         text_mask = batch["text_mask"].to(device=device, dtype=torch.int64)
 
-        batch_size = pos_latents.shape[0]
-
-        # Handle text embeddings: could be [seq_len, dim] or [B, seq_len, dim]
         if text_embeds.dim() == 2:
-            text_embeds = text_embeds.unsqueeze(0).expand(batch_size, -1, -1)
-        elif text_embeds.shape[0] != batch_size:
-            text_embeds = text_embeds.expand(batch_size, -1, -1)
-
-        # Handle text mask similarly
+            text_embeds = text_embeds.unsqueeze(0)
         if text_mask.dim() == 1:
-            text_mask = text_mask.unsqueeze(0).expand(batch_size, -1)
-        elif text_mask.shape[0] != batch_size:
-            text_mask = text_mask.expand(batch_size, -1)
+            text_mask = text_mask.unsqueeze(0)
 
-        # Same noise for both, per batch element
+        # Same noise for both
         noise = torch.randn_like(pos_latents)
 
-        # Sample sigma per batch element
+        # Sample sigma
         seq_len = pos_latents.shape[2] * pos_latents.shape[3] * pos_latents.shape[4]
-        shift = LTX2NetworkTrainer._shifted_logit_normal_shift_for_sequence_length(seq_len)
+        shifted_logit_shift_override = getattr(args, "shifted_logit_shift", None)
+        if shifted_logit_shift_override is not None:
+            shift = float(shifted_logit_shift_override)
+        else:
+            shift = LTX2NetworkTrainer._shifted_logit_normal_shift_for_sequence_length(seq_len)
         shifted_logit_mode = self._net_trainer._resolve_shifted_logit_mode(args)
         sigma = LTX2NetworkTrainer._sample_shifted_logit_normal_sigmas(
             1,
@@ -776,30 +640,20 @@ class LTX2SliderTrainer:
         # Create noisy versions (flow matching interpolation)
         noisy_pos = ((1.0 - sigma_exp) * pos_latents + sigma_exp * noise).to(dtype=dit_dtype)
         noisy_neg = ((1.0 - sigma_exp) * neg_latents + sigma_exp * noise).to(dtype=dit_dtype)
-        model_ts = sigma.unsqueeze(1)  # [B, 1]
+        model_ts = sigma.unsqueeze(1)
 
         # Flow matching velocity targets
         target_pos = (noise - pos_latents).to(dtype=dit_dtype)
         target_neg = (noise - neg_latents).to(dtype=dit_dtype)
 
-        self._net_trainer._ensure_fp8_buffers_on_device(accelerator.unwrap_model(transformer))
+        noisy_pos, transformer_options, video_loss_mask, conditioning_enabled = self._prepare_first_frame_conditioning(
+            pos_latents, noisy_pos, accelerator, args
+        )
+        noisy_neg, _, _, _ = self._prepare_first_frame_conditioning(
+            neg_latents, noisy_neg, accelerator, args, conditioning_enabled=conditioning_enabled
+        )
 
-        # Store inputs for preservation (blank_preservation, dop)
-        if self._net_trainer._preservation_active:
-            self._net_trainer._last_dit_inputs = {
-                "model_input": noisy_pos,  # Use positive latents as reference
-                "model_timesteps": model_ts,
-                "audio_model_timesteps": None,
-                "text_embeds": text_embeds,
-                "text_mask": text_mask,
-                "video_conditioning": None,
-                "video_conditioning_mask": None,
-                "audio_latents": None,
-                "video_loss_weight": 1.0,
-                "audio_loss_weight": 0.0,
-                "frame_rate": self.slider_config.frame_rate,
-                "transformer_options": {},
-            }
+        self._net_trainer._ensure_fp8_buffers_on_device(accelerator.unwrap_model(transformer))
 
         # Training pass: positive (multiplier=+1)
         network.set_multiplier(1.0)
@@ -810,9 +664,9 @@ class LTX2SliderTrainer:
                 context=text_embeds,
                 attention_mask=text_mask,
                 frame_rate=self.slider_config.frame_rate,
-                transformer_options={},
+                transformer_options=transformer_options,
             )
-        loss_pos = F_torch.mse_loss(pred_pos.float(), target_pos.float())
+        loss_pos = self._compute_masked_mse_loss(pred_pos, target_pos, video_loss_mask)
         accelerator.backward(loss_pos)
 
         del pred_pos
@@ -827,9 +681,9 @@ class LTX2SliderTrainer:
                 context=text_embeds,
                 attention_mask=text_mask,
                 frame_rate=self.slider_config.frame_rate,
-                transformer_options={},
+                transformer_options=transformer_options,
             )
-        loss_neg = F_torch.mse_loss(pred_neg.float(), target_neg.float())
+        loss_neg = self._compute_masked_mse_loss(pred_neg, target_neg, video_loss_mask)
         accelerator.backward(loss_neg)
 
         del pred_neg
@@ -838,9 +692,7 @@ class LTX2SliderTrainer:
         network.set_multiplier(1.0)
         return (loss_pos.item() + loss_neg.item()) / 2.0
 
-    # -- I2V slider step -------------------------------------------------------
-
-    def _i2v_slider_step(
+    def _audio_reference_slider_step(
         self,
         transformer,
         network,
@@ -849,123 +701,132 @@ class LTX2SliderTrainer:
         args: argparse.Namespace,
         dit_dtype: torch.dtype,
     ) -> float:
-        """One training step for i2v slider mode.
+        """One training step for audio-only reference slider mode."""
+        if getattr(args, "ltx_mode", "video") != "audio":
+            raise ValueError("Audio reference sliders require --ltx2_mode audio")
 
-        Uses first_frame_conditioning to preserve the first frame while training
-        the model to control motion amount on subsequent frames.
-
-        pos_latents: Original video with motion (e.g., camera rotation)
-        neg_latents: Control video with repeated first frame (no motion)
-        """
         device = accelerator.device
 
-        pos_latents = batch["pos_latents"].to(device=device, dtype=torch.float32)  # [B, 128, F, H, W]
-        neg_latents = batch["neg_latents"].to(device=device, dtype=torch.float32)
+        pos_audio_latents = batch["pos_audio_latents"].to(device=device, dtype=torch.float32)
+        neg_audio_latents = batch["neg_audio_latents"].to(device=device, dtype=torch.float32)
+        pos_virtual_latents = batch["pos_virtual_latents"].to(device=device, dtype=torch.float32)
+        neg_virtual_latents = batch["neg_virtual_latents"].to(device=device, dtype=torch.float32)
         text_embeds = batch["text_embeds"].to(device=device, dtype=dit_dtype)
         text_mask = batch["text_mask"].to(device=device, dtype=torch.int64)
 
-        batch_size = pos_latents.shape[0]
-
-        # Handle text embeddings: could be [seq_len, dim] or [B, seq_len, dim]
         if text_embeds.dim() == 2:
-            text_embeds = text_embeds.unsqueeze(0).expand(batch_size, -1, -1)
-        elif text_embeds.shape[0] != batch_size:
-            text_embeds = text_embeds.expand(batch_size, -1, -1)
-
-        # Handle text mask similarly
+            text_embeds = text_embeds.unsqueeze(0)
         if text_mask.dim() == 1:
-            text_mask = text_mask.unsqueeze(0).expand(batch_size, -1)
-        elif text_mask.shape[0] != batch_size:
-            text_mask = text_mask.expand(batch_size, -1)
+            text_mask = text_mask.unsqueeze(0)
 
-        # Same noise for both, per batch element
-        noise = torch.randn_like(pos_latents)
+        if pos_audio_latents.shape != neg_audio_latents.shape:
+            raise ValueError(
+                f"Audio slider pair shape mismatch: pos {tuple(pos_audio_latents.shape)} vs neg {tuple(neg_audio_latents.shape)}"
+            )
+        if pos_virtual_latents.shape != neg_virtual_latents.shape:
+            raise ValueError(
+                "Audio slider virtual geometry mismatch: "
+                f"pos {tuple(pos_virtual_latents.shape)} vs neg {tuple(neg_virtual_latents.shape)}"
+            )
 
-        # Sample sigma per batch element
-        seq_len = pos_latents.shape[2] * pos_latents.shape[3] * pos_latents.shape[4]
-        shift = LTX2NetworkTrainer._shifted_logit_normal_shift_for_sequence_length(seq_len)
-        sigma = torch.sigmoid(torch.randn(batch_size, device=device) + shift)  # [B]
-        sigma_exp = sigma.view(batch_size, 1, 1, 1, 1)  # [B, 1, 1, 1, 1]
+        noise = torch.randn_like(pos_audio_latents)
 
-        # Create noisy versions (flow matching interpolation)
-        noisy_pos = ((1.0 - sigma_exp) * pos_latents + sigma_exp * noise).to(dtype=dit_dtype)
-        noisy_neg = ((1.0 - sigma_exp) * neg_latents + sigma_exp * noise).to(dtype=dit_dtype)
+        seq_len = pos_virtual_latents.shape[2] * pos_virtual_latents.shape[3] * pos_virtual_latents.shape[4]
+        shifted_logit_shift_override = getattr(args, "shifted_logit_shift", None)
+        if shifted_logit_shift_override is not None:
+            shift = float(shifted_logit_shift_override)
+        else:
+            shift = self._net_trainer._resolve_shifted_logit_normal_shift(args, int(seq_len))
+        shifted_logit_mode = self._net_trainer._resolve_shifted_logit_mode(args)
+        sigma = LTX2NetworkTrainer._sample_shifted_logit_normal_sigmas(
+            pos_audio_latents.shape[0],
+            torch.full((pos_audio_latents.shape[0],), float(shift), device=device, dtype=torch.float32),
+            std=float(getattr(args, "logit_std", 1.0)),
+            mode=shifted_logit_mode,
+            eps=float(getattr(args, "shifted_logit_eps", 1e-3)),
+            uniform_prob=float(getattr(args, "shifted_logit_uniform_prob", 0.1)),
+        )
+        model_ts = sigma.unsqueeze(1).to(dtype=dit_dtype)
+        audio_model_ts = model_ts
+        if bool(getattr(args, "independent_audio_timestep", False)):
+            audio_model_ts = self._net_trainer._sample_independent_audio_timesteps(
+                args,
+                batch_size=pos_audio_latents.shape[0],
+                device=device,
+                dtype=dit_dtype,
+            )
+        sigma_audio = audio_model_ts[:, 0].to(dtype=torch.float32).view(-1, 1, 1, 1)
 
-        # Flow matching velocity targets
-        target_pos = (noise - pos_latents).to(dtype=dit_dtype)
-        target_neg = (noise - neg_latents).to(dtype=dit_dtype)
+        noisy_pos = ((1.0 - sigma_audio) * pos_audio_latents + sigma_audio * noise).to(dtype=dit_dtype)
+        noisy_neg = ((1.0 - sigma_audio) * neg_audio_latents + sigma_audio * noise).to(dtype=dit_dtype)
 
-        # Enable first frame conditioning for i2v mode
-        # This preserves the first frame (timestep=0) while training subsequent frames
-        first_frame_p = self.slider_config.first_frame_conditioning_p
-        num_frames = pos_latents.shape[2]
-        video_conditioning_enabled = None
-        if first_frame_p > 0.0 and num_frames > 1:
-            # Always enable for i2v mode (typically first_frame_p=1.0)
-            video_conditioning_enabled = torch.ones((batch_size,), device=device, dtype=torch.bool)
+        target_pos = (noise - pos_audio_latents).to(dtype=dit_dtype)
+        target_neg = (noise - neg_audio_latents).to(dtype=dit_dtype)
+
+        audio_lengths = batch.get("audio_lengths")
+        neg_audio_lengths = batch.get("neg_audio_lengths")
+        if isinstance(audio_lengths, torch.Tensor):
+            audio_lengths = audio_lengths.to(device=device)
+        if isinstance(neg_audio_lengths, torch.Tensor):
+            neg_audio_lengths = neg_audio_lengths.to(device=device)
+        loss_mask_pos = self._build_audio_loss_mask(pos_audio_latents, audio_lengths, device)
+        loss_mask_neg = self._build_audio_loss_mask(neg_audio_latents, neg_audio_lengths, device)
+
+        dummy_video = torch.zeros(
+            (pos_audio_latents.shape[0], self._resolve_transformer_in_channels(transformer), 1, 1, 1),
+            device=device,
+            dtype=dit_dtype,
+        )
+        transformer_options = {"patches_replace": {}}
 
         self._net_trainer._ensure_fp8_buffers_on_device(accelerator.unwrap_model(transformer))
 
-        # Create timestep tensor with first frame conditioning
-        model_ts = sigma.unsqueeze(1)  # [B, 1]
-        if video_conditioning_enabled is not None:
-            # For first frame conditioning, we need to pass the conditioning info
-            # to the transformer via transformer_options
-            transformer_options = {
-                "video_conditioning_enabled": video_conditioning_enabled,
-            }
-        else:
-            transformer_options = {}
-
-        # Store inputs for preservation (blank_preservation, dop)
-        if self._net_trainer._preservation_active:
-            self._net_trainer._last_dit_inputs = {
-                "model_input": noisy_pos,  # Use positive latents as reference
-                "model_timesteps": model_ts,
-                "audio_model_timesteps": None,
-                "text_embeds": text_embeds,
-                "text_mask": text_mask,
-                "video_conditioning": None,
-                "video_conditioning_mask": None,
-                "audio_latents": None,
-                "video_loss_weight": 1.0,
-                "audio_loss_weight": 0.0,
-                "frame_rate": self.slider_config.frame_rate,
-                "transformer_options": transformer_options,
-            }
-
-        # Training pass: positive (multiplier=+1) - original video with motion
         network.set_multiplier(1.0)
         with accelerator.autocast():
             pred_pos = transformer(
-                noisy_pos,
+                [dummy_video, noisy_pos],
                 timestep=model_ts,
+                audio_timestep=audio_model_ts,
                 context=text_embeds,
                 attention_mask=text_mask,
                 frame_rate=self.slider_config.frame_rate,
                 transformer_options=transformer_options,
+                audio_only=True,
             )
-        loss_pos = F_torch.mse_loss(pred_pos.float(), target_pos.float())
+        if isinstance(pred_pos, (list, tuple)):
+            _video_pred_pos, pred_pos_audio = pred_pos
+        else:
+            pred_pos_audio = None
+        if pred_pos_audio is None:
+            raise ValueError("Audio slider expected an audio prediction but got None")
+        loss_pos = self._compute_masked_mse_loss(pred_pos_audio, target_pos, loss_mask_pos)
         accelerator.backward(loss_pos)
 
-        del pred_pos
+        del pred_pos, pred_pos_audio
         clean_memory_on_device(device)
 
-        # Training pass: negative (multiplier=-1) - control video without motion
         network.set_multiplier(-1.0)
         with accelerator.autocast():
             pred_neg = transformer(
-                noisy_neg,
+                [dummy_video, noisy_neg],
                 timestep=model_ts,
+                audio_timestep=audio_model_ts,
                 context=text_embeds,
                 attention_mask=text_mask,
                 frame_rate=self.slider_config.frame_rate,
                 transformer_options=transformer_options,
+                audio_only=True,
             )
-        loss_neg = F_torch.mse_loss(pred_neg.float(), target_neg.float())
+        if isinstance(pred_neg, (list, tuple)):
+            _video_pred_neg, pred_neg_audio = pred_neg
+        else:
+            pred_neg_audio = None
+        if pred_neg_audio is None:
+            raise ValueError("Audio slider expected an audio prediction but got None")
+        loss_neg = self._compute_masked_mse_loss(pred_neg_audio, target_neg, loss_mask_neg)
         accelerator.backward(loss_neg)
 
-        del pred_neg
+        del pred_neg, pred_neg_audio
         clean_memory_on_device(device)
 
         network.set_multiplier(1.0)
@@ -983,7 +844,6 @@ class LTX2SliderTrainer:
         sample_parameters,
         dit_dtype: torch.dtype,
         global_step: int,
-        epoch: int = 0,
     ) -> None:
         """Generate preview samples at multiple slider strengths."""
         if sample_parameters is None:
@@ -1000,7 +860,7 @@ class LTX2SliderTrainer:
             args.output_name = f"{original_name}_mult{mult:+.1f}"
 
             self._net_trainer.sample_images(
-                accelerator, args, epoch, global_step, vae, transformer, sample_parameters, dit_dtype
+                accelerator, args, None, global_step, vae, transformer, sample_parameters, dit_dtype
             )
 
             args.output_name = original_name
@@ -1017,91 +877,19 @@ class LTX2SliderTrainer:
         """
         cfg = self.slider_config
         dataset = PairedSliderDataset(
-            pos_cache_dirs=cfg.pos_cache_dirs,
-            neg_cache_dirs=cfg.neg_cache_dirs,
-            text_cache_dirs=cfg.text_cache_dirs,
+            cfg.pos_cache_dir,
+            cfg.neg_cache_dir,
+            cfg.text_cache_dir,
+            reference_modality=cfg.reference_modality,
         )
         num_workers = min(getattr(args, "max_data_loader_n_workers", 2), os.cpu_count() or 1)
-
-        # Use batch_size from slider config for bucket batching
-        # If batch_size > 1, use bucket sampler to group same-shape items together
-        batch_size = cfg.batch_size
-        use_bucket_batching = batch_size > 1
-
-        if use_bucket_batching:
-            # Check if we have enough items per bucket for the requested batch_size
-            min_bucket_size = min(len(indices) for indices in dataset.buckets.values())
-            if min_bucket_size < batch_size:
-                logger.warning(
-                    f"Requested batch_size={batch_size} but smallest bucket only has {min_bucket_size} items. "
-                    f"Reducing effective batch_size for small buckets. Use batch_size=1 or gradient_accumulation_steps for consistent batching."
-                )
-
-            # Use bucket sampler for true batching within each shape group
-            batch_sampler = SliderBucketBatchSampler(dataset, batch_size=batch_size, shuffle=True)
-            dataloader = torch.utils.data.DataLoader(
-                dataset,
-                batch_sampler=batch_sampler,
-                collate_fn=_slider_collate_fn,
-                num_workers=num_workers,
-                persistent_workers=num_workers > 0 and getattr(args, "persistent_data_loader_workers", False),
-            )
-        else:
-            # batch_size=1: use simple dataloader without bucketing
-            dataloader = torch.utils.data.DataLoader(
-                dataset,
-                batch_size=1,
-                shuffle=True,
-                num_workers=num_workers,
-                persistent_workers=num_workers > 0 and getattr(args, "persistent_data_loader_workers", False),
-            )
-        return dataloader
-
-    # -- I2V dataset ----------------------------------------------------------
-
-    def _build_i2v_dataloader(self, args: argparse.Namespace):
-        """Build a dataloader for i2v-mode slider training.
-
-        Loads original/control video pairs from pre-cached directories.
-        """
-        cfg = self.slider_config
-        dataset = I2VSliderDataset(
-            i2v_cache_dirs=cfg.i2v_cache_dirs,
-            text_cache_dirs=cfg.text_cache_dirs,
+        dataloader = torch.utils.data.DataLoader(
+            dataset,
+            batch_size=1,
+            shuffle=True,
+            num_workers=num_workers,
+            persistent_workers=num_workers > 0 and getattr(args, "persistent_data_loader_workers", False),
         )
-        num_workers = min(getattr(args, "max_data_loader_n_workers", 2), os.cpu_count() or 1)
-
-        # Use batch_size from slider config for bucket batching
-        batch_size = cfg.batch_size
-        use_bucket_batching = batch_size > 1
-
-        if use_bucket_batching:
-            # Check if we have enough items per bucket for the requested batch_size
-            min_bucket_size = min(len(indices) for indices in dataset.buckets.values())
-            if min_bucket_size < batch_size:
-                logger.warning(
-                    f"Requested batch_size={batch_size} but smallest bucket only has {min_bucket_size} items. "
-                    f"Reducing effective batch_size for small buckets. Use batch_size=1 or gradient_accumulation_steps for consistent batching."
-                )
-
-            # Use bucket sampler for true batching within each shape group
-            batch_sampler = SliderBucketBatchSampler(dataset, batch_size=batch_size, shuffle=True)
-            dataloader = torch.utils.data.DataLoader(
-                dataset,
-                batch_sampler=batch_sampler,
-                collate_fn=_slider_collate_fn,
-                num_workers=num_workers,
-                persistent_workers=num_workers > 0 and getattr(args, "persistent_data_loader_workers", False),
-            )
-        else:
-            # batch_size=1: use simple dataloader without bucketing
-            dataloader = torch.utils.data.DataLoader(
-                dataset,
-                batch_size=1,
-                shuffle=True,
-                num_workers=num_workers,
-                persistent_workers=num_workers > 0 and getattr(args, "persistent_data_loader_workers", False),
-            )
         return dataloader
 
     # -- Main training entry --------------------------------------------------
@@ -1121,29 +909,45 @@ class LTX2SliderTrainer:
 
         # Load slider config
         self.slider_config = load_slider_config(args.slider_config)
-        logger.info("Slider mode: %s, targets: %d", self.slider_config.mode, len(self.slider_config.targets))
+        logger.info(
+            "Slider mode: %s, reference_modality: %s, targets: %d",
+            self.slider_config.mode,
+            self.slider_config.reference_modality,
+            len(self.slider_config.targets),
+        )
 
         # Override from CLI if given
         if getattr(args, "guidance_strength", None) is not None:
             self.slider_config.guidance_strength = args.guidance_strength
         if getattr(args, "sample_slider_range", None) is not None:
             self.slider_config.sample_slider_range = [float(v) for v in args.sample_slider_range.split(",")]
-        if getattr(args, "first_frame_conditioning_p", None) is not None:
-            self.slider_config.first_frame_conditioning_p = args.first_frame_conditioning_p
 
         # Validate
-        if self.slider_config.mode not in {"text", "reference", "i2v"}:
-            raise ValueError(f"Invalid slider mode '{self.slider_config.mode}'. Must be 'text', 'reference', or 'i2v'.")
+        if self.slider_config.mode not in {"text", "reference"}:
+            raise ValueError(f"Invalid slider mode '{self.slider_config.mode}'. Must be 'text' or 'reference'.")
+        if self.slider_config.reference_modality not in {"video", "audio"}:
+            raise ValueError(
+                f"Invalid reference_modality '{self.slider_config.reference_modality}'. Must be 'video' or 'audio'."
+            )
         if self.slider_config.mode == "text" and len(self.slider_config.targets) == 0:
             raise ValueError("Text-only slider mode requires at least one target in slider config")
         if self.slider_config.mode == "reference":
-            # Check for multi-dataset lists
-            if not self.slider_config.pos_cache_dirs or not self.slider_config.neg_cache_dirs:
-                raise ValueError("Reference slider mode requires pos_cache_dirs and neg_cache_dirs in slider config")
-        if self.slider_config.mode == "i2v":
-            # Check for i2v dataset lists
-            if not self.slider_config.i2v_cache_dirs:
-                raise ValueError("I2V slider mode requires i2v_cache_dirs in slider config")
+            if not self.slider_config.pos_cache_dir or not self.slider_config.neg_cache_dir:
+                raise ValueError("Reference slider mode requires pos_cache_dir and neg_cache_dir in slider config")
+            if self.slider_config.reference_modality == "audio":
+                if getattr(args, "ltx_mode", "video") != "audio":
+                    raise ValueError("Audio reference sliders require --ltx2_mode audio")
+                if getattr(args, "sample_prompts", None) and not bool(getattr(args, "sample_audio_only", False)):
+                    logger.info("Enabling --sample_audio_only automatically for audio reference sliders.")
+                    args.sample_audio_only = True
+                if getattr(args, "lora_target_preset", None) is None:
+                    logger.info("Using lora_target_preset=audio for audio reference slider training")
+                    args.lora_target_preset = "audio"
+                elif getattr(args, "lora_target_preset", None) != "audio":
+                    logger.warning(
+                        "Audio reference sliders work best with --lora_target_preset audio; got %s",
+                        args.lora_target_preset,
+                    )
 
         # Seed
         if args.seed is None:
@@ -1278,8 +1082,7 @@ class LTX2SliderTrainer:
                 clean_memory_on_device(accelerator.device)
 
         # -- Optimizer & scheduler ---------------------------------------------
-        # Use compat wrapper for automatic Prodigy LR handling
-        trainable_params, lr_descriptions = prepare_optimizer_params_compat(network, args, logger)
+        trainable_params, lr_descriptions = network.prepare_optimizer_params(unet_lr=args.learning_rate)
         optimizer_name, optimizer_args_str, optimizer, optimizer_train_fn, optimizer_eval_fn = (
             NetworkTrainer().get_optimizer(args, trainable_params)
         )
@@ -1299,56 +1102,6 @@ class LTX2SliderTrainer:
 
         network, optimizer, lr_scheduler = accelerator.prepare(network, optimizer, lr_scheduler)
 
-        # -- Pre-train hooks (preservation, CREPA, etc.) -------------------------
-        # This sets up blank_preservation, dop, prior_divergence, crepa if enabled
-        self._net_trainer.pre_train_hook(args, accelerator, transformer=transformer, network=network)
-
-        # -- Register hooks to exclude transformer from state saving ---------------
-        # Only save the LoRA network, not the base transformer (13GB+)
-        def save_model_hook(models, weights, output_dir):
-            """Filter out all models except the LoRA network when saving state."""
-            remove_indices = []
-            for i, model in enumerate(models):
-                if not isinstance(model, type(accelerator.unwrap_model(network))):
-                    remove_indices.append(i)
-            for i in reversed(remove_indices):
-                models.pop(i)
-                weights.pop(i)
-
-        def load_model_hook(models, input_dir):
-            """Filter out all models except the LoRA network when loading state."""
-            import os
-            from safetensors.torch import load_file
-
-            # Check if this is an old state with multiple model files
-            # Old states: model.safetensors (transformer) + model_1.safetensors (LoRA)
-            # New states: model.safetensors (LoRA only)
-            model_1_path = os.path.join(input_dir, "model_1.safetensors")
-
-            if os.path.exists(model_1_path):
-                # Old format: keep only model_1 (LoRA), discard model (transformer)
-                logger.info("Detected old state format with separate transformer/LoRA files. Loading LoRA only.")
-                # Load model_1 into the first model (LoRA network)
-                if len(models) > 0:
-                    try:
-                        state_dict = load_file(model_1_path)
-                        models[0].load_state_dict(state_dict, strict=False)
-                    except Exception as e:
-                        logger.warning(f"Failed to load model_1.safetensors: {e}")
-                # Clear all models since we manually loaded
-                models.clear()
-            else:
-                # New format: filter by model type
-                remove_indices = []
-                for i, model in enumerate(models):
-                    if not isinstance(model, type(accelerator.unwrap_model(network))):
-                        remove_indices.append(i)
-                for i in reversed(remove_indices):
-                    models.pop(i)
-
-        accelerator.register_save_state_pre_hook(save_model_hook)
-        accelerator.register_load_state_pre_hook(load_model_hook)
-
         if args.gradient_checkpointing:
             transformer.train()
         else:
@@ -1356,21 +1109,10 @@ class LTX2SliderTrainer:
 
         accelerator.unwrap_model(network).prepare_grad_etc(transformer)
 
-        # -- Resume training if specified ----------------------------------------
-        global_step = 0
-        current_epoch = 0
-        if getattr(args, "resume", None):
-            logger.info(f"Resuming training from state: {args.resume}")
-            self._net_trainer.resume_from_local_or_hf_if_specified(accelerator, args)
-            global_step = self._net_trainer._recover_global_step(args.resume) if not getattr(args, "resume_from_huggingface", False) else 0
-            logger.info(f"Resumed from global_step: {global_step}")
-
-        # -- Reference dataloader (if reference or i2v mode) -------------------------
+        # -- Reference dataloader (if reference mode) -------------------------
         ref_dataloader = None
         if self.slider_config.mode == "reference":
             ref_dataloader = self._build_reference_dataloader(args)
-        elif self.slider_config.mode == "i2v":
-            ref_dataloader = self._build_i2v_dataloader(args)
 
         # -- Metadata ----------------------------------------------------------
         metadata = {
@@ -1482,14 +1224,7 @@ class LTX2SliderTrainer:
             disable=not accelerator.is_local_main_process, desc="steps",
         )
 
-        # Initialize global_step/current_epoch if not already set by resume
-        if not getattr(args, "resume", None):
-            global_step = 0
-            current_epoch = 0
-        else:
-            # Update progress bar to show resumed position
-            progress_bar.update(global_step)
-
+        global_step = 0
         loss_recorder = train_utils.LossRecorder()
 
         clean_memory_on_device(accelerator.device)
@@ -1505,137 +1240,39 @@ class LTX2SliderTrainer:
             logger.info("  latent_frames: %d", getattr(args, "latent_frames", 1))
             logger.info("  latent_height: %d", getattr(args, "latent_height", 512))
             logger.info("  latent_width: %d", getattr(args, "latent_width", 768))
-        elif self.slider_config.mode == "reference":
-            logger.info("  dataset size: %d", len(ref_dataloader.dataset))
-            batch_size = self.slider_config.batch_size
-            grad_accum = getattr(args, "gradient_accumulation_steps", 1)
-            logger.info("  batch_size: %d (gradient_accumulation_steps: %d, effective_batch_size: %d)",
-                       batch_size, grad_accum, batch_size * grad_accum)
-            logger.info("  save_every_n_epochs: %s", getattr(args, "save_every_n_epochs", "disabled"))
-        elif self.slider_config.mode == "i2v":
-            logger.info("  dataset size: %d", len(ref_dataloader.dataset))
-            batch_size = self.slider_config.batch_size
-            grad_accum = getattr(args, "gradient_accumulation_steps", 1)
-            logger.info("  batch_size: %d (gradient_accumulation_steps: %d, effective_batch_size: %d)",
-                       batch_size, grad_accum, batch_size * grad_accum)
-            logger.info("  save_every_n_epochs: %s", getattr(args, "save_every_n_epochs", "disabled"))
 
         # Sample at first if requested
-        if should_sample_images(args, 0, epoch=current_epoch):
+        if should_sample_images(args, 0, epoch=0):
             optimizer_eval_fn()
-            self._sample_slider(accelerator, args, transformer, vae, accelerator.unwrap_model(network), sample_parameters, dit_dtype, 0, current_epoch)
+            self._sample_slider(accelerator, args, transformer, vae, accelerator.unwrap_model(network), sample_parameters, dit_dtype, 0)
             optimizer_train_fn()
 
         ref_iter = None
         if ref_dataloader is not None:
             ref_iter = iter(ref_dataloader)
 
-        # Track steps in current epoch for reference mode
-        steps_in_current_epoch = 0
-        dataset_size = len(ref_dataloader.dataset) if ref_dataloader is not None else 0
-
-        # Flag to track if we need to save at epoch boundary
-        epoch_to_save = None
-
         while global_step < args.max_train_steps:
             accelerator.unwrap_model(network).on_step_start()
-
-            # Save at epoch boundary if needed (outside of accumulate block)
-            if epoch_to_save is not None:
-                optimizer_eval_fn()
-                accelerator.wait_for_everyone()
-                if accelerator.is_main_process:
-                    logger.info("Saving checkpoint at epoch %d", epoch_to_save)
-                    ckpt_name = train_utils.get_epoch_ckpt_name(args.output_name, epoch_to_save)
-                    save_model(ckpt_name, accelerator.unwrap_model(network), global_step, epoch_to_save)
-
-                    if getattr(args, "save_state", False):
-                        train_utils.save_and_remove_state_stepwise(args, accelerator, global_step)
-
-                    remove_step_no = train_utils.get_remove_step_no(args, global_step)
-                    if remove_step_no is not None:
-                        remove_ckpt_name = train_utils.get_step_ckpt_name(args.output_name, remove_step_no)
-                        remove_model(remove_ckpt_name)
-
-                optimizer_train_fn()
-                epoch_to_save = None
 
             with accelerator.accumulate(network):
                 if self.slider_config.mode == "text":
                     loss = self._text_slider_step(transformer, network, accelerator, args, dit_dtype)
-                elif self.slider_config.mode == "reference":
+                else:
                     # Reference mode: get next batch
                     try:
                         batch = next(ref_iter)
                     except StopIteration:
-                        # Completed one epoch
-                        epoch_completed = current_epoch
-                        current_epoch += 1
-                        steps_in_current_epoch = 0
-                        logger.info("Completed epoch %d, starting epoch %d", epoch_completed, current_epoch)
-
-                        # Log epoch-level metrics to tensorboard
-                        if len(accelerator.trackers) > 0:
-                            logs = {"loss/epoch": loss_recorder.moving_average}
-                            accelerator.log(logs, step=epoch_completed + 1)
-
-                        # Check if we should save after completing this epoch
-                        if (getattr(args, "save_every_n_epochs", None) is not None
-                                and epoch_completed > 0
-                                and epoch_completed % args.save_every_n_epochs == 0):
-                            # Mark for saving after exiting accumulate block
-                            epoch_to_save = epoch_completed
-
-                        # Restart iterator for next epoch
                         ref_iter = iter(ref_dataloader)
                         batch = next(ref_iter)
-
-                    loss = self._reference_slider_step(transformer, network, batch, accelerator, args, dit_dtype)
-                    steps_in_current_epoch += 1
-                else:  # i2v mode
-                    # I2V mode: get next batch
-                    try:
-                        batch = next(ref_iter)
-                    except StopIteration:
-                        # Completed one epoch
-                        epoch_completed = current_epoch
-                        current_epoch += 1
-                        steps_in_current_epoch = 0
-                        logger.info("Completed epoch %d, starting epoch %d", epoch_completed, current_epoch)
-
-                        # Log epoch-level metrics to tensorboard
-                        if len(accelerator.trackers) > 0:
-                            logs = {"loss/epoch": loss_recorder.moving_average}
-                            accelerator.log(logs, step=epoch_completed + 1)
-
-                        # Check if we should save after completing this epoch
-                        if (getattr(args, "save_every_n_epochs", None) is not None
-                                and epoch_completed > 0
-                                and epoch_completed % args.save_every_n_epochs == 0):
-                            # Mark for saving after exiting accumulate block
-                            epoch_to_save = epoch_completed
-
-                        # Restart iterator for next epoch
-                        ref_iter = iter(ref_dataloader)
-                        batch = next(ref_iter)
-
-                    loss = self._i2v_slider_step(transformer, network, batch, accelerator, args, dit_dtype)
-                    steps_in_current_epoch += 1
+                    if self.slider_config.reference_modality == "audio":
+                        loss = self._audio_reference_slider_step(transformer, network, batch, accelerator, args, dit_dtype)
+                    else:
+                        loss = self._reference_slider_step(transformer, network, batch, accelerator, args, dit_dtype)
 
                 # Gradient clipping
                 if accelerator.sync_gradients and getattr(args, "max_grad_norm", 0.0) != 0.0:
                     params_to_clip = accelerator.unwrap_model(network).get_trainable_params()
                     accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
-
-                # -- Preservation / Regularization (blank_preservation, dop) -----------
-                # Run preservation backward passes for blank and DOP
-                # Note: prior_divergence is skipped for slider training since it requires
-                # a single video_pred which isn't available in the multi-pass slider step
-                pres_losses = {}
-                if self._net_trainer._preservation_active and self._net_trainer._preservation_helper is not None:
-                    pres_losses = self._net_trainer.preservation_backward(
-                        args, accelerator, transformer, network, dit_dtype,
-                    )
 
                 if accelerator.sync_gradients:
                     optimizer.step()
@@ -1650,82 +1287,40 @@ class LTX2SliderTrainer:
             progress_bar.update(1)
             global_step += 1
 
-            loss_recorder.add(epoch=current_epoch, step=global_step - 1, loss=loss)
+            loss_recorder.add(epoch=0, step=global_step - 1, loss=loss)
             avr_loss = loss_recorder.moving_average
             progress_bar.set_postfix(avr_loss=f"{avr_loss:.4f}", loss=f"{loss:.4f}")
 
             if len(accelerator.trackers) > 0:
-                # Get LR - handle automagic optimizer specially
-                if args.optimizer_type.lower() == "automagic":
-                    # Automagic has per-parameter LRs, get them directly
-                    actual_optimizer = optimizer.optimizer if hasattr(optimizer, "optimizer") else optimizer
-                    if hasattr(actual_optimizer, "get_avg_learning_rate"):
-                        lr_value = actual_optimizer.get_avg_learning_rate()
-                        lr_tensor = actual_optimizer.get_lr_tensor()
-                        logs = {
-                            "loss/current": loss,
-                            "loss/average": avr_loss,
-                            "lr/unet": lr_value,
-                        }
-                        # Log additional automagic metrics if available
-                        if lr_tensor is not None and len(lr_tensor) > 1:
-                            logs["lr/automagic_min"] = float(lr_tensor.min())
-                            logs["lr/automagic_max"] = float(lr_tensor.max())
-                            logs["lr/automagic_std"] = float(lr_tensor.std())
-                    else:
-                        lr_value = 0.0
-                        logs = {
-                            "loss/current": loss,
-                            "loss/average": avr_loss,
-                            "lr/unet": lr_value,
-                        }
-                else:
-                    # Standard optimizer/scheduler
-                    lrs = lr_scheduler.get_last_lr()
-                    logs = {
-                        "loss/current": loss,
-                        "loss/average": avr_loss,
-                        "lr/unet": float(lrs[0]) if lrs else 0.0,
-                    }
-
-                # Add preservation losses to logs (blank_pres, dop)
-                if pres_losses:
-                    logs.update(pres_losses)
-
+                lrs = lr_scheduler.get_last_lr()
+                logs = {
+                    "loss/current": loss,
+                    "loss/average": avr_loss,
+                    "lr/unet": float(lrs[0]) if lrs else 0.0,
+                }
                 accelerator.log(logs, step=global_step)
 
             # Sampling
-            # For --sample_at_first: skip sampling at epoch 0 if sample_at_first is False
-            # (Same check as normal training to avoid buggy should_sample_images behavior)
-            if current_epoch == 0 and not getattr(args, "sample_at_first", False):
-                should_sampling = False
-            else:
-                # Check step-based sampling
-                should_sampling = should_sample_images(args, global_step, epoch=None)  # Pass None to skip epoch check
-                # Handle epoch-based sampling separately: only sample on first step of qualifying epochs
-                if not should_sampling and getattr(args, "sample_every_n_epochs", None) is not None:
-                    if current_epoch % args.sample_every_n_epochs == 0 and steps_in_current_epoch == 0:
-                        should_sampling = True
-            should_saving_steps = (
+            should_sampling = should_sample_images(args, global_step, epoch=None)
+            should_saving = (
                 getattr(args, "save_every_n_steps", None) is not None
                 and global_step % args.save_every_n_steps == 0
             )
-            # Note: epoch-based saving is handled inside the training loop when dataloader is exhausted
 
-            if should_sampling or should_saving_steps:
+            if should_sampling or should_saving:
                 optimizer_eval_fn()
 
                 if should_sampling:
                     self._sample_slider(
                         accelerator, args, transformer, vae,
-                        accelerator.unwrap_model(network), sample_parameters, dit_dtype, global_step, current_epoch,
+                        accelerator.unwrap_model(network), sample_parameters, dit_dtype, global_step,
                     )
 
-                if should_saving_steps:
+                if should_saving:
                     accelerator.wait_for_everyone()
                     if accelerator.is_main_process:
                         ckpt_name = train_utils.get_step_ckpt_name(args.output_name, global_step)
-                        save_model(ckpt_name, accelerator.unwrap_model(network), global_step, current_epoch)
+                        save_model(ckpt_name, accelerator.unwrap_model(network), global_step, 0)
 
                         if getattr(args, "save_state", False):
                             train_utils.save_and_remove_state_stepwise(args, accelerator, global_step)
@@ -1746,7 +1341,7 @@ class LTX2SliderTrainer:
 
         if is_main_process:
             ckpt_name = train_utils.get_last_ckpt_name(args.output_name)
-            save_model(ckpt_name, accelerator.unwrap_model(network), global_step, current_epoch, force_sync_upload=True)
+            save_model(ckpt_name, accelerator.unwrap_model(network), global_step, 0, force_sync_upload=True)
             logger.info("Slider training complete. Model saved.")
 
 
@@ -1780,10 +1375,6 @@ def slider_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
     parser.add_argument(
         "--sample_slider_range", type=str, default=None,
         help="Comma-separated multiplier values for preview, e.g. '-2,-1,0,1,2'",
-    )
-    parser.add_argument(
-        "--first_frame_conditioning_p", type=float, default=None,
-        help="Override first frame conditioning probability from slider config (typically 1.0 for i2v mode)",
     )
     return parser
 

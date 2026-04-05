@@ -14,10 +14,10 @@ ComfyUI format:
 """
 
 import safetensors.torch
-import torch
 import argparse
 import os
 from pathlib import Path
+import torch
 
 
 def convert_key_to_comfy(key):
@@ -41,13 +41,24 @@ def convert_key_to_comfy(key):
     main_part = parts[0]  # e.g., lora_unet_model_transformer_blocks_0_attn1_to_k
     weight_part = '.'.join(parts[1:])  # e.g., lora_down.weight
 
-    # Remove the 'lora_unet_model_' prefix and replace with 'diffusion_model.'
-    if not main_part.startswith('lora_unet_model_'):
-        print(f"Warning: Key doesn't start with 'lora_unet_model_': {key}")
+    # Remove the lora_unet_ prefix and handle the wrapper's module structure.
+    # Transformer keys: lora_unet_model_transformer_blocks_... (wrapper.model.transformer_blocks)
+    # Connector keys:   lora_unet_embeddings_connector_... (wrapper.embeddings_connector)
+    if main_part.startswith('lora_unet_model_'):
+        # Standard transformer path: strip wrapper.model prefix
+        main_part = main_part[len('lora_unet_model_'):]
+    elif main_part.startswith('lora_unet_'):
+        # Connector or other wrapper-level module
+        main_part = main_part[len('lora_unet_'):]
+    else:
+        print(f"Warning: Key doesn't start with 'lora_unet_': {key}")
         return None
 
-    # Remove prefix
-    main_part = main_part[len('lora_unet_model_'):]
+    # Map connector attribute names to ComfyUI model names
+    # Training wrapper: self.embeddings_connector -> ComfyUI: video_embeddings_connector
+    if main_part.startswith('embeddings_connector_'):
+        main_part = 'video_' + main_part
+    # audio_embeddings_connector is already correct
 
     # Convert underscores to dots for the hierarchy
     # We need to be careful with numeric parts
@@ -63,7 +74,14 @@ def convert_key_to_comfy(key):
     # This prevents _attn1_ from matching inside audio_attn1_
     import re
 
-    # Step 1: Basic block structure
+    # Step 0: Handle connector module paths
+    # video_embeddings_connector_transformer_1d_blocks_0_... -> video_embeddings_connector.transformer_1d_blocks.0....
+    # audio_embeddings_connector_transformer_1d_blocks_0_... -> audio_embeddings_connector.transformer_1d_blocks.0....
+    converted = converted.replace('video_embeddings_connector_', 'video_embeddings_connector.')
+    converted = converted.replace('audio_embeddings_connector_', 'audio_embeddings_connector.')
+    converted = converted.replace('transformer_1d_blocks_', 'transformer_1d_blocks.')
+
+    # Step 1: Basic block structure (main transformer)
     converted = converted.replace('transformer_blocks_', 'transformer_blocks.')
 
     # Step 2: Handle audio/video attention patterns FIRST (keep underscores in these)
@@ -109,25 +127,52 @@ def convert_key_to_comfy(key):
     return comfy_key
 
 
-def convert_lora_to_comfy(input_path, output_path=None, verbose=False):
+def convert_key_from_comfy(key):
     """
-    Convert a LoRA file from training format to ComfyUI format
+    Convert a ComfyUI-format LTX-2 LoRA key back to training format.
 
-    Args:
-        input_path: Path to the input LoRA file
-        output_path: Path to save the converted LoRA (optional)
-        verbose: Print detailed conversion info
-
-    Returns:
-        Path to the output file
+    Example:
+        diffusion_model.transformer_blocks.0.attn1.to_k.lora_A.weight
+        -> lora_unet_model_transformer_blocks_0_attn1_to_k.lora_down.weight
     """
-    print(f"Loading LoRA from: {input_path}")
+    if key.endswith(".lora_A.weight"):
+        weight_part = "lora_down.weight"
+        path = key[: -len(".lora_A.weight")]
+    elif key.endswith(".lora_B.weight"):
+        weight_part = "lora_up.weight"
+        path = key[: -len(".lora_B.weight")]
+    elif key.endswith(".alpha"):
+        weight_part = "alpha"
+        path = key[: -len(".alpha")]
+    else:
+        return None
 
-    # Load the trained LoRA
-    trained_state_dict = safetensors.torch.load_file(input_path)
+    if not path.startswith("diffusion_model."):
+        return None
 
-    print(f"Input LoRA has {len(trained_state_dict)} keys")
+    path = path[len("diffusion_model.") :]
+    if path.startswith("video_embeddings_connector."):
+        path = path[len("video_embeddings_connector.") :]
+        main_part = f"lora_unet_embeddings_connector_{path.replace('.', '_')}"
+    elif path.startswith("audio_embeddings_connector."):
+        path = path[len("audio_embeddings_connector.") :]
+        main_part = f"lora_unet_audio_embeddings_connector_{path.replace('.', '_')}"
+    else:
+        main_part = f"lora_unet_model_{path.replace('.', '_')}"
 
+    return f"{main_part}.{weight_part}"
+
+
+def is_comfy_lora_state_dict(weights_sd):
+    """Return True if the state dict looks like an LTX-2 ComfyUI LoRA."""
+    if not weights_sd:
+        return False
+    keys = list(weights_sd.keys())
+    return any(key.startswith("diffusion_model.") and ".lora_" in key for key in keys)
+
+
+def convert_lora_to_comfy_state_dict(trained_state_dict, verbose=False):
+    """Convert a training-format LTX-2 LoRA state dict to ComfyUI format."""
     # Collect alpha and rank per LoRA module to fold scale into weights
     lora_alpha = {}
     lora_rank = {}
@@ -151,7 +196,7 @@ def convert_lora_to_comfy(input_path, output_path=None, verbose=False):
         new_key = convert_key_to_comfy(key)
 
         if new_key is None:
-            if '.alpha' in key:
+            if ".alpha" in key:
                 skipped_alpha += 1
                 if verbose:
                     print(f"Skipping alpha key: {key}")
@@ -175,12 +220,66 @@ def convert_lora_to_comfy(input_path, output_path=None, verbose=False):
             if verbose:
                 print(f"Converted: {key} -> {new_key}")
 
-    print(f"\nConversion summary:")
-    print(f"  Converted: {converted} keys")
-    print(f"  Skipped alpha keys: {skipped_alpha}")
-    print(f"  Folded alpha into lora_B: {folded_alpha}")
-    print(f"  Failed: {failed} keys")
-    print(f"  Output LoRA has {len(comfy_state_dict)} keys")
+    if verbose:
+        print("\nConversion summary:")
+        print(f"  Converted: {converted} keys")
+        print(f"  Skipped alpha keys: {skipped_alpha}")
+        print(f"  Folded alpha into lora_B: {folded_alpha}")
+        print(f"  Failed: {failed} keys")
+        print(f"  Output LoRA has {len(comfy_state_dict)} keys")
+
+    return comfy_state_dict
+
+
+def convert_lora_from_comfy_state_dict(comfy_state_dict):
+    """
+    Convert a ComfyUI-format LTX-2 LoRA state dict back to training format.
+
+    Since ComfyUI checkpoints do not store alpha separately, this recreates
+    native ``.alpha`` buffers with ``alpha=rank``. This preserves the effective
+    LoRA delta when the checkpoint is warm-started for further training.
+    """
+    converted_state_dict = {}
+    lora_dims = {}
+
+    for key, tensor in comfy_state_dict.items():
+        new_key = convert_key_from_comfy(key)
+        if new_key is None:
+            continue
+        converted_state_dict[new_key] = tensor
+        if new_key.endswith(".lora_down.weight"):
+            lora_name = new_key.rsplit(".", 2)[0]
+            lora_dims[lora_name] = tensor.shape[0]
+
+    for lora_name, dim in lora_dims.items():
+        alpha_key = f"{lora_name}.alpha"
+        if alpha_key not in converted_state_dict:
+            converted_state_dict[alpha_key] = torch.tensor(dim)
+
+    return converted_state_dict
+
+
+def convert_lora_to_comfy(input_path, output_path=None, verbose=False):
+    """
+    Convert a LoRA file from training format to ComfyUI format
+
+    Args:
+        input_path: Path to the input LoRA file
+        output_path: Path to save the converted LoRA (optional)
+        verbose: Print detailed conversion info
+
+    Returns:
+        Path to the output file
+    """
+    print(f"Loading LoRA from: {input_path}")
+
+    # Load the trained LoRA
+    trained_state_dict = safetensors.torch.load_file(input_path)
+
+    print(f"Input LoRA has {len(trained_state_dict)} keys")
+
+    comfy_state_dict = convert_lora_to_comfy_state_dict(trained_state_dict, verbose=verbose)
+    print(f"Output LoRA has {len(comfy_state_dict)} keys")
 
     # Determine output path
     if output_path is None:
@@ -201,7 +300,7 @@ def convert_lora_to_comfy(input_path, output_path=None, verbose=False):
     print(f"\nSaving ComfyUI-compatible LoRA to: {output_path}")
     safetensors.torch.save_file(comfy_state_dict, output_path, metadata=metadata)
 
-    print(f"[OK] Conversion complete!")
+    print("[OK] Conversion complete!")
 
     return output_path
 

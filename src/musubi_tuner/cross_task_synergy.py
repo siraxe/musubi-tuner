@@ -3,8 +3,8 @@
 Alongside the main joint denoising loss (both modalities noisy), computes
 two uni-directional auxiliary losses where one modality is clean (timestep=0):
 
-1. Audio-driven video: video noisy + audio clean -> supervise video prediction
-2. Video-driven audio: video clean + audio noisy -> supervise audio prediction
+1. Audio-driven video: video noisy + audio clean → supervise video prediction
+2. Video-driven audio: video clean + audio noisy → supervise audio prediction
 
 This provides stable cross-modal alignment targets, addressing the
 "correspondence drift" problem where concurrent noisy latents impede
@@ -87,7 +87,7 @@ def compute_cross_task_synergy_losses(
     # Zero timesteps for clean modality
     zero_timestep = torch.zeros_like(video_timesteps[:, :1])
 
-    # 1. Audio-driven video loss: clean audio + noisy video -> supervise video
+    # 1. Audio-driven video loss: clean audio + noisy video → supervise video
     if lambda_audio_driven > 0.0:
         with accelerator.autocast():
             pred = transformer(
@@ -120,7 +120,7 @@ def compute_cross_task_synergy_losses(
         total_loss = total_loss + lambda_audio_driven * driven_video_loss
         metrics["loss/cts_audio_driven_video"] = driven_video_loss.detach().item()
 
-    # 2. Video-driven audio loss: clean video + noisy audio -> supervise audio
+    # 2. Video-driven audio loss: clean video + noisy audio → supervise audio
     if lambda_video_driven > 0.0:
         with accelerator.autocast():
             pred = transformer(

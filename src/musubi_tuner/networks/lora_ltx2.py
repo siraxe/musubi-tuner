@@ -3,12 +3,14 @@ from __future__ import annotations
 import ast
 import logging
 import types
+from dataclasses import replace
 from typing import Dict, List, Optional
 
 import torch
 import torch.nn as nn
 
 import musubi_tuner.networks.lora as lora
+from musubi_tuner.ltx_2.convert_lora_to_comfy import convert_lora_from_comfy_state_dict, is_comfy_lora_state_dict
 from musubi_tuner.ltx_2.components.patchifiers import get_pixel_coords
 from musubi_tuner.ltx_2.guidance.perturbations import BatchedPerturbationConfig
 from musubi_tuner.ltx_2.model.transformer.modality import Modality
@@ -16,6 +18,18 @@ from musubi_tuner.ltx_2.types import AudioLatentShape, SpatioTemporalScaleFactor
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
+
+
+def convert_weight_keys(weights_sd: Dict[str, torch.Tensor]) -> Optional[Dict[str, torch.Tensor]]:
+    """Normalize external LTX-2 LoRA weights into native training keys.
+
+    Returns converted state dict for recognized formats, or None to let the
+    generic fallback in hv_train_network handle it.
+    """
+    if is_comfy_lora_state_dict(weights_sd):
+        logger.info("converting LTX-2 LoRA weights from ComfyUI format to native training format")
+        return convert_lora_from_comfy_state_dict(weights_sd)
+    return None
 
 
 def _split_av_context(
@@ -72,11 +86,7 @@ def _patch_lora_load_state_dict_for_audio(network: lora.LoRANetwork) -> lora.LoR
     original = network.load_state_dict
 
     def _filter_audio_keys(keys: List[str]) -> List[str]:
-        audio_patterns = ["audio_", "to_gate_logits", "audio_to_video", "video_to_audio"]
-        return [
-            k for k in keys
-            if not any(pattern in k for pattern in audio_patterns)
-        ]
+        return [k for k in keys if "audio_" not in k]
 
     def _load_state_dict(self, state_dict, strict: bool = True):
         result = original(state_dict, strict=False)
@@ -85,14 +95,12 @@ def _patch_lora_load_state_dict_for_audio(network: lora.LoRANetwork) -> lora.LoR
         non_audio_missing = _filter_audio_keys(missing)
         non_audio_unexpected = _filter_audio_keys(unexpected)
         if non_audio_missing:
-            logger.warning(
-                f"LoRA checkpoint is missing {len(non_audio_missing)} keys that exist in current model. "
-                f"These will be initialized from scratch. First few: {non_audio_missing[:5]}"
+            raise RuntimeError(
+                f"Missing non-audio LoRA keys in state_dict: {non_audio_missing[:10]}"
             )
         if non_audio_unexpected:
-            logger.warning(
-                f"LoRA checkpoint has {len(non_audio_unexpected)} keys not in current model. "
-                f"These will be ignored. First few: {non_audio_unexpected[:5]}"
+            raise RuntimeError(
+                f"Unexpected non-audio LoRA keys in state_dict: {non_audio_unexpected[:10]}"
             )
         if missing and not non_audio_missing:
             logger.warning(
@@ -188,6 +196,45 @@ class LTX2Wrapper(nn.Module):
         if hasattr(self.model, "switch_block_swap_for_training"):
             return self.model.switch_block_swap_for_training()
         return None
+
+    def load_connectors(
+        self,
+        embeddings_connector: nn.Module,
+        audio_embeddings_connector: Optional[nn.Module] = None,
+    ) -> None:
+        """Attach connector modules to the wrapper for LoRA discovery and forward pass."""
+        self.embeddings_connector = embeddings_connector
+        if audio_embeddings_connector is not None:
+            self.audio_embeddings_connector = audio_embeddings_connector
+
+    def has_connectors(self) -> bool:
+        return isinstance(getattr(self, "embeddings_connector", None), nn.Module)
+
+    def _run_connectors(
+        self,
+        video_features: torch.Tensor,
+        audio_features: Optional[torch.Tensor],
+        attention_mask: torch.Tensor,
+    ) -> tuple:
+        """Run attached connectors on pre-connector features. Returns (video_ctx, audio_ctx, mask)."""
+        dtype = video_features.dtype
+        if attention_mask.dtype == torch.bool:
+            attention_mask = attention_mask.to(torch.int64)
+        additive_mask = (attention_mask - 1).to(dtype).reshape(
+            (attention_mask.shape[0], 1, -1, attention_mask.shape[-1])
+        ) * torch.finfo(dtype).max
+
+        encoded, encoded_mask = self.embeddings_connector(video_features, additive_mask)
+        mask_int = (encoded_mask < 0.000001).to(torch.int64)
+        mask_int = mask_int.reshape([encoded.shape[0], encoded.shape[1], 1])
+        video_ctx = encoded * mask_int
+        out_mask = mask_int.squeeze(-1)
+
+        audio_ctx = None
+        if audio_features is not None and hasattr(self, "audio_embeddings_connector"):
+            audio_ctx, _ = self.audio_embeddings_connector(audio_features, additive_mask)
+
+        return video_ctx, audio_ctx, out_mask
 
     def __getattr__(self, name: str):
         try:
@@ -311,6 +358,7 @@ class LTX2Wrapper(nn.Module):
         video_tokens = None
         video_timesteps = None
         video_positions = None
+        a2v_cross_attention_mask = None
         if model_video_enabled:
             video_tokens = self._video_patchifier.patchify(video_latents)
             video_seq_len = video_tokens.shape[1]
@@ -353,9 +401,39 @@ class LTX2Wrapper(nn.Module):
                 causal_fix=True,
             ).to(dtype=video_latents.dtype)
             video_positions[:, 0, ...] = video_positions[:, 0, ...] / float(frame_rate)
+            if isinstance(transformer_options, dict):
+                video_positions_override = transformer_options.get("video_positions_override")
+                if isinstance(video_positions_override, torch.Tensor):
+                    if video_positions_override.shape != video_positions.shape:
+                        raise ValueError(
+                            "video_positions_override shape mismatch: "
+                            f"got {tuple(video_positions_override.shape)}, expected {tuple(video_positions.shape)}"
+                        )
+                    video_positions = video_positions_override.to(device=video_positions.device, dtype=video_positions.dtype)
+                a2v_cross_attention_mask = transformer_options.get("a2v_cross_attention_mask")
+
+        # Connector LoRA: run connectors on pre-connector features if available
+        if (
+            self.has_connectors()
+            and isinstance(transformer_options, dict)
+            and isinstance(transformer_options.get("video_features"), torch.Tensor)
+        ):
+            raw_video_features = transformer_options["video_features"]
+            raw_audio_features = transformer_options.get("audio_features")
+            features_mask = transformer_options.get("features_attention_mask", attention_mask)
+            video_ctx, audio_ctx, connector_mask = self._run_connectors(
+                raw_video_features, raw_audio_features, features_mask
+            )
+            if audio_ctx is not None:
+                context = torch.cat([video_ctx, audio_ctx], dim=-1)
+            else:
+                context = video_ctx
+            attention_mask = connector_mask
 
         video_context = context
         audio_context = context
+        audio_context_mask = attention_mask
+        v2a_cross_attention_mask = None
         if (
             model_video_enabled
             and not audio_only
@@ -367,18 +445,8 @@ class LTX2Wrapper(nn.Module):
         video_modality = None
         if model_video_enabled:
             video_self_attention_mask = None
-            a2v_cross_attention_mask = None
             if isinstance(transformer_options, dict):
                 video_self_attention_mask = transformer_options.get("self_attention_mask")
-                video_positions_override = transformer_options.get("video_positions_override")
-                if isinstance(video_positions_override, torch.Tensor):
-                    if video_positions_override.shape != video_positions.shape:
-                        raise ValueError(
-                            "video_positions_override shape mismatch: "
-                            f"got {tuple(video_positions_override.shape)}, expected {tuple(video_positions.shape)}"
-                        )
-                    video_positions = video_positions_override.to(device=video_positions.device, dtype=video_positions.dtype)
-                a2v_cross_attention_mask = transformer_options.get("a2v_cross_attention_mask")
             video_modality = Modality(
                 enabled=(not audio_only if video_enabled is None else bool(video_enabled)),
                 latent=video_tokens,
@@ -415,9 +483,6 @@ class LTX2Wrapper(nn.Module):
 
             audio_shape = AudioLatentShape(batch=bsz, channels=ach, frames=at, mel_bins=af)
             audio_positions = self._audio_patchifier.get_patch_grid_bounds(audio_shape, device=audio_latents.device)
-
-            audio_context_mask = attention_mask
-            v2a_cross_attention_mask = None
             if isinstance(transformer_options, dict):
                 audio_positions_override = transformer_options.get("audio_positions_override")
                 if isinstance(audio_positions_override, torch.Tensor):
@@ -430,6 +495,7 @@ class LTX2Wrapper(nn.Module):
                 if "audio_context_mask" in transformer_options:
                     audio_context_mask = transformer_options.get("audio_context_mask")
                 v2a_cross_attention_mask = transformer_options.get("v2a_cross_attention_mask")
+
             audio_modality = Modality(
                 enabled=(True if audio_enabled is None else bool(audio_enabled)),
                 latent=audio_tokens,
@@ -441,7 +507,61 @@ class LTX2Wrapper(nn.Module):
                 v2a_cross_attention_mask=v2a_cross_attention_mask,
             )
 
-        perturbations = BatchedPerturbationConfig.empty(bsz)
+        # TARP: windowed A2V cross-attention mask
+        tarp_config = transformer_options.get("tarp_config") if isinstance(transformer_options, dict) else None
+        if (
+            tarp_config is not None
+            and video_modality is not None
+            and audio_modality is not None
+            and audio_seq_len > 0
+        ):
+            from musubi_tuner.tarp_dcr import compute_tarp_a2v_mask, compute_tarp_v2a_mask
+
+            spatial_per_frame = video_seq_len // vframes
+
+            # A2V: video queries attend to windowed audio (s = 3c)
+            tarp_a2v = compute_tarp_a2v_mask(
+                video_frames=vframes,
+                video_spatial_tokens=spatial_per_frame,
+                audio_seq_len=audio_seq_len,
+                window_multiplier=tarp_config["window_multiplier"],
+                device=video_tokens.device,
+                dtype=video_latents.dtype,
+            )
+            if tarp_a2v is not None:
+                existing_mask = video_modality.a2v_cross_attention_mask
+                if existing_mask is not None:
+                    tarp_a2v = torch.minimum(existing_mask, tarp_a2v)
+                video_modality = replace(video_modality, a2v_cross_attention_mask=tarp_a2v)
+
+            # V2A: each audio token attends to nearest video frame only (s = 1)
+            tarp_v2a = compute_tarp_v2a_mask(
+                video_frames=vframes,
+                video_spatial_tokens=spatial_per_frame,
+                audio_seq_len=audio_seq_len,
+                device=video_tokens.device,
+                dtype=video_latents.dtype,
+            )
+            if tarp_v2a is not None:
+                existing_v2a = audio_modality.v2a_cross_attention_mask
+                if existing_v2a is not None:
+                    tarp_v2a = torch.minimum(existing_v2a, tarp_v2a)
+                audio_modality = replace(audio_modality, v2a_cross_attention_mask=tarp_v2a)
+
+        # DCR: per-sample gradient detachment masks
+        if isinstance(transformer_options, dict):
+            dcr_audio_mask = transformer_options.get("dcr_audio_mask")
+            if dcr_audio_mask is not None and audio_modality is not None:
+                audio_modality = replace(audio_modality, dcr_detach_mask=dcr_audio_mask)
+            dcr_video_mask = transformer_options.get("dcr_video_mask")
+            if dcr_video_mask is not None and video_modality is not None:
+                video_modality = replace(video_modality, dcr_detach_mask=dcr_video_mask)
+
+        perturbations = (
+            transformer_options.get("perturbations")
+            if isinstance(transformer_options, dict) and "perturbations" in transformer_options
+            else BatchedPerturbationConfig.empty(bsz)
+        )
         video_pred_tokens, audio_pred_tokens = self.model(video_modality, audio_modality, perturbations)
 
         if model_video_enabled:
@@ -514,6 +634,12 @@ def load_ltx2_wrapper(
 #   - ff, audio_ff (feed-forward, if included via patterns)
 LTX2_TARGET_REPLACE_MODULES = [
     "BasicAVTransformerBlock",
+]
+
+# Extended target modules when connector LoRA is enabled
+LTX2_TARGET_REPLACE_MODULES_WITH_CONNECTOR = [
+    "BasicAVTransformerBlock",
+    "_BasicTransformerBlock1D",
 ]
 
 # LoRA target presets for different training modes
@@ -609,6 +735,40 @@ LTX2_INCLUDE_PATTERNS_AUDIO_REF_ONLY_IC = [
     r".*\.video_to_audio_attn\.to_out\.0$",
 ]
 
+# video_sa: Video self-attention only
+# Targets only video self-attention projections. Audio modules are excluded entirely,
+# producing a smaller LoRA when used with --ltx2_mode video.
+LTX2_INCLUDE_PATTERNS_VIDEO_SA = [
+    r".*\.attn1\.to_k$",
+    r".*\.attn1\.to_q$",
+    r".*\.attn1\.to_v$",
+    r".*\.attn1\.to_out\.0$",
+]
+
+# video_sa_ff: Video self-attention + video feed-forward
+LTX2_INCLUDE_PATTERNS_VIDEO_SA_FF = [
+    r".*\.attn1\.to_k$",
+    r".*\.attn1\.to_q$",
+    r".*\.attn1\.to_v$",
+    r".*\.attn1\.to_out\.0$",
+    r".*\.ff\.net\.0\.proj$",
+    r".*\.ff\.net\.2$",
+]
+
+# video_sa_ca_ff: Video self-attention + cross-attention + feed-forward
+LTX2_INCLUDE_PATTERNS_VIDEO_SA_CA_FF = [
+    r".*\.attn1\.to_k$",
+    r".*\.attn1\.to_q$",
+    r".*\.attn1\.to_v$",
+    r".*\.attn1\.to_out\.0$",
+    r".*\.attn2\.to_k$",
+    r".*\.attn2\.to_q$",
+    r".*\.attn2\.to_v$",
+    r".*\.attn2\.to_out\.0$",
+    r".*\.ff\.net\.0\.proj$",
+    r".*\.ff\.net\.2$",
+]
+
 # full: All linear layers in transformer blocks
 # Maximum expressiveness, but larger LoRA file and more VRAM usage.
 LTX2_INCLUDE_PATTERNS_FULL = None  # None means no filtering, all Linear layers matched
@@ -617,8 +777,12 @@ LTX2_INCLUDE_PATTERNS_FULL = None  # None means no filtering, all Linear layers 
 LTX2_LORA_TARGET_PRESETS = {
     "t2v": LTX2_INCLUDE_PATTERNS_T2V,
     "v2v": LTX2_INCLUDE_PATTERNS_V2V,
+    "video_sa": LTX2_INCLUDE_PATTERNS_VIDEO_SA,
+    "video_sa_ff": LTX2_INCLUDE_PATTERNS_VIDEO_SA_FF,
+    "video_sa_ca_ff": LTX2_INCLUDE_PATTERNS_VIDEO_SA_CA_FF,
     "audio": LTX2_INCLUDE_PATTERNS_AUDIO,
     "audio_ref_only_ic": LTX2_INCLUDE_PATTERNS_AUDIO_REF_ONLY_IC,
+    "av_ic": LTX2_INCLUDE_PATTERNS_V2V,  # superset: all attn (video+audio+cross-modal) + video FFN + audio FFN
     "full": LTX2_INCLUDE_PATTERNS_FULL,
 }
 
@@ -626,15 +790,20 @@ LTX2_LORA_TARGET_PRESETS = {
 LTX2_DEFAULT_INCLUDE_PATTERNS = LTX2_INCLUDE_PATTERNS_T2V
 
 
-def _build_exclude_patterns(raw_patterns: Optional[str], audio_video: bool = False) -> List[str]:  # noqa: ARG001
+def _build_exclude_patterns(
+    raw_patterns: Optional[str], audio_video: bool = False, connector_lora: bool = False,  # noqa: ARG001
+) -> List[str]:
     """Build exclude patterns list, including connector exclusions."""
     patterns: List[str] = [
         r".*text_embedding_projection\.aggregate_embed.*",
         r".*text_embedding_projection\.video_aggregate_embed.*",
         r".*text_embedding_projection\.audio_aggregate_embed.*",
-        r".*embeddings_connector\..*",
-        r".*audio_embeddings_connector\..*",
     ]
+    if not connector_lora:
+        patterns.extend([
+            r".*embeddings_connector\..*",
+            r".*audio_embeddings_connector\..*",
+        ])
     if raw_patterns is None:
         return patterns
     user_patterns = ast.literal_eval(raw_patterns)
@@ -728,7 +897,12 @@ def create_arch_network(
     if not audio_video and unet is not None:
         audio_video = unet.__class__.__name__ == "LTXAVModel" or hasattr(unet, "audio_patchify_proj")
 
-    kwargs["exclude_patterns"] = _build_exclude_patterns(kwargs.get("exclude_patterns"), audio_video=audio_video)
+    connector_lora = kwargs.pop("connector_lora", False)
+    kwargs["exclude_patterns"] = _build_exclude_patterns(
+        kwargs.get("exclude_patterns"), audio_video=audio_video, connector_lora=connector_lora,
+    )
+
+    target_modules = LTX2_TARGET_REPLACE_MODULES_WITH_CONNECTOR if connector_lora else LTX2_TARGET_REPLACE_MODULES
 
     # Handle lora_target_preset: use preset patterns unless include_patterns is explicitly set
     lora_target_preset = kwargs.pop("lora_target_preset", None)
@@ -753,8 +927,11 @@ def create_arch_network(
         module_kwargs["loftq_data"] = loftq_data
         kwargs["module_kwargs"] = module_kwargs
 
+    if connector_lora:
+        logger.info("Connector LoRA enabled: targeting %s", target_modules)
+
     net = lora.create_network(
-        LTX2_TARGET_REPLACE_MODULES,
+        target_modules,
         "lora_unet",
         multiplier,
         network_dim,
@@ -782,10 +959,19 @@ def create_arch_network_from_weights(
         if not audio_video and unet is not None:
             audio_video = unet.__class__.__name__ == "LTXAVModel" or hasattr(unet, "audio_patchify_proj")
 
-    kwargs["exclude_patterns"] = _build_exclude_patterns(kwargs.get("exclude_patterns"), audio_video=audio_video)
+    # Auto-detect connector LoRA from weight keys
+    connector_lora = kwargs.pop("connector_lora", False)
+    if not connector_lora:
+        connector_lora = any("embeddings_connector" in k for k in weights_sd.keys())
+
+    kwargs["exclude_patterns"] = _build_exclude_patterns(
+        kwargs.get("exclude_patterns"), audio_video=audio_video, connector_lora=connector_lora,
+    )
+
+    target_modules = LTX2_TARGET_REPLACE_MODULES_WITH_CONNECTOR if connector_lora else LTX2_TARGET_REPLACE_MODULES
 
     net = lora.create_network_from_weights(
-        LTX2_TARGET_REPLACE_MODULES,
+        target_modules,
         multiplier,
         weights_sd,
         text_encoders,
@@ -794,3 +980,61 @@ def create_arch_network_from_weights(
         **kwargs,
     )
     return _patch_lora_load_state_dict_for_audio(net)
+
+
+def load_connectors_from_checkpoint(
+    checkpoint_path: str,
+    config: dict,
+    *,
+    audio_video: bool = True,
+    device: torch.device = torch.device("cpu"),
+    dtype: torch.dtype = torch.bfloat16,
+) -> tuple:
+    """Load connector modules from an LTX-2 checkpoint.
+
+    Returns (video_connector, audio_connector_or_None).
+    """
+    from musubi_tuner.ltx_2.text_encoders.gemma.embeddings_connector import (
+        AudioEmbeddings1DConnectorConfigurator,
+        Embeddings1DConnector,
+        Embeddings1DConnectorConfigurator,
+    )
+
+    video_connector = Embeddings1DConnectorConfigurator.from_config(config)
+    audio_connector = AudioEmbeddings1DConnectorConfigurator.from_config(config) if audio_video else None
+
+    # Load weights from checkpoint using key mapping from AV_GEMMA_TEXT_ENCODER_KEY_OPS
+    from safetensors import safe_open
+
+    video_prefix = "model.diffusion_model.video_embeddings_connector."
+    audio_prefix = "model.diffusion_model.audio_embeddings_connector."
+
+    paths = checkpoint_path if isinstance(checkpoint_path, (list, tuple)) else [checkpoint_path]
+
+    video_sd = {}
+    audio_sd = {}
+    for path in paths:
+        with safe_open(path, framework="pt", device=str(device)) as f:
+            for key in f.keys():
+                if key.startswith(video_prefix):
+                    local_key = key[len(video_prefix):]
+                    video_sd[local_key] = f.get_tensor(key).to(dtype=dtype)
+                elif key.startswith(audio_prefix) and audio_connector is not None:
+                    local_key = key[len(audio_prefix):]
+                    audio_sd[local_key] = f.get_tensor(key).to(dtype=dtype)
+
+    if video_sd:
+        video_connector.load_state_dict(video_sd, strict=False, assign=True)
+        video_connector = video_connector.to(device=device, dtype=dtype)
+        logger.info("Loaded video connector: %d params", sum(p.numel() for p in video_connector.parameters()))
+    else:
+        logger.warning("No video connector weights found in checkpoint (prefix: %s)", video_prefix)
+
+    if audio_connector is not None and audio_sd:
+        audio_connector.load_state_dict(audio_sd, strict=False, assign=True)
+        audio_connector = audio_connector.to(device=device, dtype=dtype)
+        logger.info("Loaded audio connector: %d params", sum(p.numel() for p in audio_connector.parameters()))
+    elif audio_connector is not None:
+        logger.warning("No audio connector weights found in checkpoint (prefix: %s)", audio_prefix)
+
+    return video_connector, audio_connector

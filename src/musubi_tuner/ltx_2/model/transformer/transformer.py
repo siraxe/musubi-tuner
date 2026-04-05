@@ -6,11 +6,10 @@ import os
 import torch
 import torch.utils.checkpoint as checkpoint
 
-from musubi_tuner.ltx_2.utils import create_cpu_offloading_wrapper
 from musubi_tuner.ltx_2.model.ltx2_custom_offloading_utils import weighs_to_device
 from musubi_tuner.ltx_2.model.transformer.block_level_checkpointing import block_checkpoint
 from musubi_tuner.ltx_2.guidance.perturbations import BatchedPerturbationConfig, PerturbationType
-from musubi_tuner.ltx_2.model.transformer.adaln import AdaLayerNormSingle, adaln_embedding_coefficient
+from musubi_tuner.ltx_2.model.transformer.adaln import adaln_embedding_coefficient
 from musubi_tuner.ltx_2.model.transformer.attention import Attention, AttentionCallable, AttentionFunction
 from musubi_tuner.ltx_2.model.transformer.fp8_device_utils import ensure_fp8_modules_on_device
 from musubi_tuner.ltx_2.model.transformer.feed_forward import FeedForward
@@ -473,6 +472,9 @@ class BasicAVTransformerBlock(torch.nn.Module):
         sublayer_diag = os.getenv("LTX2_NAN_SUBLAYER_DIAG", "0") == "1"
         v2a_diag = os.getenv("LTX2_V2A_DIAG", "0") == "1"
         attn_retry_fp32 = os.getenv("LTX2_ATTN_FP32_RETRY", "0") == "1"
+        # Clamp FFN outputs to prevent bf16 overflow (max ~65504).
+        # Set LTX2_FFN_CLAMP=60000 to enable. Default: disabled (0).
+        ffn_clamp = float(os.getenv("LTX2_FFN_CLAMP", "0"))
         force_pytorch_cross_attn = (
             os.getenv("LTX2_FORCE_PYTORCH_CROSS_ATTN", "0") == "1"
             or getattr(self, "_force_pytorch_cross_attn", False)
@@ -537,7 +539,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
             original_fn = None
             if force_pytorch:
                 original_fn = getattr(attn_module, "attention_function", None)
-                attn_module.attention_function = AttentionFunction.PYTORCH
+                attn_module.attention_function = AttentionFunction.PYTORCH.to_callable()
             try:
                 if force_fp32:
                     x_fp32 = x_in.to(torch.float32)
@@ -672,6 +674,10 @@ class BasicAVTransformerBlock(torch.nn.Module):
             vx_norm3 = rms_norm(vx, eps=self.norm_eps)
             ax_norm3 = rms_norm(ax, eps=self.norm_eps)
 
+            # DCR: per-sample gradient detachment (applied after AdaLN, see below)
+            dcr_audio_mask = audio.dcr_detach_mask if audio is not None else None
+            dcr_video_mask = video.dcr_detach_mask if video is not None else None
+
             (
                 scale_ca_audio_hidden_states_a2v,
                 shift_ca_audio_hidden_states_a2v,
@@ -704,12 +710,16 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 # AdaLN Structural Fix
                 vx_scaled = (vx_norm3.to(torch.float32) * (1 + scale_ca_video_hidden_states_a2v.to(torch.float32)) + shift_ca_video_hidden_states_a2v.to(torch.float32)).to(vx.dtype)
                 ax_scaled = (ax_norm3.to(torch.float32) * (1 + scale_ca_audio_hidden_states_a2v.to(torch.float32)) + shift_ca_audio_hidden_states_a2v.to(torch.float32)).to(ax.dtype)
+                # DCR: detach audio context AFTER AdaLN so scale/shift params also don't get noisy gradients
+                if dcr_audio_mask is not None:
+                    ax_scaled = ax_scaled * dcr_audio_mask + ax_scaled.detach() * (1 - dcr_audio_mask)
                 a2v_mask = perturbations.mask_like(PerturbationType.SKIP_A2V_CROSS_ATTN, self.idx, vx)
                 vx = vx + (
                     _attn_with_retry(
                         self.audio_to_video_attn,
                         vx_scaled,
                         context=ax_scaled,
+                        mask=video.a2v_cross_attention_mask if video is not None else None,
                         pe=video.cross_positional_embeddings,
                         k_pe=audio.cross_positional_embeddings,
                         force_fp32=force_fp32_cross_attn,
@@ -724,6 +734,9 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 # AdaLN Structural Fix
                 ax_scaled = (ax_norm3.to(torch.float32) * (1 + scale_ca_audio_hidden_states_v2a.to(torch.float32)) + shift_ca_audio_hidden_states_v2a.to(torch.float32)).to(ax.dtype)
                 vx_scaled = (vx_norm3.to(torch.float32) * (1 + scale_ca_video_hidden_states_v2a.to(torch.float32)) + shift_ca_video_hidden_states_v2a.to(torch.float32)).to(vx.dtype)
+                # DCR: detach video context AFTER AdaLN
+                if dcr_video_mask is not None:
+                    vx_scaled = vx_scaled * dcr_video_mask + vx_scaled.detach() * (1 - dcr_video_mask)
                 v2a_mask = perturbations.mask_like(PerturbationType.SKIP_V2A_CROSS_ATTN, self.idx, ax)
                 _log_stats("v2a_ax_scaled", ax_scaled)
                 _log_stats("v2a_vx_scaled", vx_scaled)
@@ -733,6 +746,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
                         self.video_to_audio_attn,
                         ax_scaled,
                         context=vx_scaled,
+                        mask=audio.v2a_cross_attention_mask if audio is not None else None,
                         pe=audio.cross_positional_embeddings,
                         k_pe=video.cross_positional_embeddings,
                         force_fp32=force_fp32_cross_attn,
@@ -763,7 +777,10 @@ class BasicAVTransformerBlock(torch.nn.Module):
             )
             # AdaLN Structural Fix
             vx_scaled = (rms_norm(vx, eps=self.norm_eps).to(torch.float32) * (1 + vscale_mlp.to(torch.float32)) + vshift_mlp.to(torch.float32)).to(vx.dtype)
-            vx = vx + self.ff(vx_scaled) * vgate_mlp
+            ff_out = self.ff(vx_scaled) * vgate_mlp
+            if ffn_clamp > 0:
+                ff_out = ff_out.clamp(-ffn_clamp, ffn_clamp)
+            vx = vx + ff_out
             _check_finite_local("video_after_ff", vx)
 
             del vshift_mlp, vscale_mlp, vgate_mlp
@@ -775,7 +792,10 @@ class BasicAVTransformerBlock(torch.nn.Module):
             )
             # AdaLN Structural Fix
             ax_scaled = (rms_norm(ax, eps=self.norm_eps).to(torch.float32) * (1 + ascale_mlp.to(torch.float32)) + ashift_mlp.to(torch.float32)).to(ax.dtype)
-            ax = ax + self.audio_ff(ax_scaled) * agate_mlp
+            audio_ff_out = self.audio_ff(ax_scaled) * agate_mlp
+            if ffn_clamp > 0:
+                audio_ff_out = audio_ff_out.clamp(-ffn_clamp, ffn_clamp)
+            ax = ax + audio_ff_out
             _check_finite_local("audio_after_ff", ax)
 
             del ashift_mlp, ascale_mlp, agate_mlp

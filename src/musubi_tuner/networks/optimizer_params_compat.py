@@ -98,44 +98,6 @@ def _collect_fallback_trainable_params(network: Any) -> tuple[list[Any], int, Op
     return [], 0, None
 
 
-def _is_prodigy_optimizer(optimizer_type: str) -> bool:
-    """Check if the optimizer is a Prodigy variant."""
-    if not optimizer_type:
-        return False
-    optimizer_lower = optimizer_type.lower()
-    return "prodigy" in optimizer_lower
-
-
-def _merge_param_groups_to_single_lr(
-    param_groups: list[Any],
-    target_lr: float,
-    logger: logging.Logger,
-) -> list[Any]:
-    """Merge multiple parameter groups with different LRs into a single group.
-
-    Prodigy doesn't support different LRs for different parameter groups.
-    This function merges all groups to use a single LR.
-    """
-    all_params = []
-    total_param_count = 0
-
-    for group in param_groups:
-        if isinstance(group, dict):
-            params = group.get("params", [])
-            all_params.extend(params if isinstance(params, list) else [params])
-            total_param_count += len(all_params)
-        else:
-            all_params.append(group)
-            total_param_count += 1
-
-    merged = [{"params": all_params, "lr": target_lr}]
-    logger.info(
-        f"Merged {len(param_groups)} parameter groups into single group with lr={target_lr} "
-        f"(Prodigy requires uniform LR across all params)"
-    )
-    return merged
-
-
 def prepare_optimizer_params_compat(
     network: Any,
     args: argparse.Namespace,
@@ -167,26 +129,6 @@ def prepare_optimizer_params_compat(
 
     normalized_params, param_count = _normalize_optimizer_param_groups(trainable_params)
     if param_count > 0:
-        # Check if Prodigy is being used with multiple LR groups
-        optimizer_type = getattr(args, "optimizer_type", "")
-        if _is_prodigy_optimizer(optimizer_type):
-            # Check for multiple non-zero LRs
-            unique_lrs = set()
-            for group in normalized_params:
-                if isinstance(group, dict):
-                    lr = group.get("lr", 0)
-                    if lr != 0:  # Ignore frozen groups
-                        unique_lrs.add(float(lr))
-
-            if len(unique_lrs) > 1:
-                logger.warning(
-                    f"Prodigy optimizer does not support different learning rates for different parameter groups. "
-                    f"Found LRs: {unique_lrs}. Using main learning rate ({args.learning_rate}) for all parameters."
-                )
-                normalized_params = _merge_param_groups_to_single_lr(
-                    normalized_params, args.learning_rate, logger
-                )
-
         return normalized_params, lr_descriptions
 
     fallback_params, fallback_count, fallback_source = _collect_fallback_trainable_params(network)

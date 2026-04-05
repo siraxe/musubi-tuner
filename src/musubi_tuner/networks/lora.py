@@ -36,7 +36,6 @@ class LoRAModule(torch.nn.Module):
         rank_dropout=None,
         module_dropout=None,
         split_dims: Optional[List[int]] = None,
-        use_stiefel: bool = False,
         **kwargs,
     ):
         """
@@ -46,7 +45,6 @@ class LoRAModule(torch.nn.Module):
         """
         super().__init__()
         self.lora_name = lora_name
-        self.use_stiefel = use_stiefel
 
         if org_module.__class__.__name__ == "Conv2d":
             in_dim = org_module.in_channels
@@ -78,19 +76,6 @@ class LoRAModule(torch.nn.Module):
                 lora_A, lora_B = loftq_init_data
                 self.lora_down.weight.data.copy_(lora_A)
                 self.lora_up.weight.data.copy_(lora_B)
-            elif self.use_stiefel:
-                # Stiefel-LoRA Initialization:
-                # B-factor (lora_up) initialized as orthogonal matrix (on Stiefel Manifold)
-                # A-factor (lora_down) initialized as zeros (so adapter starts as identity)
-                torch.nn.init.orthogonal_(self.lora_up.weight)
-                torch.nn.init.zeros_(self.lora_down.weight)
-                # Mark weights for Stiefel optimizer detection
-                self.lora_down.weight._is_lora_A = True
-                self.lora_up.weight._is_lora_B = True
-            else:
-                # Standard LoRA initialization
-                torch.nn.init.kaiming_uniform_(self.lora_down.weight, a=math.sqrt(5))
-                torch.nn.init.zeros_(self.lora_up.weight)
         else:
             # conv2d not supported
             assert sum(split_dims) == out_dim, "sum of split_dims must be equal to out_dim"
@@ -100,20 +85,10 @@ class LoRAModule(torch.nn.Module):
                 [torch.nn.Linear(in_dim, self.lora_dim, bias=False) for _ in range(len(split_dims))]
             )
             self.lora_up = torch.nn.ModuleList([torch.nn.Linear(self.lora_dim, split_dim, bias=False) for split_dim in split_dims])
-
-            if self.use_stiefel:
-                # Stiefel-LoRA Initialization for split_dims
-                for lora_up in self.lora_up:
-                    torch.nn.init.orthogonal_(lora_up.weight)
-                    lora_up.weight._is_lora_B = True
-                for lora_down in self.lora_down:
-                    torch.nn.init.zeros_(lora_down.weight)
-                    lora_down.weight._is_lora_A = True
-            else:
-                for lora_down in self.lora_down:
-                    torch.nn.init.kaiming_uniform_(lora_down.weight, a=math.sqrt(5))
-                for lora_up in self.lora_up:
-                    torch.nn.init.zeros_(lora_up.weight)
+            for lora_down in self.lora_down:
+                torch.nn.init.kaiming_uniform_(lora_down.weight, a=math.sqrt(5))
+            for lora_up in self.lora_up:
+                torch.nn.init.zeros_(lora_up.weight)
 
         if type(alpha) == torch.Tensor:
             alpha = alpha.detach().float().numpy()  # without casting, bf16 causes error
@@ -200,11 +175,10 @@ class LoRAInfModule(LoRAModule):
         multiplier=1.0,
         lora_dim=4,
         alpha=1,
-        use_stiefel: bool = False,
         **kwargs,
     ):
         # no dropout for inference
-        super().__init__(lora_name, org_module, multiplier, lora_dim, alpha, use_stiefel=use_stiefel)
+        super().__init__(lora_name, org_module, multiplier, lora_dim, alpha)
 
         self.org_module_ref = [org_module]  # for reference
         self.enabled = True
@@ -381,7 +355,30 @@ def create_network(
         else:
             conv_alpha = float(conv_alpha)
 
-    # TODO generic rank/dim setting with regular expression
+    # per-modality dim/alpha overrides
+    audio_dim = kwargs.get("audio_dim", None)
+    if audio_dim is not None:
+        audio_dim = int(audio_dim)
+    audio_alpha = kwargs.get("audio_alpha", None)
+    if audio_alpha is not None:
+        audio_alpha = float(audio_alpha)
+    cross_modal_dim = kwargs.get("cross_modal_dim", None)
+    if cross_modal_dim is not None:
+        cross_modal_dim = int(cross_modal_dim)
+    cross_modal_alpha = kwargs.get("cross_modal_alpha", None)
+    if cross_modal_alpha is not None:
+        cross_modal_alpha = float(cross_modal_alpha)
+
+    # per-modality dropout overrides
+    audio_dropout = kwargs.get("audio_dropout", None)
+    if audio_dropout is not None:
+        audio_dropout = float(audio_dropout)
+    video_dropout = kwargs.get("video_dropout", None)
+    if video_dropout is not None:
+        video_dropout = float(video_dropout)
+    cross_modal_dropout = kwargs.get("cross_modal_dropout", None)
+    if cross_modal_dropout is not None:
+        cross_modal_dropout = float(cross_modal_dropout)
 
     # rank/module dropout
     rank_dropout = kwargs.get("rank_dropout", None)
@@ -395,17 +392,6 @@ def create_network(
     verbose = kwargs.get("verbose", False)
     if verbose is not None:
         verbose = True if verbose == "True" else False
-
-    # Stiefel-LoRA support
-    use_stiefel = kwargs.get("use_stiefel", False)
-    if isinstance(use_stiefel, str):
-        use_stiefel = use_stiefel.lower() in ("true", "1", "yes")
-
-    # Add use_stiefel to module_kwargs if not already present
-    if module_kwargs is None:
-        module_kwargs = {}
-    if "use_stiefel" not in module_kwargs:
-        module_kwargs["use_stiefel"] = use_stiefel
 
     # regular expression for module selection: exclude and include
     exclude_patterns = kwargs.get("exclude_patterns", None)
@@ -437,6 +423,13 @@ def create_network(
         exclude_patterns=exclude_patterns,
         include_patterns=include_patterns,
         verbose=verbose,
+        audio_dim=audio_dim,
+        audio_alpha=audio_alpha,
+        audio_dropout=audio_dropout,
+        video_dropout=video_dropout,
+        cross_modal_dim=cross_modal_dim,
+        cross_modal_alpha=cross_modal_alpha,
+        cross_modal_dropout=cross_modal_dropout,
     )
 
     loraplus_lr_ratio = kwargs.get("loraplus_lr_ratio", None)
@@ -475,6 +468,13 @@ class LoRANetwork(torch.nn.Module):
         exclude_patterns: Optional[List[str]] = None,
         include_patterns: Optional[List[str]] = None,
         verbose: Optional[bool] = False,
+        audio_dim: Optional[int] = None,
+        audio_alpha: Optional[float] = None,
+        audio_dropout: Optional[float] = None,
+        video_dropout: Optional[float] = None,
+        cross_modal_dim: Optional[int] = None,
+        cross_modal_alpha: Optional[float] = None,
+        cross_modal_dropout: Optional[float] = None,
     ) -> None:
         super().__init__()
         self.multiplier = multiplier
@@ -489,6 +489,13 @@ class LoRANetwork(torch.nn.Module):
         self.target_replace_modules = target_replace_modules
         self.prefix = prefix
         self.module_kwargs = module_kwargs or {}
+        self.audio_dim = audio_dim
+        self.audio_alpha = audio_alpha
+        self.audio_dropout = audio_dropout
+        self.video_dropout = video_dropout
+        self.cross_modal_dim = cross_modal_dim
+        self.cross_modal_alpha = cross_modal_alpha
+        self.cross_modal_dropout = cross_modal_dropout
 
         self.loraplus_lr_ratio = None
         # self.loraplus_unet_lr_ratio = None
@@ -498,9 +505,19 @@ class LoRANetwork(torch.nn.Module):
             logger.info("create LoRA network from weights")
         else:
             logger.info(f"create LoRA network. base dim (rank): {lora_dim}, alpha: {alpha}")
+            if self.audio_dim is not None:
+                logger.info(f"audio modules: dim (rank): {self.audio_dim}, alpha: {self.audio_alpha if self.audio_alpha is not None else alpha}")
+            if self.cross_modal_dim is not None:
+                logger.info(
+                    f"cross-modal modules: dim (rank): {self.cross_modal_dim}, alpha: {self.cross_modal_alpha if self.cross_modal_alpha is not None else alpha}"
+                )
             logger.info(
                 f"neuron dropout: p={self.dropout}, rank dropout: p={self.rank_dropout}, module dropout: p={self.module_dropout}"
             )
+            if self.audio_dropout is not None or self.video_dropout is not None or self.cross_modal_dropout is not None:
+                logger.info(
+                    f"per-modality dropout overrides: video={self.video_dropout}, audio={self.audio_dropout}, cross-modal={self.cross_modal_dropout}"
+                )
             # if self.conv_lora_dim is not None:
             #     logger.info(
             #         f"apply LoRA to Conv2d with kernel size (3,3). dim (rank): {self.conv_lora_dim}, alpha: {self.conv_alpha}"
@@ -541,6 +558,23 @@ class LoRANetwork(torch.nn.Module):
         ) -> List[LoRAModule]:
             loras = []
             skipped = []
+
+            def is_audio_module(module_name: str) -> bool:
+                return "audio_" in module_name
+
+            def is_cross_modal_module(module_name: str) -> bool:
+                return "audio_to_video" in module_name or "video_to_audio" in module_name or "av_ca_" in module_name
+
+            def resolve_module_dropout(module_name: str) -> Optional[float]:
+                if is_cross_modal_module(module_name) and self.cross_modal_dropout is not None:
+                    return self.cross_modal_dropout
+                if is_audio_module(module_name):
+                    if self.audio_dropout is not None:
+                        return self.audio_dropout
+                elif self.video_dropout is not None:
+                    return self.video_dropout
+                return self.dropout
+
             for name, module in root_module.named_modules():
                 if target_replace_mods is None or module.__class__.__name__ in target_replace_mods:
                     if target_replace_mods is None:  # dirty hack for all modules
@@ -581,6 +615,7 @@ class LoRANetwork(torch.nn.Module):
 
                             dim = None
                             alpha = None
+                            module_dropout_value = resolve_module_dropout(original_name)
 
                             if modules_dim is not None:
                                 # モジュール指定あり
@@ -592,6 +627,16 @@ class LoRANetwork(torch.nn.Module):
                                 if is_linear or is_conv2d_1x1:
                                     dim = default_dim if default_dim is not None else self.lora_dim
                                     alpha = self.alpha
+                                    # per-modality override: audio modules get audio_dim/audio_alpha
+                                    if self.audio_dim is not None and is_audio_module(original_name):
+                                        dim = self.audio_dim
+                                        if self.audio_alpha is not None:
+                                            alpha = self.audio_alpha
+                                    if is_cross_modal_module(original_name):
+                                        if self.cross_modal_dim is not None:
+                                            dim = self.cross_modal_dim
+                                        if self.cross_modal_alpha is not None:
+                                            alpha = self.cross_modal_alpha
                                 elif self.conv_lora_dim is not None:
                                     dim = self.conv_lora_dim
                                     alpha = self.conv_alpha
@@ -614,7 +659,7 @@ class LoRANetwork(torch.nn.Module):
                                 self.multiplier,
                                 dim,
                                 alpha,
-                                dropout=dropout,
+                                dropout=module_dropout_value,
                                 rank_dropout=rank_dropout,
                                 module_dropout=module_dropout,
                                 **per_module_kwargs,
@@ -811,6 +856,7 @@ class LoRANetwork(torch.nn.Module):
                 param_data = {"params": list(groups[key].values()), "lr": lr_val}
                 if key == "plus" and self.loraplus_lr_ratio:
                     param_data["lr"] = lr_val * self.loraplus_lr_ratio
+                param_data["group_name"] = f"unet_{desc}{suffix}".replace(" ", "_")
                 all_params.append(param_data)
                 suffix = " plus" if key == "plus" else ""
                 lr_descriptions.append(f"unet_{desc}{suffix}")
@@ -857,6 +903,7 @@ class LoRANetwork(torch.nn.Module):
                     logger.info("NO LR skipping!")
                     continue
 
+                param_data["group_name"] = "unet_plus" if key == "plus" else "unet"
                 params.append(param_data)
                 descriptions.append("plus" if key == "plus" else "")
 

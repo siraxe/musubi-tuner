@@ -1,5 +1,6 @@
 import ast
 import asyncio
+from collections import deque
 from datetime import timedelta
 import gc
 import importlib
@@ -45,13 +46,17 @@ from musubi_tuner.dataset.audio_quota_sampler import (
     split_concat_indices_by_audio,
     sync_dataset_group_epoch_without_loading,
 )
+from musubi_tuner.modality_freezer import ModalityFreezer
+from musubi_tuner.cross_task_synergy import compute_cross_task_synergy_losses
 from musubi_tuner.audio_loss_balance import (
     compute_ema_magnitude_audio_weight,
     compute_inverse_frequency_audio_weight,
+    compute_uncertainty_weighted_loss,
     update_loss_ema,
     update_audio_presence_ema,
 )
-from musubi_tuner.cross_task_synergy import compute_cross_task_synergy_losses
+from musubi_tuner.ogm_ge import compute_ogm_ge_coefficients, maybe_add_ogm_ge_gradient_noise
+from musubi_tuner.modules.group_lr_scheduler import GroupWarmupScheduler, parse_group_lr_warmup_args
 from musubi_tuner.modules.lr_schedulers import RexLR
 from musubi_tuner.modules.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
 import musubi_tuner.networks.lora as lora_module
@@ -586,21 +591,12 @@ class NetworkTrainer:
                     logs[f"lr/d*eff_lr/{lr_desc}"] = optimizer.param_groups[i]["d"] * optimizer.param_groups[i]["effective_lr"]
 
             if args.optimizer_type.lower() == "automagic" and optimizer is not None:
-                # Handle wrapped optimizer (AcceleratedOptimizer)
-                actual_optimizer = optimizer
-                if hasattr(optimizer, "optimizer"):
-                    actual_optimizer = optimizer.optimizer
-                elif hasattr(optimizer, "_optimizer"):
-                    actual_optimizer = optimizer._optimizer
-
-                if hasattr(actual_optimizer, "get_avg_learning_rate"):
-                    logs[f"lr/automagic_avg"] = actual_optimizer.get_avg_learning_rate()
-                if hasattr(actual_optimizer, "get_lr_tensor"):
-                    lr_tensor = actual_optimizer.get_lr_tensor()
-                    if lr_tensor is not None and len(lr_tensor) > 1:
-                        logs["lr/automagic_min"] = float(lr_tensor.min())
-                        logs["lr/automagic_max"] = float(lr_tensor.max())
-                        logs["lr/automagic_std"] = float(lr_tensor.std())
+                logs["lr/automagic_avg"] = optimizer.get_avg_learning_rate()
+                lr_tensor = optimizer.get_lr_tensor()
+                if lr_tensor is not None and len(lr_tensor) > 1:
+                    logs["lr/automagic_min"] = float(lr_tensor.min())
+                    logs["lr/automagic_max"] = float(lr_tensor.max())
+                    logs["lr/automagic_std"] = float(lr_tensor.std())
 
         return logs
 
@@ -690,24 +686,6 @@ class NetworkTrainer:
             from musubi_tuner.optimizers.automagic import Automagic
             logger.info(f"use Automagic optimizer | lr={lr} | {optimizer_kwargs}")
             optimizer_class = Automagic
-            optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
-
-        elif optimizer_type == "stiefel" or optimizer_type == "stiefel_lora":
-            try:
-                from adv_optm import Stiefel_LoRA
-            except ImportError:
-                raise ImportError(
-                    "adv_optm package is required for Stiefel-LoRA. Install with: pip install adv_optm==2.3.dev3"
-                )
-            logger.info(f"use Stiefel-LoRA optimizer | lr={lr} | {optimizer_kwargs}")
-            optimizer_class = Stiefel_LoRA
-            # Set defaults for Stiefel-LoRA if not specified
-            if "momentum" not in optimizer_kwargs:
-                optimizer_kwargs["momentum"] = 0.95
-            if "weight_decay" not in optimizer_kwargs:
-                optimizer_kwargs["weight_decay"] = 0.0
-            if "cautious_wd" not in optimizer_kwargs:
-                optimizer_kwargs["cautious_wd"] = 0.1
             optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
 
         if optimizer is None:
@@ -841,6 +819,7 @@ class NetworkTrainer:
         power = args.lr_scheduler_power
         timescale = args.lr_scheduler_timescale
         min_lr_ratio = args.lr_scheduler_min_lr_ratio
+        group_lr_warmup_overrides = parse_group_lr_warmup_args(getattr(args, "lr_group_warmup_args", None))
 
         lr_scheduler_kwargs = {}  # get custom lr_scheduler kwargs
         if args.lr_scheduler_args is not None and len(args.lr_scheduler_args) > 0:
@@ -868,7 +847,9 @@ class NetworkTrainer:
                 lr_scheduler_type = values[-1]
             lr_scheduler_class = getattr(lr_scheduler_module, lr_scheduler_type)
             lr_scheduler = lr_scheduler_class(optimizer, **lr_scheduler_kwargs)
-            return lr_scheduler
+            return self._maybe_wrap_group_warmup_scheduler(
+                lr_scheduler, optimizer, num_warmup_steps, group_lr_warmup_overrides
+            )
 
         if name.startswith("adafactor"):
             assert type(optimizer) == transformers.optimization.Adafactor, (
@@ -876,112 +857,191 @@ class NetworkTrainer:
             )
             initial_lr = float(name.split(":")[1])
             # logger.info(f"adafactor scheduler init lr {initial_lr}")
-            return wrap_check_needless_num_warmup_steps(transformers.optimization.AdafactorSchedule(optimizer, initial_lr))
+            return self._maybe_wrap_group_warmup_scheduler(
+                wrap_check_needless_num_warmup_steps(transformers.optimization.AdafactorSchedule(optimizer, initial_lr)),
+                optimizer,
+                num_warmup_steps,
+                group_lr_warmup_overrides,
+            )
 
         if name.lower() == "rex":
-            return RexLR(
-                optimizer,
-                max_lr=args.learning_rate,
-                min_lr=(  # Will start and end with min_lr, use non-zero min_lr by default
-                    args.learning_rate * min_lr_ratio if min_lr_ratio is not None else args.learning_rate * 0.01
+            return self._maybe_wrap_group_warmup_scheduler(
+                RexLR(
+                    optimizer,
+                    max_lr=args.learning_rate,
+                    min_lr=(  # Will start and end with min_lr, use non-zero min_lr by default
+                        args.learning_rate * min_lr_ratio if min_lr_ratio is not None else args.learning_rate * 0.01
+                    ),
+                    num_steps=num_training_steps,
+                    num_warmup_steps=num_warmup_steps,
+                    **lr_scheduler_kwargs,
                 ),
-                num_steps=num_training_steps,
+                optimizer,
                 num_warmup_steps=num_warmup_steps,
-                **lr_scheduler_kwargs,
+                warmup_overrides=group_lr_warmup_overrides,
             )
 
         if name == DiffusersSchedulerType.PIECEWISE_CONSTANT.value:
             name = DiffusersSchedulerType(name)
             schedule_func = DIFFUSERS_TYPE_TO_SCHEDULER_FUNCTION[name]
-            return schedule_func(optimizer, **lr_scheduler_kwargs)  # step_rules and last_epoch are given as kwargs
+            return self._maybe_wrap_group_warmup_scheduler(
+                schedule_func(optimizer, **lr_scheduler_kwargs),  # step_rules and last_epoch are given as kwargs
+                optimizer,
+                num_warmup_steps,
+                group_lr_warmup_overrides,
+            )
 
         name = SchedulerType(name)
         schedule_func = TYPE_TO_SCHEDULER_FUNCTION[name]
 
         if name == SchedulerType.CONSTANT:
-            return wrap_check_needless_num_warmup_steps(schedule_func(optimizer, **lr_scheduler_kwargs))
+            return self._maybe_wrap_group_warmup_scheduler(
+                wrap_check_needless_num_warmup_steps(schedule_func(optimizer, **lr_scheduler_kwargs)),
+                optimizer,
+                num_warmup_steps,
+                group_lr_warmup_overrides,
+            )
 
         # All other schedulers require `num_warmup_steps`
         if num_warmup_steps is None:
             raise ValueError(f"{name} requires `num_warmup_steps`, please provide that argument.")
 
         if name == SchedulerType.CONSTANT_WITH_WARMUP:
-            return schedule_func(optimizer, num_warmup_steps=num_warmup_steps, **lr_scheduler_kwargs)
+            return self._maybe_wrap_group_warmup_scheduler(
+                schedule_func(optimizer, num_warmup_steps=num_warmup_steps, **lr_scheduler_kwargs),
+                optimizer,
+                num_warmup_steps,
+                group_lr_warmup_overrides,
+            )
 
         if name == SchedulerType.INVERSE_SQRT:
-            return schedule_func(optimizer, num_warmup_steps=num_warmup_steps, timescale=timescale, **lr_scheduler_kwargs)
+            return self._maybe_wrap_group_warmup_scheduler(
+                schedule_func(optimizer, num_warmup_steps=num_warmup_steps, timescale=timescale, **lr_scheduler_kwargs),
+                optimizer,
+                num_warmup_steps,
+                group_lr_warmup_overrides,
+            )
 
         # All other schedulers require `num_training_steps`
         if num_training_steps is None:
             raise ValueError(f"{name} requires `num_training_steps`, please provide that argument.")
 
         if name == SchedulerType.COSINE_WITH_RESTARTS:
-            return schedule_func(
+            return self._maybe_wrap_group_warmup_scheduler(
+                schedule_func(
+                    optimizer,
+                    num_warmup_steps=num_warmup_steps,
+                    num_training_steps=num_training_steps,
+                    num_cycles=num_cycles,
+                    **lr_scheduler_kwargs,
+                ),
                 optimizer,
-                num_warmup_steps=num_warmup_steps,
-                num_training_steps=num_training_steps,
-                num_cycles=num_cycles,
-                **lr_scheduler_kwargs,
+                num_warmup_steps,
+                group_lr_warmup_overrides,
             )
 
         if name == SchedulerType.POLYNOMIAL:
-            return schedule_func(
+            return self._maybe_wrap_group_warmup_scheduler(
+                schedule_func(
+                    optimizer,
+                    num_warmup_steps=num_warmup_steps,
+                    num_training_steps=num_training_steps,
+                    power=power,
+                    **lr_scheduler_kwargs,
+                ),
                 optimizer,
-                num_warmup_steps=num_warmup_steps,
-                num_training_steps=num_training_steps,
-                power=power,
-                **lr_scheduler_kwargs,
+                num_warmup_steps,
+                group_lr_warmup_overrides,
             )
 
         if name == SchedulerType.COSINE_WITH_MIN_LR:
-            return schedule_func(
+            return self._maybe_wrap_group_warmup_scheduler(
+                schedule_func(
+                    optimizer,
+                    num_warmup_steps=num_warmup_steps,
+                    num_training_steps=num_training_steps,
+                    num_cycles=num_cycles / 2,
+                    min_lr_rate=min_lr_ratio,
+                    **lr_scheduler_kwargs,
+                ),
                 optimizer,
-                num_warmup_steps=num_warmup_steps,
-                num_training_steps=num_training_steps,
-                num_cycles=num_cycles / 2,
-                min_lr_rate=min_lr_ratio,
-                **lr_scheduler_kwargs,
+                num_warmup_steps,
+                group_lr_warmup_overrides,
             )
 
         # these schedulers do not require `num_decay_steps`
         if name == SchedulerType.LINEAR or name == SchedulerType.COSINE:
-            return schedule_func(
+            return self._maybe_wrap_group_warmup_scheduler(
+                schedule_func(
+                    optimizer,
+                    num_warmup_steps=num_warmup_steps,
+                    num_training_steps=num_training_steps,
+                    **lr_scheduler_kwargs,
+                ),
                 optimizer,
-                num_warmup_steps=num_warmup_steps,
-                num_training_steps=num_training_steps,
-                **lr_scheduler_kwargs,
+                num_warmup_steps,
+                group_lr_warmup_overrides,
             )
 
         # All other schedulers require `num_decay_steps`
         if num_decay_steps is None:
             raise ValueError(f"{name} requires `num_decay_steps`, please provide that argument.")
         if name == SchedulerType.WARMUP_STABLE_DECAY:
-            return schedule_func(
+            return self._maybe_wrap_group_warmup_scheduler(
+                schedule_func(
+                    optimizer,
+                    num_warmup_steps=num_warmup_steps,
+                    num_stable_steps=num_stable_steps,
+                    num_decay_steps=num_decay_steps,
+                    num_cycles=num_cycles / 2,
+                    min_lr_ratio=min_lr_ratio if min_lr_ratio is not None else 0.0,
+                    **lr_scheduler_kwargs,
+                ),
                 optimizer,
-                num_warmup_steps=num_warmup_steps,
-                num_stable_steps=num_stable_steps,
-                num_decay_steps=num_decay_steps,
-                num_cycles=num_cycles / 2,
-                min_lr_ratio=min_lr_ratio if min_lr_ratio is not None else 0.0,
-                **lr_scheduler_kwargs,
+                num_warmup_steps,
+                group_lr_warmup_overrides,
             )
 
-        return schedule_func(
+        return self._maybe_wrap_group_warmup_scheduler(
+            schedule_func(
+                optimizer,
+                num_warmup_steps=num_warmup_steps,
+                num_training_steps=num_training_steps,
+                num_decay_steps=num_decay_steps,
+                **lr_scheduler_kwargs,
+            ),
             optimizer,
-            num_warmup_steps=num_warmup_steps,
-            num_training_steps=num_training_steps,
-            num_decay_steps=num_decay_steps,
-            **lr_scheduler_kwargs,
+            num_warmup_steps,
+            group_lr_warmup_overrides,
+        )
+
+    def _maybe_wrap_group_warmup_scheduler(
+        self,
+        lr_scheduler,
+        optimizer: torch.optim.Optimizer,
+        num_warmup_steps: Optional[int],
+        warmup_overrides: dict[str, int],
+    ):
+        if not warmup_overrides:
+            return lr_scheduler
+        logger.info("Per-group LR warmup overrides enabled: %s", warmup_overrides)
+        return GroupWarmupScheduler(
+            lr_scheduler,
+            optimizer,
+            default_warmup_steps=int(num_warmup_steps or 0),
+            warmup_overrides=warmup_overrides,
         )
 
     def resume_from_local_or_hf_if_specified(self, accelerator: Accelerator, args: argparse.Namespace) -> int:
         """Resume training state. Returns the recovered global_step (0 if not resuming)."""
         if not args.resume:
+            self._resume_state_dir = None
             return 0
 
         if not args.resume_from_huggingface:
             logger.info(f"resume training from local state: {args.resume}")
             accelerator.load_state(args.resume)
+            self._resume_state_dir = args.resume
             return self._recover_global_step(args.resume)
 
         logger.info(f"resume training from huggingface state: {args.resume}")
@@ -1026,12 +1086,22 @@ class NetworkTrainer:
             )
         dirname = os.path.dirname(results[0])
         accelerator.load_state(dirname)
+        self._resume_state_dir = dirname
 
         return self._recover_global_step(dirname)
 
     @staticmethod
     def _recover_global_step(state_dir: str) -> int:
-        """Read global_step from the LR scheduler state saved by accelerate."""
+        """Read global_step from resume metadata or LR scheduler state."""
+        # prefer resume_metadata.json (new format) over scheduler.bin hack
+        # only trust metadata with global_step > 0 (callers using default params write 0)
+        metadata = train_utils.load_resume_metadata(state_dir)
+        if metadata is not None and metadata.get("global_step", 0) > 0:
+            global_step = int(metadata["global_step"])
+            logger.info(f"recovered global_step={global_step} from resume_metadata.json")
+            return global_step
+
+        # fallback to scheduler.bin for old checkpoints
         scheduler_path = os.path.join(state_dir, "scheduler.bin")
         try:
             scheduler_state = torch.load(scheduler_path, map_location="cpu", weights_only=True)
@@ -1041,6 +1111,52 @@ class NetworkTrainer:
         except Exception as e:
             logger.warning(f"could not recover global_step from {scheduler_path}: {e}  (starting from step 0)")
             return 0
+
+    @staticmethod
+    def _find_latest_state_dir(args: argparse.Namespace) -> Optional[str]:
+        """Find the latest training state directory in output_dir for --autoresume.
+
+        Scans output_dir for directories ending in '-state' that contain a valid
+        scheduler.bin, reads the global_step from each, and returns the path with
+        the highest step. Works with epoch-based, step-based, and final states.
+        """
+        if not args.output_dir or not os.path.isdir(args.output_dir):
+            return None
+
+        best_step = -1
+        best_path = None
+
+        for entry in os.listdir(args.output_dir):
+            full_path = os.path.join(args.output_dir, entry)
+            if not os.path.isdir(full_path) or not entry.endswith("-state"):
+                continue
+
+            scheduler_path = os.path.join(full_path, "scheduler.bin")
+            if not os.path.exists(scheduler_path):
+                continue
+
+            # Try resume_metadata.json first (new format, only trust non-zero global_step)
+            metadata = train_utils.load_resume_metadata(full_path)
+            if metadata is not None and metadata.get("global_step", 0) > 0:
+                step = int(metadata["global_step"])
+            else:
+                # Fast path: parse step number from step-based directory names
+                step_match = re.search(r"-step(\d+)-state$", entry)
+                if step_match:
+                    step = int(step_match.group(1))
+                else:
+                    # Epoch-based or final state: read scheduler.bin for actual global_step
+                    try:
+                        scheduler_state = torch.load(scheduler_path, map_location="cpu", weights_only=True)
+                        step = int(scheduler_state["last_epoch"])
+                    except Exception:
+                        continue
+
+            if step > best_step:
+                best_step = step
+                best_path = full_path
+
+        return best_path
 
     def get_bucketed_timestep(self) -> float:
         if self.num_timestep_buckets is None or self.num_timestep_buckets <= 1:
@@ -1369,6 +1485,93 @@ class NetworkTrainer:
                 line += "#" * int(w / max_weighting * CONSOLE_WIDTH)
                 print(line)
 
+    def _get_tensorboard_writer(self, accelerator: Accelerator):
+        for tracker in getattr(accelerator, "trackers", []):
+            if getattr(tracker, "name", None) == "tensorboard" and hasattr(tracker, "writer"):
+                return tracker.writer
+        return None
+
+    def _should_log_timestep_distribution_to_tensorboard(self, args: argparse.Namespace, accelerator: Accelerator) -> bool:
+        if not accelerator.is_main_process:
+            return False
+        if not bool(getattr(args, "log_timestep_distribution_tensorboard", False)):
+            return False
+        return self._get_tensorboard_writer(accelerator) is not None
+
+    def _get_timestep_distribution_logging_payload(
+        self,
+        args: argparse.Namespace,
+        timesteps: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        del args
+        return {"main": timesteps}
+
+    def _prepare_timestep_distribution_values(
+        self,
+        timesteps: torch.Tensor,
+        accelerator: Accelerator,
+    ) -> Optional[torch.Tensor]:
+        try:
+            flat = timesteps.detach().reshape(-1).to(dtype=torch.float32)
+            if accelerator.num_processes > 1:
+                try:
+                    flat = accelerator.gather(flat)
+                except Exception:
+                    flat = flat.cpu()
+            else:
+                flat = flat.cpu()
+
+            if flat.numel() == 0:
+                return None
+            flat = flat[torch.isfinite(flat)]
+            if flat.numel() == 0:
+                return None
+            return flat.contiguous()
+        except Exception as e:
+            logger.warning(f"Failed to accumulate timestep distribution for TensorBoard logging: {e}")
+            return None
+
+    def _accumulate_timestep_distribution(
+        self,
+        timestep_buffers: Dict[str, deque],
+        name: str,
+        timesteps: torch.Tensor,
+        accelerator: Accelerator,
+    ) -> None:
+        try:
+            values = self._prepare_timestep_distribution_values(timesteps, accelerator)
+            if values is None or values.numel() == 0:
+                return
+            if name not in timestep_buffers:
+                timestep_buffers[name] = deque()
+            timestep_buffers[name].append(values)
+        except Exception as e:
+            logger.warning(f"Failed to accumulate timestep distribution for TensorBoard logging: {e}")
+
+    def _log_timestep_distribution_histogram(
+        self,
+        accelerator: Accelerator,
+        global_step: int,
+        tag: str,
+        values: torch.Tensor,
+    ) -> None:
+        try:
+            writer = self._get_tensorboard_writer(accelerator)
+            if writer is None or values.numel() == 0:
+                return
+            try:
+                writer.add_histogram(tag, values, global_step=global_step, bins=100)
+            except TypeError:
+                writer.add_histogram(tag, values, global_step=global_step)
+
+            writer.add_scalar(f"{tag}_mean", float(values.mean().item()), global_step)
+            writer.add_scalar(f"{tag}_std", float(values.std(unbiased=False).item()), global_step)
+            writer.add_scalar(f"{tag}_min", float(values.min().item()), global_step)
+            writer.add_scalar(f"{tag}_max", float(values.max().item()), global_step)
+            writer.add_scalar(f"{tag}_count", int(values.numel()), global_step)
+        except Exception as e:
+            logger.warning(f"Failed to log timestep distribution histogram to TensorBoard: {e}")
+
     def sample_images(self, accelerator: Accelerator, args, epoch, steps, vae, transformer, sample_parameters, dit_dtype):
         """architecture independent sample images"""
         if not should_sample_images(args, steps, epoch):
@@ -1605,7 +1808,22 @@ class NetworkTrainer:
     def control_training(self) -> bool:
         return self._control_training
 
+    def _resolve_network_module(self, network_module):
+        if isinstance(network_module, str):
+            return importlib.import_module(network_module)
+        return network_module
+
     def convert_weight_keys(self, weights_sd: dict[str, torch.Tensor], network_module: lora_module):
+        if not weights_sd:
+            return weights_sd
+
+        network_module_obj = self._resolve_network_module(network_module)
+        module_converter = getattr(network_module_obj, "convert_weight_keys", None)
+        if callable(module_converter):
+            converted = module_converter(weights_sd)
+            if converted is not None:
+                return converted
+
         keys = list(weights_sd.keys())
         if keys[0].startswith("lora_"):
             return weights_sd  # default format
@@ -1614,6 +1832,13 @@ class NetworkTrainer:
             logger.info("converting LoRA weights from diffusers format to default format")
             return convert_lora.convert_from_diffusers("lora_unet_", weights_sd)
         return weights_sd  # unknown format, return as is
+
+    def load_network_weights(self, file: str, network_module: lora_module) -> dict[str, torch.Tensor]:
+        if os.path.splitext(file)[1] == ".safetensors":
+            weights_sd = load_file(file)
+        else:
+            weights_sd = torch.load(file, map_location="cpu")
+        return self.convert_weight_keys(weights_sd, network_module)
 
     def process_sample_prompts(
         self,
@@ -2000,23 +2225,12 @@ class NetworkTrainer:
         audio_loss_balance_eps = float(getattr(args, "audio_loss_balance_eps", 0.05))
         audio_loss_balance_min = float(getattr(args, "audio_loss_balance_min", 0.05))
         audio_loss_balance_max = float(getattr(args, "audio_loss_balance_max", 4.0))
+        audio_presence_ema = float(getattr(args, "audio_loss_balance_ema_init", 1.0))
+        audio_presence_ema = min(max(audio_presence_ema, 1e-6), 1.0)
         audio_loss_balance_target_ratio = float(getattr(args, "audio_loss_balance_target_ratio", 0.33))
         audio_loss_balance_ema_decay = float(getattr(args, "audio_loss_balance_ema_decay", 0.99))
-
-        # EMA state container for persistence across resumes
-        class EMAState:
-            def __init__(self):
-                self.audio_presence_ema = float(getattr(args, "audio_loss_balance_ema_init", 1.0))
-                self.audio_presence_ema = min(max(self.audio_presence_ema, 1e-6), 1.0)
-                self.audio_loss_ema = max(float(getattr(args, "audio_loss_balance_ema_init", 1.0)), 1e-6)
-                self.video_loss_ema = max(float(getattr(args, "audio_loss_balance_ema_init", 1.0)), 1e-6)
-
-        ema_state = EMAState()
-
-        # For backward compatibility with existing code
-        audio_presence_ema = ema_state.audio_presence_ema
-        audio_loss_ema = ema_state.audio_loss_ema
-        video_loss_ema = ema_state.video_loss_ema
+        audio_loss_ema = max(float(getattr(args, "audio_loss_balance_ema_init", 1.0)), 1e-6)
+        video_loss_ema = max(float(getattr(args, "audio_loss_balance_ema_init", 1.0)), 1e-6)
         if audio_loss_balance_mode == "inv_freq":
             logger.info(
                 "Audio inverse-frequency weighting enabled: beta=%.4f eps=%.4f min=%.4f max=%.4f ema_init=%.4f",
@@ -2034,6 +2248,38 @@ class NetworkTrainer:
                 audio_loss_balance_min,
                 audio_loss_balance_max,
                 audio_loss_ema,
+            )
+        elif audio_loss_balance_mode == "ogm_ge":
+            logger.info(
+                "OGM-GE balancing enabled: alpha=%.4f noise_std=%.4f",
+                float(getattr(args, "ogm_ge_alpha", 0.3)),
+                float(getattr(args, "ogm_ge_noise_std", 0.0)),
+            )
+
+        # Uncertainty weighting: learnable log-variance scalars (Kendall et al., CVPR 2018)
+        uncertainty_log_var_video = None
+        uncertainty_log_var_audio = None
+        if audio_loss_balance_mode == "uncertainty":
+            uncertainty_log_var_video = torch.nn.Parameter(torch.zeros(1))
+            uncertainty_log_var_audio = torch.nn.Parameter(torch.zeros(1))
+            logger.info("Uncertainty weighting enabled: learnable log-variance scalars initialized to 0.0")
+
+        # G2D-style modality freezing
+        modality_freezer = None
+        freeze_check_interval = int(getattr(args, "modality_freeze_check_interval", 0) or 0)
+        if freeze_check_interval > 0:
+            modality_freezer = ModalityFreezer(
+                check_interval=freeze_check_interval,
+                ratio_threshold=float(getattr(args, "modality_freeze_ratio_threshold", 0.5)),
+                warmup_steps=int(getattr(args, "modality_freeze_warmup_steps", 100)),
+                ema_decay=float(getattr(args, "modality_freeze_ema_decay", 0.99)),
+            )
+            logger.info(
+                "Modality freezer enabled: check_interval=%d ratio_threshold=%.2f warmup=%d ema_decay=%.4f",
+                modality_freezer.check_interval,
+                modality_freezer.ratio_threshold,
+                modality_freezer.warmup_steps,
+                modality_freezer.ema_decay,
             )
 
         # Load dataset config
@@ -2218,8 +2464,7 @@ class NetworkTrainer:
 
                 accelerator.print(f"merging module: {weight_path} with multiplier {multiplier}")
 
-                weights_sd = load_file(weight_path)
-                weights_sd = self.convert_weight_keys(weights_sd, args.network_module)
+                weights_sd = self.load_network_weights(weight_path, network_module)
                 module = network_module.create_arch_network_from_weights(
                     multiplier, weights_sd, unet=transformer, for_inference=True
                 )
@@ -2248,7 +2493,7 @@ class NetworkTrainer:
 
         if args.dim_from_weights:
             logger.info(f"Loading network from weights: {args.dim_from_weights}")
-            weights_sd = load_file(args.dim_from_weights)
+            weights_sd = self.load_network_weights(args.dim_from_weights, network_module)
             network, _ = network_module.create_arch_network_from_weights(1, weights_sd, unet=transformer)
         else:
             # We use the name create_arch_network for compatibility with LyCORIS
@@ -2287,7 +2532,8 @@ class NetworkTrainer:
 
         if args.network_weights is not None:
             # FIXME consider alpha of weights: this assumes that the alpha is not changed
-            info = network.load_weights(args.network_weights)
+            weights_sd = self.load_network_weights(args.network_weights, network_module)
+            info = network.load_state_dict(weights_sd, False)
             accelerator.print(f"load network weights from {args.network_weights}: {info}")
 
         # LyCORIS + FP8 backend compatibility:
@@ -2338,12 +2584,32 @@ class NetworkTrainer:
         accelerator.print("prepare optimizer, data loader etc.")
 
         network_module_name = str(getattr(args, "network_module", "") or "")
-        # Always use compat wrapper for automatic Prodigy LR handling
-        trainable_params, lr_descriptions = prepare_optimizer_params_compat(network, args, logger)
+        uses_lycoris_module = "lycoris" in network_module_name.lower()
+        if uses_lycoris_module:
+            trainable_params, lr_descriptions = prepare_optimizer_params_compat(network, args, logger)
+        else:
+            trainable_params, lr_descriptions = network.prepare_optimizer_params(
+                unet_lr=args.learning_rate,
+                audio_lr=getattr(args, "audio_lr", None),
+                lr_args=getattr(args, "lr_args", None),
+            )
 
         optimizer_name, optimizer_args, optimizer, optimizer_train_fn, optimizer_eval_fn = self.get_optimizer(
             args, trainable_params
         )
+
+        # Add uncertainty weighting log-variance params to optimizer
+        if uncertainty_log_var_video is not None:
+            uncertainty_lr = float(getattr(args, "uncertainty_lr", None) or args.learning_rate)
+            uncertainty_log_var_video = uncertainty_log_var_video.to(device=accelerator.device)
+            uncertainty_log_var_audio = uncertainty_log_var_audio.to(device=accelerator.device)
+            optimizer.add_param_group({
+                "params": [uncertainty_log_var_video, uncertainty_log_var_audio],
+                "lr": uncertainty_lr,
+                "weight_decay": 0.0,
+                "group_name": "uncertainty",
+            })
+            logger.info("Added uncertainty log-variance params to optimizer (lr=%.2e)", uncertainty_lr)
 
         def set_trainer_train_mode() -> None:
             optimizer_train_fn()
@@ -2555,19 +2821,16 @@ class NetworkTrainer:
                     except Exception as e:
                         logger.warning(f"Failed to save Self-Flow projector to state dir: {e}")
 
-                # Save EMA state for loss balancing persistence across resumes
-                try:
-                    ema_state_data = {
-                        "audio_loss_ema": ema_state.audio_loss_ema,
-                        "video_loss_ema": ema_state.video_loss_ema,
-                        "audio_presence_ema": ema_state.audio_presence_ema,
-                    }
-                    ema_file = os.path.join(output_dir, "ema_state.json")
-                    with open(ema_file, "w") as f:
-                        json.dump(ema_state_data, f, indent=2)
-                    logger.debug(f"Saved EMA state to {ema_file}: {ema_state_data}")
-                except Exception as e:
-                    logger.warning(f"Failed to save EMA state: {e}")
+                # Save uncertainty weighting log-variance params
+                if uncertainty_log_var_video is not None:
+                    try:
+                        from safetensors.torch import save_file
+                        save_file(
+                            {"log_var_video": uncertainty_log_var_video.data, "log_var_audio": uncertainty_log_var_audio.data},
+                            os.path.join(output_dir, "uncertainty_log_vars.safetensors"),
+                        )
+                    except Exception as e:
+                        logger.warning(f"Failed to save uncertainty log-variance params: {e}")
 
         def load_model_hook(models, input_dir):
             # remove models except network
@@ -2595,22 +2858,21 @@ class NetworkTrainer:
                 except Exception as e:
                     logger.warning(f"Failed to load Self-Flow state from checkpoint dir: {e}")
 
-            # Load EMA state for loss balancing persistence across resumes
-            try:
-                ema_file = os.path.join(input_dir, "ema_state.json")
-                if os.path.exists(ema_file):
-                    with open(ema_file, "r") as f:
-                        ema_state_data = json.load(f)
-                    ema_state.audio_loss_ema = ema_state_data.get("audio_loss_ema", ema_state.audio_loss_ema)
-                    ema_state.video_loss_ema = ema_state_data.get("video_loss_ema", ema_state.video_loss_ema)
-                    ema_state.audio_presence_ema = ema_state_data.get("audio_presence_ema", ema_state.audio_presence_ema)
-                    # Update local vars for backward compatibility
-                    audio_loss_ema = ema_state.audio_loss_ema
-                    video_loss_ema = ema_state.video_loss_ema
-                    audio_presence_ema = ema_state.audio_presence_ema
-                    logger.info(f"Loaded EMA state from {ema_file}: audio_loss_ema={audio_loss_ema:.4f}, video_loss_ema={video_loss_ema:.4f}, audio_presence_ema={audio_presence_ema:.4f}")
-            except Exception as e:
-                logger.warning(f"Failed to load EMA state from checkpoint dir: {e}")
+            # Load uncertainty weighting log-variance params
+            if uncertainty_log_var_video is not None:
+                try:
+                    from safetensors.torch import load_file
+                    lv_file = os.path.join(input_dir, "uncertainty_log_vars.safetensors")
+                    if os.path.exists(lv_file):
+                        lv_sd = load_file(lv_file)
+                        uncertainty_log_var_video.data.copy_(lv_sd["log_var_video"])
+                        uncertainty_log_var_audio.data.copy_(lv_sd["log_var_audio"])
+                        logger.info(
+                            "Loaded uncertainty log-variance params: video=%.4f, audio=%.4f",
+                            uncertainty_log_var_video.item(), uncertainty_log_var_audio.item(),
+                        )
+                except Exception as e:
+                    logger.warning(f"Failed to load uncertainty log-variance params: {e}")
 
         accelerator.register_save_state_pre_hook(save_model_hook)
         accelerator.register_load_state_pre_hook(load_model_hook)
@@ -2619,73 +2881,74 @@ class NetworkTrainer:
         num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
         num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
 
-        # resume from local or huggingface — must be after num_update_steps_per_epoch is known
-        initial_global_step = 0
-        if args.resume:
-            reset_optimizer = getattr(args, "reset_optimizer", False)
-            reset_optimizer_params = getattr(args, "reset_optimizer_params", False)
-
-            if reset_optimizer:
-                # Load only model and scheduler, skip optimizer to avoid param group mismatch
-                logger.info(f"resume training from local state (skipping optimizer): {args.resume}")
-
-                # Load random states
-                random_path = os.path.join(args.resume, "random_states.pth")
-                if os.path.exists(random_path):
-                    random_state = torch.load(random_path)
-                    if random_state:
-                        random.setstate(random_state.get("python", None))
-                        if hasattr(torch, "cuda"):
-                            torch.cuda.set_rng_state_all(random_state.get("cuda", None))
-                        np.random.set_state(random_state.get("numpy", None))
-
-                # Load model state manually (skip optimizer)
-                model_path = os.path.join(args.resume, "pytorch_model.bin")
-                if os.path.exists(model_path):
-                    state_dict = torch.load(model_path, map_location="cpu")
-                    # Get the unwrapped model to load state
-                    unwrapped_model = accelerator.unwrap_model(network)
-                    unwrapped_model.load_state_dict(state_dict)
-                    accelerator.print(f"loaded model state from {model_path}")
-
-                # Load scheduler state
-                scheduler_path = os.path.join(args.resume, "scheduler.bin")
-                if os.path.exists(scheduler_path):
-                    scheduler_state = torch.load(scheduler_path, map_location="cpu")
-                    if isinstance(scheduler_state, dict) and "state" in scheduler_state:
-                        lr_scheduler.load_state_dict(scheduler_state)
-                        accelerator.print(f"loaded scheduler state from {scheduler_path}")
-
-                # Load EMA state for loss balancing persistence
-                ema_path = os.path.join(args.resume, "ema_state.json")
-                if os.path.exists(ema_path):
-                    try:
-                        with open(ema_path, "r") as f:
-                            ema_state_data = json.load(f)
-                        ema_state.audio_loss_ema = ema_state_data.get("audio_loss_ema", ema_state.audio_loss_ema)
-                        ema_state.video_loss_ema = ema_state_data.get("video_loss_ema", ema_state.video_loss_ema)
-                        ema_state.audio_presence_ema = ema_state_data.get("audio_presence_ema", ema_state.audio_presence_ema)
-                        # Update local vars for backward compatibility
-                        audio_loss_ema = ema_state.audio_loss_ema
-                        video_loss_ema = ema_state.video_loss_ema
-                        audio_presence_ema = ema_state.audio_presence_ema
-                        accelerator.print(f"loaded EMA state from {ema_path}: audio_loss_ema={audio_loss_ema:.4f}, video_loss_ema={video_loss_ema:.4f}, audio_presence_ema={audio_presence_ema:.4f}")
-                    except Exception as e:
-                        accelerator.print(f"warning: failed to load EMA state: {e}")
-
-                initial_global_step = self._recover_global_step(args.resume)
-                accelerator.print(f"resumed from step {initial_global_step} (optimizer state reset)")
+        # autoresume: find latest state in output_dir if --autoresume is set and --resume is not
+        if getattr(args, "autoresume", False) and not args.resume:
+            latest = self._find_latest_state_dir(args)
+            if latest:
+                logger.info(f"autoresume: found latest state directory: {latest}")
+                args.resume = latest
             else:
-                initial_global_step = self.resume_from_local_or_hf_if_specified(accelerator, args)
+                logger.info("autoresume: no saved state found in output_dir, starting from scratch")
 
-        # Sync local vars after resume (in case EMA state was loaded via load_model_hook)
-        audio_loss_ema = ema_state.audio_loss_ema
-        video_loss_ema = ema_state.video_loss_ema
-        audio_presence_ema = ema_state.audio_presence_ema
-        if initial_global_step > 0 and audio_loss_balance_mode != "none":
-            accelerator.print(f"EMA loss balancing state: audio_loss_ema={audio_loss_ema:.4f}, video_loss_ema={video_loss_ema:.4f}, audio_presence_ema={audio_presence_ema:.4f}")
+        # resume from local or huggingface — must be after num_update_steps_per_epoch is known
 
-        epoch_to_start = initial_global_step // num_update_steps_per_epoch if initial_global_step > 0 else 0
+        # save param_groups before resume so we can restore them if --reset_optimizer_params
+        inner_optimizer = optimizer.optimizer if hasattr(optimizer, "optimizer") else optimizer
+        if getattr(args, "reset_optimizer_params", False):
+            saved_param_groups = [{k: v for k, v in pg.items() if k != "params"} for pg in inner_optimizer.param_groups]
+
+        # load resume metadata (for mid-epoch skip) before accelerator.load_state
+        resume_metadata = None
+        if args.resume:
+            resume_metadata = train_utils.load_resume_metadata(args.resume)
+
+        initial_global_step = self.resume_from_local_or_hf_if_specified(accelerator, args)
+
+        # apply optimizer/scheduler resets after resume
+        if initial_global_step > 0:
+            if getattr(args, "reset_optimizer", False):
+                inner_optimizer.state.clear()
+                accelerator.print("reset optimizer state (cleared momentum/variance)")
+
+            if getattr(args, "reset_optimizer_params", False):
+                for pg, saved in zip(inner_optimizer.param_groups, saved_param_groups):
+                    for k, v in saved.items():
+                        pg[k] = v
+                accelerator.print("reset optimizer param groups to CLI values")
+
+            if getattr(args, "reset_optimizer", False) or getattr(args, "reset_optimizer_params", False):
+                # reset lr to base value so the new scheduler starts from the correct base
+                # (scheduler __init__ uses current group['lr'], not initial_lr)
+                for pg in inner_optimizer.param_groups:
+                    if "initial_lr" in pg:
+                        pg["lr"] = pg["initial_lr"]
+                        del pg["initial_lr"]
+                new_inner_scheduler = self.get_lr_scheduler(args, inner_optimizer, accelerator.num_processes)
+                # scheduler restarts from step 0 (fresh warmup/decay)
+                # resume_metadata.json tracks the real global_step for checkpoint recovery
+                # replace the inner scheduler while keeping the AcceleratedScheduler wrapper
+                # (the wrapper gates stepping on sync_gradients for gradient accumulation)
+                if hasattr(lr_scheduler, "scheduler"):
+                    lr_scheduler.scheduler = new_inner_scheduler
+                else:
+                    lr_scheduler = new_inner_scheduler
+                accelerator.print("recreated LR scheduler (restarting schedule from step 0)")
+
+        # calculate epoch and mid-epoch skip
+        steps_to_skip_in_epoch = 0
+        if initial_global_step > 0 and resume_metadata is not None and resume_metadata.get("global_step", 0) > 0:
+            saved_epoch = resume_metadata.get("epoch", 1)
+            step_in_epoch = resume_metadata.get("step_in_epoch", 0)
+            if step_in_epoch > 0:
+                # mid-epoch checkpoint: resume in the same epoch, skip processed batches
+                epoch_to_start = max(saved_epoch - 1, 0)
+                if not getattr(args, "reset_dataloader", False):
+                    steps_to_skip_in_epoch = step_in_epoch
+            else:
+                # epoch-end checkpoint: epoch is complete, start from next
+                epoch_to_start = saved_epoch
+        else:
+            epoch_to_start = initial_global_step // num_update_steps_per_epoch if initial_global_step > 0 else 0
 
         # 学習する
         # total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
@@ -2701,7 +2964,10 @@ class NetworkTrainer:
         accelerator.print(f"  gradient accumulation steps / 勾配を合計するステップ数 = {args.gradient_accumulation_steps}")
         accelerator.print(f"  total optimization steps / 学習ステップ数: {args.max_train_steps}")
         if initial_global_step > 0:
-            accelerator.print(f"  resuming from step {initial_global_step}, epoch {epoch_to_start + 1}/{num_train_epochs}")
+            msg = f"  resuming from step {initial_global_step}, epoch {epoch_to_start + 1}/{num_train_epochs}"
+            if steps_to_skip_in_epoch > 0:
+                msg += f", skipping {steps_to_skip_in_epoch} batches in epoch"
+            accelerator.print(msg)
 
         # TODO refactor metadata creation and move to util
         metadata = {
@@ -2753,6 +3019,10 @@ class NetworkTrainer:
             "ss_shifted_logit_uniform_prob": getattr(args, "shifted_logit_uniform_prob", None),
             "ss_audio_lr": getattr(args, "audio_lr", None),
             "ss_lr_args": json.dumps(getattr(args, "lr_args", None)) if getattr(args, "lr_args", None) else None,
+            "ss_audio_dim": getattr(args, "audio_dim", None),
+            "ss_audio_alpha": getattr(args, "audio_alpha", None),
+            "ss_video_caption_dropout_rate": getattr(args, "video_caption_dropout_rate", 0.0),
+            "ss_audio_caption_dropout_rate": getattr(args, "audio_caption_dropout_rate", 0.0),
         }
 
         datasets_metadata = []
@@ -2817,8 +3087,21 @@ class NetworkTrainer:
 
         global_step = initial_global_step
         noise_scheduler = FlowMatchDiscreteScheduler(shift=args.discrete_flow_shift, reverse=True, solver="euler")
+        timestep_tb_buffers = None
+        timestep_tb_interval = max(1, int(getattr(args, "log_timestep_distribution_interval", 100) or 100))
+        try:
+            if self._should_log_timestep_distribution_to_tensorboard(args, accelerator):
+                timestep_tb_buffers = {}
+        except Exception as e:
+            logger.warning(f"Disabling TensorBoard timestep distribution logging due to initialization failure: {e}")
+            timestep_tb_buffers = None
 
         loss_recorder = train_utils.LossRecorder()
+        if initial_global_step > 0 and getattr(self, "_resume_state_dir", None):
+            _meta = train_utils.load_resume_metadata(self._resume_state_dir)
+            if _meta and "loss_avg" in _meta:
+                loss_recorder.prefill(_meta["loss_avg"], _meta.get("loss_count", 0))
+                accelerator.print(f"  restored loss average: {_meta['loss_avg']:.4f} (from {_meta.get('loss_count', 0)} steps)")
         if train_audio_sampler is None:
             del train_dataset_group
 
@@ -2944,6 +3227,17 @@ class NetworkTrainer:
                     latents_tensor = self.scale_shift_latents(latents_tensor)
                     noise = torch.randn_like(latents_tensor)
 
+                    # HFATO: degrade latents before noise addition, keep clean for loss
+                    _hfato_config = getattr(self, "_hfato_config", None)
+                    if _hfato_config is not None and latents_tensor.dim() == 5:
+                        import random as _hfato_rand
+                        if _hfato_rand.random() < _hfato_config.probability:
+                            from musubi_tuner.hfato import degrade_latents
+                            batch["_hfato"] = {"clean_latents": latents_tensor}
+                            latents_tensor = degrade_latents(
+                                latents_tensor, _hfato_config.scale_factor, _hfato_config.interpolation,
+                            )
+
                     noisy_model_input, timesteps = self.get_noisy_model_input_and_timesteps(
                         args,
                         noise,
@@ -3030,7 +3324,18 @@ class NetworkTrainer:
                         video_pred = out["video_pred"]
                         video_target = out["video_target"]
                         video_loss_mask = out.get("video_loss_mask")
-                        video_loss = _masked_loss(video_pred, video_target, video_loss_mask)
+                        _hfato_data = out.get("_hfato")
+                        if _hfato_data is not None:
+                            from musubi_tuner.hfato import hfato_x0_loss
+                            video_loss = hfato_x0_loss(
+                                video_pred.to(dtype=network_dtype),
+                                _hfato_data["noisy"].to(device=video_pred.device, dtype=network_dtype),
+                                _hfato_data["clean"].to(device=video_pred.device, dtype=network_dtype),
+                                _hfato_data["sigma"].to(device=video_pred.device),
+                                video_loss_mask,
+                            )
+                        else:
+                            video_loss = _masked_loss(video_pred, video_target, video_loss_mask)
                         video_weight = float(out.get("video_loss_weight", 1.0))
                         loss = video_loss * video_weight
 
@@ -3140,6 +3445,11 @@ class NetworkTrainer:
             accelerator.unwrap_model(network).on_epoch_start(transformer)
 
             for step, batch in enumerate(train_dataloader):
+                # mid-epoch resume: skip batches already processed before checkpoint
+                if steps_to_skip_in_epoch > 0:
+                    steps_to_skip_in_epoch -= 1
+                    continue
+
                 _step_start_time = time.perf_counter()
                 # VRAM spike tracing for first iteration
                 _is_first_step = (epoch == epoch_to_start and step == 0)
@@ -3175,6 +3485,17 @@ class NetworkTrainer:
                     # Sample noise that we'll add to the latents
                     noise = torch.randn_like(latents_tensor)
 
+                    # HFATO: degrade latents before noise addition, keep clean for loss
+                    _hfato_config = getattr(self, "_hfato_config", None)
+                    if _hfato_config is not None and latents_tensor.dim() == 5:
+                        import random as _hfato_rand
+                        if _hfato_rand.random() < _hfato_config.probability:
+                            from musubi_tuner.hfato import degrade_latents
+                            batch["_hfato"] = {"clean_latents": latents_tensor}
+                            latents_tensor = degrade_latents(
+                                latents_tensor, _hfato_config.scale_factor, _hfato_config.interpolation,
+                            )
+
                     # calculate model input and timesteps
                     noisy_model_input, timesteps = self.get_noisy_model_input_and_timesteps(
                         args,
@@ -3203,6 +3524,12 @@ class NetworkTrainer:
                         timesteps,
                         network_dtype,
                     )
+                    if timestep_tb_buffers is not None:
+                        payload = self._get_timestep_distribution_logging_payload(args, timesteps)
+                        for name, ts_values in payload.items():
+                            if ts_values is None:
+                                continue
+                            self._accumulate_timestep_distribution(timestep_tb_buffers, name, ts_values, accelerator)
                     if _is_first_step:
                         _log_vram("FIRST_ITER: AFTER call_dit (forward pass)", logger)
                     dict_output = isinstance(model_pred, dict)
@@ -3212,6 +3539,10 @@ class NetworkTrainer:
                     audio_presence_ema_value = None
                     audio_loss_ema_value = None
                     video_loss_ema_value = None
+                    ogm_ge_state = None
+                    grad_norm_video_value = None  # Per-modality gradient norms
+                    grad_norm_audio_value = None
+                    audio_diagnostics = {}  # Per-batch audio quality diagnostics (negligible cost)
                     _loss_type = getattr(args, "loss_type", "mse")
                     _huber_delta = getattr(args, "huber_delta", 1.0)
 
@@ -3260,67 +3591,153 @@ class NetworkTrainer:
                         video_pred = out["video_pred"]
                         video_target = out["video_target"]
                         video_loss_mask = out.get("video_loss_mask")
-                        video_loss = _masked_loss(video_pred, video_target, video_loss_mask)
-                        video_weight = float(out.get("video_loss_weight", 1.0))
-                        loss = video_loss * video_weight
-                        if audio_loss_balance_mode == "ema_mag":
-                            video_loss_item = max(float(video_loss.detach().item()), 1e-12)
-                            video_loss_ema = update_loss_ema(
-                                loss_ema=video_loss_ema,
-                                loss_value=video_loss_item,
-                                ema_decay=audio_loss_balance_ema_decay,
+                        _hfato_data = out.get("_hfato")
+                        if _hfato_data is not None:
+                            from musubi_tuner.hfato import hfato_x0_loss
+                            video_loss = hfato_x0_loss(
+                                video_pred.to(dtype=network_dtype),
+                                _hfato_data["noisy"].to(device=video_pred.device, dtype=network_dtype),
+                                _hfato_data["clean"].to(device=video_pred.device, dtype=network_dtype),
+                                _hfato_data["sigma"].to(device=video_pred.device),
+                                video_loss_mask,
                             )
-                            ema_state.video_loss_ema = video_loss_ema
-                            video_loss_ema_value = video_loss_ema
-                        # Capture video loss for logging (only if weight > 0)
-                        if video_weight > 0:
-                            video_loss_value = video_loss.detach().item()
+                        else:
+                            video_loss = _masked_loss(video_pred, video_target, video_loss_mask)
 
                         audio_pred = out.get("audio_pred")
                         audio_target = out.get("audio_target")
                         audio_loss_mask = out.get("audio_loss_mask")
                         has_audio_loss = audio_pred is not None and audio_target is not None
-                        if audio_loss_balance_mode == "inv_freq":
-                            audio_presence_ema = update_audio_presence_ema(
-                                audio_presence_ema=audio_presence_ema,
-                                balance_beta=audio_loss_balance_beta,
-                                has_audio_loss=has_audio_loss,
+
+                        if audio_loss_balance_mode == "uncertainty" and has_audio_loss:
+                            # Uncertainty weighting: learnable log-variance scalars replace manual weights
+                            video_loss_value = video_loss.detach().item()
+                            audio_loss_raw = _masked_loss(audio_pred, audio_target, audio_loss_mask)
+                            audio_loss_value = audio_loss_raw.detach().item()
+                            loss = compute_uncertainty_weighted_loss(
+                                video_loss, audio_loss_raw,
+                                uncertainty_log_var_video, uncertainty_log_var_audio,
                             )
-                            ema_state.audio_presence_ema = audio_presence_ema
-                            audio_presence_ema_value = audio_presence_ema
-                        if has_audio_loss:
+                        elif audio_loss_balance_mode == "ogm_ge" and has_audio_loss:
                             audio_loss = _masked_loss(audio_pred, audio_target, audio_loss_mask)
-                            audio_weight = float(out.get("audio_loss_weight", 1.0))
-                            if audio_loss_balance_mode == "inv_freq":
-                                audio_weight = compute_inverse_frequency_audio_weight(
-                                    base_audio_weight=audio_weight,
-                                    audio_presence_ema=audio_presence_ema,
-                                    balance_eps=audio_loss_balance_eps,
-                                    balance_min=audio_loss_balance_min,
-                                    balance_max=audio_loss_balance_max,
-                                )
-                            elif audio_loss_balance_mode == "ema_mag":
-                                audio_loss_item = max(float(audio_loss.detach().item()), 1e-12)
-                                audio_loss_ema = update_loss_ema(
-                                    loss_ema=audio_loss_ema,
-                                    loss_value=audio_loss_item,
+                            video_loss_value = video_loss.detach().item()
+                            audio_loss_value = audio_loss.detach().item()
+                            ogm_ge_state = compute_ogm_ge_coefficients(
+                                video_loss_value,
+                                audio_loss_value,
+                                alpha=float(getattr(args, "ogm_ge_alpha", 0.3)),
+                            )
+                            loss = video_loss * ogm_ge_state.video_coeff + audio_loss * ogm_ge_state.audio_coeff
+                            audio_weight_effective_value = ogm_ge_state.audio_coeff
+                        else:
+                            # Standard weighting path (none / inv_freq / ema_mag)
+                            video_weight = float(out.get("video_loss_weight", 1.0))
+                            loss = video_loss * video_weight
+                            if audio_loss_balance_mode == "ema_mag":
+                                video_loss_item = max(float(video_loss.detach().item()), 1e-12)
+                                video_loss_ema = update_loss_ema(
+                                    loss_ema=video_loss_ema,
+                                    loss_value=video_loss_item,
                                     ema_decay=audio_loss_balance_ema_decay,
                                 )
-                                ema_state.audio_loss_ema = audio_loss_ema
-                                audio_loss_ema_value = audio_loss_ema
-                                audio_weight = compute_ema_magnitude_audio_weight(
-                                    base_audio_weight=audio_weight,
-                                    audio_loss_ema=audio_loss_ema,
-                                    video_loss_ema=video_loss_ema,
-                                    target_audio_ratio=audio_loss_balance_target_ratio,
-                                    balance_min=audio_loss_balance_min,
-                                    balance_max=audio_loss_balance_max,
+                                video_loss_ema_value = video_loss_ema
+                            # Capture video loss for logging (only if weight > 0)
+                            if video_weight > 0:
+                                video_loss_value = video_loss.detach().item()
+                            if audio_loss_balance_mode == "inv_freq":
+                                audio_presence_ema = update_audio_presence_ema(
+                                    audio_presence_ema=audio_presence_ema,
+                                    balance_beta=audio_loss_balance_beta,
+                                    has_audio_loss=has_audio_loss,
                                 )
-                            audio_weight_effective_value = audio_weight
-                            loss = loss + audio_loss * audio_weight
-                            # Capture audio loss for logging (only if weight > 0)
-                            if audio_weight > 0:
-                                audio_loss_value = audio_loss.detach().item()
+                                audio_presence_ema_value = audio_presence_ema
+                            if has_audio_loss:
+                                audio_loss = _masked_loss(audio_pred, audio_target, audio_loss_mask)
+                                audio_weight = float(out.get("audio_loss_weight", 1.0))
+                                if audio_loss_balance_mode == "inv_freq":
+                                    audio_weight = compute_inverse_frequency_audio_weight(
+                                        base_audio_weight=audio_weight,
+                                        audio_presence_ema=audio_presence_ema,
+                                        balance_eps=audio_loss_balance_eps,
+                                        balance_min=audio_loss_balance_min,
+                                        balance_max=audio_loss_balance_max,
+                                    )
+                                elif audio_loss_balance_mode == "ema_mag":
+                                    audio_loss_item = max(float(audio_loss.detach().item()), 1e-12)
+                                    audio_loss_ema = update_loss_ema(
+                                        loss_ema=audio_loss_ema,
+                                        loss_value=audio_loss_item,
+                                        ema_decay=audio_loss_balance_ema_decay,
+                                    )
+                                    audio_loss_ema_value = audio_loss_ema
+                                    audio_weight = compute_ema_magnitude_audio_weight(
+                                        base_audio_weight=audio_weight,
+                                        audio_loss_ema=audio_loss_ema,
+                                        video_loss_ema=video_loss_ema,
+                                        target_audio_ratio=audio_loss_balance_target_ratio,
+                                        balance_min=audio_loss_balance_min,
+                                        balance_max=audio_loss_balance_max,
+                                    )
+                                audio_weight_effective_value = audio_weight
+                                loss = loss + audio_loss * audio_weight
+                                audio_loss_value = audio_loss.detach().item() if audio_weight > 0 else None
+
+                        # --- Audio diagnostics (per-batch, negligible cost) ---
+                        if has_audio_loss and audio_pred is not None and audio_target is not None:
+                            with torch.no_grad():
+                                ap = audio_pred.detach().float()
+                                at = audio_target.detach().float()
+
+                                # Task 2: Audio latent statistics — detect collapse/explosion
+                                audio_diagnostics["audio_latent/pred_mean"] = ap.mean().item()
+                                audio_diagnostics["audio_latent/pred_std"] = ap.std().item()
+                                audio_diagnostics["audio_latent/pred_absmax"] = ap.abs().max().item()
+
+                                # Task 3: Latent-space SNR (dB)
+                                target_power = (at ** 2).mean()
+                                error_power = ((at - ap) ** 2).mean()
+                                if error_power > 0:
+                                    audio_diagnostics["audio_latent/snr_db"] = (
+                                        10.0 * torch.log10(target_power / error_power)
+                                    ).item()
+
+                                # Task 1: Timestep-stratified audio loss
+                                audio_sigma = out.get("audio_sigma")
+                                if audio_sigma is not None:
+                                    sigma = audio_sigma.detach().float()
+                                    # Per-sample MSE (reduce over C, T, F)
+                                    per_sample = ((ap - at) ** 2).mean(
+                                        dim=list(range(1, ap.dim()))
+                                    )
+                                    high_mask = sigma > 0.5
+                                    mid_mask = (sigma >= 0.1) & (sigma <= 0.5)
+                                    low_mask = sigma < 0.1
+                                    if high_mask.any():
+                                        audio_diagnostics["loss_a/sigma_high"] = per_sample[high_mask].mean().item()
+                                    if mid_mask.any():
+                                        audio_diagnostics["loss_a/sigma_mid"] = per_sample[mid_mask].mean().item()
+                                    if low_mask.any():
+                                        audio_diagnostics["loss_a/sigma_low"] = per_sample[low_mask].mean().item()
+
+                        # Task 4: Audio/video loss ratio
+                        if video_loss_value is not None and audio_loss_value is not None and video_loss_value > 0:
+                            audio_diagnostics["loss/audio_video_ratio"] = audio_loss_value / video_loss_value
+
+                        # Extended audio metrics (standalone module, no-op when off)
+                        if getattr(self, '_audio_metrics', None) is not None:
+                            self._audio_metrics.on_step(global_step)
+                            audio_diagnostics.update(self._audio_metrics.compute_latent_metrics(
+                                ap, at,
+                                video_pred=out.get("video_pred"),
+                                video_target=out.get("video_target"),
+                            ))
+                            if self._audio_metrics.should_compute_mel(global_step):
+                                _mel_decoder = getattr(self, '_get_audio_decoder_for_metrics', lambda: None)()
+                                if _mel_decoder is not None:
+                                    audio_diagnostics.update(self._audio_metrics.compute_mel_metrics(
+                                        out.get("audio_pred"), out.get("audio_target"), _mel_decoder,
+                                    ))
+
                     else:
                         if isinstance(target, torch.Tensor):
                             model_pred = model_pred.to(device=target.device, dtype=network_dtype)
@@ -3375,42 +3792,50 @@ class NetworkTrainer:
                         except Exception as e:
                             logger.warning("Self-Flow loss computation failed: %s", e)
 
-                # Cross-Task Synergy auxiliary losses
-                cts_metrics = {}
-                if dict_output:
-                    cts_data = out.get("_cts")
-                    if cts_data is not None:
-                        try:
-                            cts_loss, cts_metrics = compute_cross_task_synergy_losses(
-                                transformer=transformer,
-                                accelerator=accelerator,
-                                noisy_video=cts_data["noisy_video"],
-                                clean_video=cts_data["clean_video"],
-                                video_target=out["video_target"],
-                                video_timesteps=cts_data["video_timesteps"],
-                                video_loss_mask=out.get("video_loss_mask"),
-                                noisy_audio=cts_data["noisy_audio"],
-                                clean_audio=cts_data["clean_audio"],
-                                audio_target=out.get("audio_target"),
-                                audio_timesteps=cts_data["audio_timesteps"],
-                                audio_loss_mask=out.get("audio_loss_mask"),
-                                text_embeds=cts_data["text_embeds"],
-                                text_mask=cts_data["text_mask"],
-                                frame_rate=cts_data["frame_rate"],
-                                transformer_options=cts_data["transformer_options"],
-                                lambda_video_driven=cts_data["lambda_video_driven"],
-                                lambda_audio_driven=cts_data["lambda_audio_driven"],
-                            )
-                            if cts_loss is not None:
-                                loss = loss + cts_loss
-                        except Exception as e:
-                            logger.warning("Cross-Task Synergy loss failed: %s", e)
+                    # Cross-Task Synergy auxiliary losses
+                    cts_metrics = {}
+                    if dict_output:
+                        cts_data = out.get("_cts")
+                        if cts_data is not None:
+                            try:
+                                cts_loss, cts_metrics = compute_cross_task_synergy_losses(
+                                    transformer=transformer,
+                                    accelerator=accelerator,
+                                    noisy_video=cts_data["noisy_video"],
+                                    clean_video=cts_data["clean_video"],
+                                    video_target=out["video_target"],
+                                    video_timesteps=cts_data["video_timesteps"],
+                                    video_loss_mask=out.get("video_loss_mask"),
+                                    noisy_audio=cts_data["noisy_audio"],
+                                    clean_audio=cts_data["clean_audio"],
+                                    audio_target=out.get("audio_target"),
+                                    audio_timesteps=cts_data["audio_timesteps"],
+                                    audio_loss_mask=out.get("audio_loss_mask"),
+                                    text_embeds=cts_data["text_embeds"],
+                                    text_mask=cts_data["text_mask"],
+                                    frame_rate=cts_data["frame_rate"],
+                                    transformer_options=cts_data["transformer_options"],
+                                    lambda_video_driven=cts_data["lambda_video_driven"],
+                                    lambda_audio_driven=cts_data["lambda_audio_driven"],
+                                )
+                                if cts_loss is not None:
+                                    loss = loss + cts_loss
+                            except Exception as e:
+                                logger.warning("Cross-Task Synergy loss failed: %s", e)
 
                     if _is_first_step:
                         _log_vram("FIRST_ITER: BEFORE backward", logger)
                     accelerator.backward(loss)
                     if _is_first_step:
                         _log_vram("FIRST_ITER: AFTER backward", logger)
+
+                    if dict_output and ogm_ge_state is not None:
+                        maybe_add_ogm_ge_gradient_noise(
+                            accelerator.unwrap_model(network),
+                            video_coeff=ogm_ge_state.video_coeff,
+                            audio_coeff=ogm_ge_state.audio_coeff,
+                            noise_std_scale=float(getattr(args, "ogm_ge_noise_std", 0.0)),
+                        )
 
                     pres_losses = self.preservation_backward(args, accelerator, transformer, network, network_dtype)
                     if _prior_div_value is not None:
@@ -3484,6 +3909,25 @@ class NetworkTrainer:
                                 params_to_clip.extend(self._self_flow.get_trainable_params())
                             accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
 
+                        # Per-modality gradient norm tracking (accumulate on GPU, sync once)
+                        if len(accelerator.trackers) > 0 and dict_output:
+                            unwrapped_net = accelerator.unwrap_model(network)
+                            lora_modules = getattr(unwrapped_net, "unet_loras", None)
+                            if lora_modules:
+                                video_grad_sq = torch.zeros(1, device=accelerator.device)
+                                audio_grad_sq = torch.zeros(1, device=accelerator.device)
+                                for lora in lora_modules:
+                                    is_audio = "audio_" in lora.lora_name
+                                    for param in lora.parameters():
+                                        if param.grad is not None:
+                                            g_sq = param.grad.data.norm() ** 2
+                                            if is_audio:
+                                                audio_grad_sq += g_sq
+                                            else:
+                                                video_grad_sq += g_sq
+                                grad_norm_video_value = video_grad_sq.sqrt().item()
+                                grad_norm_audio_value = audio_grad_sq.sqrt().item()
+
                     if _is_first_step:
                         _log_vram("FIRST_ITER: BEFORE optimizer.step", logger)
                     optimizer.step()
@@ -3495,7 +3939,12 @@ class NetworkTrainer:
                         and self._self_flow is not None
                     ):
                         try:
-                            self._self_flow.update_teacher(accelerator.unwrap_model(network))
+                            # Use stored network ref: may be LoRA network or transformer (full fine-tuning).
+                            _sf_net = getattr(self, "_self_flow_network", None) or (
+                                accelerator.unwrap_model(network) if network is not None else None
+                            )
+                            if _sf_net is not None:
+                                self._self_flow.update_teacher(_sf_net)
                         except Exception as e:
                             logger.warning("Self-Flow EMA update failed: %s", e)
                     lr_scheduler.step()
@@ -3517,6 +3966,21 @@ class NetworkTrainer:
                         progress_bar.reset()  # exclude first step from progress bar, because it may take long due to initializations
                     progress_bar.update(1)
                     global_step += 1
+                    if timestep_tb_buffers is not None and (
+                        global_step == 1 or global_step % timestep_tb_interval == 0
+                    ):
+                        for name, chunks in timestep_tb_buffers.items():
+                            if not chunks:
+                                continue
+                            values = torch.cat(list(chunks), dim=0)
+                            tag = "timestep/used_values" if name == "main" else f"timestep/used_values_{name}"
+                            self._log_timestep_distribution_histogram(
+                                accelerator,
+                                global_step,
+                                tag,
+                                values,
+                            )
+                            chunks.clear()
                     if (
                         args.log_cuda_memory_every_n_steps is not None
                         and args.log_cuda_memory_every_n_steps > 0
@@ -3524,6 +3988,13 @@ class NetworkTrainer:
                         and global_step % args.log_cuda_memory_every_n_steps == 0
                     ):
                         _log_cuda_memory_stats(f"step_{global_step}", latents_shape=latents_shape)
+
+                    # G2D modality freezer: update loss EMA and check freeze state
+                    if modality_freezer is not None:
+                        modality_freezer.update_losses(video_loss_value, audio_loss_value)
+                        modality_freezer.maybe_update_freeze(
+                            global_step, accelerator.unwrap_model(network),
+                        )
 
                     # to avoid calling optimizer_eval_fn() too frequently, we call it only when we need to sample images or save the model
                     should_sampling = should_sample_images(args, global_step, epoch=None)
@@ -3545,7 +4016,17 @@ class NetworkTrainer:
                                     gui_metrics.log_event("checkpoint", global_step)
 
                                 if args.save_state:
-                                    train_utils.save_and_remove_state_stepwise(args, accelerator, global_step)
+                                    train_utils.save_and_remove_state_stepwise(
+                                        args, accelerator, global_step, epoch=epoch + 1, step_in_epoch=step + 1
+                                    )
+                                    _state_dir = os.path.join(
+                                        args.output_dir,
+                                        train_utils.STEP_STATE_NAME.format(args.output_name, global_step),
+                                    )
+                                    train_utils.update_resume_metadata(_state_dir, {
+                                        "loss_avg": loss_recorder.moving_average,
+                                        "loss_count": len(loss_recorder.loss_list),
+                                    })
 
                                 remove_step_no = train_utils.get_remove_step_no(args, global_step)
                                 if remove_step_no is not None:
@@ -3576,69 +4057,55 @@ class NetworkTrainer:
                     )
                     if audio_weight_effective_value is not None:
                         logs["loss/audio_weight_effective"] = audio_weight_effective_value
+                    if ogm_ge_state is not None:
+                        logs["ogm_ge/video_coeff"] = ogm_ge_state.video_coeff
+                        logs["ogm_ge/audio_coeff"] = ogm_ge_state.audio_coeff
+                        logs["ogm_ge/discrepancy"] = ogm_ge_state.discrepancy
                     if audio_presence_ema_value is not None:
                         logs["loss/audio_presence_ema"] = audio_presence_ema_value
                     if audio_loss_ema_value is not None:
                         logs["loss/audio_loss_ema"] = audio_loss_ema_value
                     if video_loss_ema_value is not None:
                         logs["loss/video_loss_ema"] = video_loss_ema_value
+                    if grad_norm_video_value is not None:
+                        logs["grad_norm/video"] = grad_norm_video_value
+                    if grad_norm_audio_value is not None:
+                        logs["grad_norm/audio"] = grad_norm_audio_value
+                        if grad_norm_video_value is not None and grad_norm_video_value > 0:
+                            logs["grad_norm/audio_video_ratio"] = grad_norm_audio_value / grad_norm_video_value
+                    if uncertainty_log_var_video is not None:
+                        lv_v = uncertainty_log_var_video.detach().item()
+                        lv_a = uncertainty_log_var_audio.detach().item()
+                        logs["uncertainty/log_var_video"] = lv_v
+                        logs["uncertainty/log_var_audio"] = lv_a
+                        logs["uncertainty/precision_video"] = math.exp(-lv_v)
+                        logs["uncertainty/precision_audio"] = math.exp(-lv_a)
+                    if modality_freezer is not None:
+                        # Encode state as numeric: 0=both active, 1=audio frozen, -1=video frozen
+                        state_map = {"both": 0, "audio_frozen": 1, "video_frozen": -1}
+                        logs["modality_freeze/state"] = state_map.get(modality_freezer.state, 0)
+                        logs["modality_freeze/video_loss_ema"] = modality_freezer.video_loss_ema
+                        logs["modality_freeze/audio_loss_ema"] = modality_freezer.audio_loss_ema
                     if pres_losses:
                         logs.update(pres_losses)
+                    if audio_diagnostics:
+                        logs.update(audio_diagnostics)
                     accelerator.log(logs, step=global_step)
 
                     # Log automagic LR histogram directly to tracker
                     if args.optimizer_type.lower() == "automagic" and optimizer is not None:
-                        # Handle wrapped optimizer (AcceleratedOptimizer)
-                        actual_optimizer = optimizer
-                        if hasattr(optimizer, "optimizer"):
-                            actual_optimizer = optimizer.optimizer
-                        elif hasattr(optimizer, "_optimizer"):
-                            actual_optimizer = optimizer._optimizer
-
-                        if hasattr(actual_optimizer, "get_lr_tensor"):
-                            lr_tensor = actual_optimizer.get_lr_tensor()
-                            if lr_tensor is not None and lr_tensor.mean() > 0:
-                                for tracker in accelerator.trackers:
-                                    if tracker.name == "tensorboard":
-                                        tracker.writer.add_histogram("lr/automagic_lrs", lr_tensor, global_step)
-                                    elif tracker.name == "wandb":
-                                        import wandb
-                                        tracker.log({"lr/automagic_lrs": wandb.Histogram(lr_tensor.cpu().numpy())}, step=global_step)
-
-                    # Log schedulefree optimizer LR
-                    if optimizer is not None and "schedulefree" in args.optimizer_type.lower():
-                        # Handle wrapped optimizer (AcceleratedOptimizer)
-                        actual_optimizer = optimizer
-                        if hasattr(optimizer, "optimizer"):
-                            actual_optimizer = optimizer.optimizer
-                        elif hasattr(optimizer, "_optimizer"):
-                            actual_optimizer = optimizer._optimizer
-
-                        # schedulefree stores scheduled_lr in param_groups
-                        if hasattr(actual_optimizer, "param_groups") and len(actual_optimizer.param_groups) > 0:
-                            scheduled_lr = actual_optimizer.param_groups[0].get("scheduled_lr")
-                            if scheduled_lr is not None:
-                                for tracker in accelerator.trackers:
-                                    if tracker.name == "tensorboard":
-                                        tracker.writer.add_scalar("lr", scheduled_lr, global_step)
-                                    elif tracker.name == "wandb":
-                                        import wandb
-                                        tracker.log({"lr": scheduled_lr}, step=global_step)
+                        lr_tensor = optimizer.get_lr_tensor()
+                        if lr_tensor is not None and lr_tensor.mean() > 0:
+                            for tracker in accelerator.trackers:
+                                if tracker.name == "tensorboard":
+                                    tracker.writer.add_histogram("lr/automagic_lrs", lr_tensor, global_step)
+                                elif tracker.name == "wandb":
+                                    import wandb
+                                    tracker.log({"lr/automagic_lrs": wandb.Histogram(lr_tensor.cpu().numpy())}, step=global_step)
 
                 # GUI dashboard per-step metrics
                 if gui_metrics is not None:
                     step_time = time.perf_counter() - _step_start_time
-                    # Get current LR for GUI metrics
-                    if "schedulefree" in args.optimizer_type.lower() and optimizer is not None:
-                        actual_optimizer = optimizer
-                        if hasattr(optimizer, "optimizer"):
-                            actual_optimizer = optimizer.optimizer
-                        elif hasattr(optimizer, "_optimizer"):
-                            actual_optimizer = optimizer._optimizer
-                        current_lr = actual_optimizer.param_groups[0].get("scheduled_lr", 0.0) if hasattr(actual_optimizer, "param_groups") else 0.0
-                    else:
-                        current_lr = lr_scheduler.get_last_lr()[0] if lr_scheduler else 0.0
-
                     gui_metrics.log(
                         step=global_step,
                         epoch=epoch,
@@ -3646,7 +4113,7 @@ class NetworkTrainer:
                         avr_loss=avr_loss,
                         loss_v=video_loss_value,
                         loss_a=audio_loss_value,
-                        lr=current_lr,
+                        lr=lr_scheduler.get_last_lr()[0],
                         step_time=step_time,
                     )
                     gui_metrics.update_status(step=global_step, status="training")
@@ -3660,6 +4127,9 @@ class NetworkTrainer:
 
                 if global_step >= args.max_train_steps:
                     break
+
+            # ensure skip counter doesn't carry into next epoch (e.g. if dataset shrunk)
+            steps_to_skip_in_epoch = 0
 
             if len(accelerator.trackers) > 0:
                 logs = {"loss/epoch": loss_recorder.moving_average}
@@ -3688,7 +4158,17 @@ class NetworkTrainer:
                         remove_model(remove_ckpt_name)
 
                     if args.save_state:
-                        train_utils.save_and_remove_state_on_epoch_end(args, accelerator, epoch + 1)
+                        train_utils.save_and_remove_state_on_epoch_end(
+                            args, accelerator, epoch + 1, global_step=global_step, step_in_epoch=0
+                        )
+                        _state_dir = os.path.join(
+                            args.output_dir,
+                            train_utils.EPOCH_STATE_NAME.format(args.output_name, epoch + 1),
+                        )
+                        train_utils.update_resume_metadata(_state_dir, {
+                            "loss_avg": loss_recorder.moving_average,
+                            "loss_count": len(loss_recorder.loss_list),
+                        })
 
             self.sample_images(accelerator, args, epoch + 1, global_step, vae, transformer, sample_parameters, dit_dtype)
             set_trainer_train_mode()
@@ -3709,7 +4189,15 @@ class NetworkTrainer:
         set_trainer_eval_mode()
 
         if is_main_process and (args.save_state or args.save_state_on_train_end):
-            train_utils.save_state_on_train_end(args, accelerator)
+            train_utils.save_state_on_train_end(args, accelerator, global_step=global_step, epoch=num_train_epochs)
+            _state_dir = os.path.join(
+                args.output_dir,
+                train_utils.LAST_STATE_NAME.format(args.output_name),
+            )
+            train_utils.update_resume_metadata(_state_dir, {
+                "loss_avg": loss_recorder.moving_average,
+                "loss_count": len(loss_recorder.loss_list),
+            })
 
         if is_main_process:
             ckpt_name = train_utils.get_last_ckpt_name(args.output_name)
@@ -4221,6 +4709,37 @@ def setup_parser_common() -> argparse.ArgumentParser:
         choices=["image", "console"],
         help="show timesteps in image or console, and return to console / タイムステップを画像またはコンソールに表示し、コンソールに戻る",
     )
+    parser.set_defaults(log_timestep_distribution_tensorboard=True)
+    parser.add_argument(
+        "--log_timestep_distribution_tensorboard",
+        dest="log_timestep_distribution_tensorboard",
+        action="store_true",
+        help=(
+            "Enable native TensorBoard histogram logging of the observed training timestep distribution "
+            "(enabled by default when TensorBoard logging is active)."
+            " / TensorBoard有効時、実際に使用されたタイムステップ分布をネイティブヒストグラムとして記録します"
+            "（デフォルトで有効）。"
+        ),
+    )
+    parser.add_argument(
+        "--disable_timestep_distribution_tensorboard",
+        dest="log_timestep_distribution_tensorboard",
+        action="store_false",
+        help=(
+            "Disable TensorBoard histogram logging of timestep distribution."
+            " / タイムステップ分布のTensorBoardヒストグラム記録を無効にします。"
+        ),
+    )
+    parser.add_argument(
+        "--log_timestep_distribution_interval",
+        type=int,
+        default=100,
+        help=(
+            "Interval in optimizer steps for TensorBoard timestep distribution logging when "
+            "timestep distribution logging is enabled (default: 100)."
+            " / タイムステップ分布のTensorBoard記録間隔（最適化ステップ単位、デフォルト: 100）。"
+        ),
+    )
 
     # network settings
     parser.add_argument(
@@ -4301,6 +4820,12 @@ def setup_parser_common() -> argparse.ArgumentParser:
     )
     parser.add_argument("--resume", type=str, default=None, help="saved state to resume training / 学習再開するモデルのstate")
     parser.add_argument(
+        "--autoresume",
+        action="store_true",
+        help="automatically resume from the latest saved state in output_dir (ignored if --resume is specified)"
+        " / output_dir内の最新のstateから自動的に学習を再開する（--resumeが指定されている場合は無視される）",
+    )
+    parser.add_argument(
         "--reset_optimizer",
         action="store_true",
         help="clear optimizer state (momentum/variance) when resuming, keeping only model weights",
@@ -4309,6 +4834,11 @@ def setup_parser_common() -> argparse.ArgumentParser:
         "--reset_optimizer_params",
         action="store_true",
         help="reset optimizer param groups (lr, weight_decay, etc.) to CLI values when resuming, keeping momentum/variance",
+    )
+    parser.add_argument(
+        "--reset_dataloader",
+        action="store_true",
+        help="skip mid-epoch dataloader resume and restart from the beginning of the epoch",
     )
 
     parser.add_argument(
