@@ -86,7 +86,12 @@ def _patch_lora_load_state_dict_for_audio(network: lora.LoRANetwork) -> lora.LoR
     original = network.load_state_dict
 
     def _filter_audio_keys(keys: List[str]) -> List[str]:
-        return [k for k in keys if "audio_" not in k]
+        # Filter out audio-specific keys (audio_* and to_gate_logits which are audio-only)
+        return [
+            k
+            for k in keys
+            if "audio_" not in k and "to_gate_logits" not in k
+        ]
 
     def _load_state_dict(self, state_dict, strict: bool = True):
         result = original(state_dict, strict=False)
