@@ -47,7 +47,7 @@ LTX2_LATENTS_STD = [1.0]
 
 DEFAULT_SAMPLE_PROMPTS_CACHE = "ltx2_sample_prompts_cache.pt"
 DEFAULT_SAMPLE_LATENTS_CACHE = "ltx2_sample_latents_cache.pt"
-IC_LORA_STRATEGIES = ("auto", "none", "v2v", "audio_ref_only_ic", "av_ic")
+IC_LORA_STRATEGIES = ("auto", "none", "v2v", "iv2v", "audio_ref_only_ic", "av_ic")
 
 
 def infer_ic_lora_strategy_from_preset(lora_target_preset: Optional[str]) -> str:
@@ -55,6 +55,8 @@ def infer_ic_lora_strategy_from_preset(lora_target_preset: Optional[str]) -> str
     preset = str(lora_target_preset or "").lower()
     if preset == "v2v":
         return "v2v"
+    if preset == "iv2v":
+        return "iv2v"
     if preset == "audio_ref_only_ic":
         return "audio_ref_only_ic"
     if preset == "av_ic":
@@ -1810,7 +1812,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                     )
 
         # IC-LoRA strategies enable I2V-capable sampling flow in trainer.
-        self._i2v_training = ic_lora_strategy in {"v2v", "audio_ref_only_ic", "av_ic"}
+        self._i2v_training = ic_lora_strategy in {"v2v", "iv2v", "audio_ref_only_ic", "av_ic"}
 
         apply_ltx2_tweaks(args)
 
@@ -1834,6 +1836,8 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             md["ss_ic_lora_strategy"] = self._ic_lora_strategy
         if self._ic_lora_strategy == "v2v":
             md["ss_v2v_training"] = True
+        elif self._ic_lora_strategy == "iv2v":
+            md["ss_iv2v_training"] = True
         elif self._ic_lora_strategy == "av_ic":
             md["ss_av_ic_training"] = True
         elif self._i2v_training:
@@ -2391,8 +2395,12 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
         if isinstance(ref_latents, dict):
             ref_latents = ref_latents.get("latents")
 
+        ref_img_latents = batch.get("ref_img_latents")
+        if isinstance(ref_img_latents, dict):
+            ref_img_latents = ref_img_latents.get("latents")
+
         if ref_latents is not None:
-            if ic_lora_strategy not in ("v2v", "av_ic"):
+            if ic_lora_strategy not in ("v2v", "iv2v", "av_ic"):
                 if not self._warned_ignored_ref_latents:
                     logger.warning(
                         "ref_latents were provided but --ic_lora_strategy is '%s'; ignoring reference-video conditioning.",
@@ -2400,7 +2408,8 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                     )
                     self._warned_ignored_ref_latents = True
                 ref_latents = None
-            elif ic_lora_strategy == "v2v":
+                ref_img_latents = None
+            elif ic_lora_strategy in ("v2v", "iv2v"):
                 if self._audio_video or self._ltx_mode != "video":
                     raise ValueError("Reference latent conditioning is only supported for video-only LTX-2 training")
                 if not isinstance(ref_latents, torch.Tensor):
@@ -2674,11 +2683,22 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             ref_latents = ref_latents.to(device=accelerator.device, dtype=network_dtype)
             ref_tokens = patchifier.patchify(ref_latents)
             target_tokens = patchifier.patchify(model_noisy_video)
-            combined_tokens = torch.cat([ref_tokens, target_tokens], dim=1)
 
-            bsz = combined_tokens.shape[0]
+            bsz = ref_tokens.shape[0]
             ref_seq_len = ref_tokens.shape[1]
             target_seq_len = target_tokens.shape[1]
+
+            # iv2v: prepend image reference tokens
+            img_ref_seq_len = 0
+            img_ref_conditioning_mask = None
+            if ic_lora_strategy == "iv2v" and ref_img_latents is not None:
+                ref_img_latents = ref_img_latents.to(device=accelerator.device, dtype=network_dtype)
+                img_ref_tokens = patchifier.patchify(ref_img_latents)
+                img_ref_seq_len = img_ref_tokens.shape[1]
+                img_ref_conditioning_mask = torch.ones((bsz, img_ref_seq_len), device=accelerator.device, dtype=torch.bool)
+                combined_tokens = torch.cat([img_ref_tokens, ref_tokens, target_tokens], dim=1)
+            else:
+                combined_tokens = torch.cat([ref_tokens, target_tokens], dim=1)
 
             ref_height = int(ref_latents.shape[3])
             ref_width = int(ref_latents.shape[4])
@@ -2692,9 +2712,14 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                 first_frame_tokens = tgt_height * tgt_width
                 if first_frame_tokens > 0:
                     target_conditioning_mask[video_conditioning_enabled, :first_frame_tokens] = True
-            conditioning_mask = torch.cat([ref_conditioning_mask, target_conditioning_mask], dim=1)
 
-            combined_timesteps = sigma.view(bsz, 1).expand(bsz, ref_seq_len + target_seq_len)
+            if img_ref_conditioning_mask is not None:
+                conditioning_mask = torch.cat([img_ref_conditioning_mask, ref_conditioning_mask, target_conditioning_mask], dim=1)
+            else:
+                conditioning_mask = torch.cat([ref_conditioning_mask, target_conditioning_mask], dim=1)
+
+            total_cond_len = img_ref_seq_len + ref_seq_len + target_seq_len
+            combined_timesteps = sigma.view(bsz, 1).expand(bsz, total_cond_len)
             combined_timesteps = torch.where(conditioning_mask, torch.zeros_like(combined_timesteps), combined_timesteps)
 
             frame_rate_v2v = frame_rate
@@ -2742,7 +2767,34 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             ).to(dtype=network_dtype)
             tgt_positions[:, 0, ...] = tgt_positions[:, 0, ...] / float(frame_rate_v2v)
 
-            combined_positions = torch.cat([ref_positions, tgt_positions], dim=2)
+            # iv2v: compute image ref positions (1 frame, same spatial as video ref)
+            if img_ref_seq_len > 0:
+                img_ref_height = int(ref_img_latents.shape[3])
+                img_ref_width = int(ref_img_latents.shape[4])
+                img_ref_frames = int(ref_img_latents.shape[2])
+                img_coords = patchifier.get_patch_grid_bounds(
+                    output_shape=VideoLatentShape(
+                        batch=bsz,
+                        channels=int(ref_img_latents.shape[1]),
+                        frames=img_ref_frames,
+                        height=img_ref_height,
+                        width=img_ref_width,
+                    ),
+                    device=accelerator.device,
+                )
+                img_positions = get_pixel_coords(
+                    latent_coords=img_coords,
+                    scale_factors=SpatioTemporalScaleFactors.default(),
+                    causal_fix=True,
+                ).to(dtype=network_dtype)
+                img_positions[:, 0, ...] = img_positions[:, 0, ...] / float(frame_rate_v2v)
+                if reference_downscale_factor != 1:
+                    img_positions = img_positions.clone()
+                    img_positions[:, 1, ...] *= reference_downscale_factor
+                    img_positions[:, 2, ...] *= reference_downscale_factor
+                combined_positions = torch.cat([img_positions, ref_positions, tgt_positions], dim=2)
+            else:
+                combined_positions = torch.cat([ref_positions, tgt_positions], dim=2)
 
             video_modality = Modality(
                 enabled=True,
@@ -2770,7 +2822,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                     )
                     pred_tokens, _ = base_model(video_modality, None, perturbations)
 
-            target_pred_tokens = pred_tokens[:, ref_seq_len:, :]
+            target_pred_tokens = pred_tokens[:, img_ref_seq_len + ref_seq_len:, :]
             target_velocity = patchifier.patchify(noise - latents)
             target_loss_mask = ~target_conditioning_mask
 

@@ -1123,6 +1123,8 @@ class BucketBatchManager:
                 for key, value in sd_ref.items():
                     if key.startswith("latents_"):
                         sd_ref_latents["ref_" + key] = value
+                    elif key.startswith("img_latents_"):
+                        sd_ref_latents["ref_img_" + key[len("img_"):]] = value
                 if not sd_ref_latents:
                     raise ValueError(f"No latent tensors found in reference cache: {reference_latent_cache_path}")
                 sd_latent = {**sd_latent, **sd_ref_latents}
@@ -1448,6 +1450,17 @@ class BucketBatchManager:
                 bsz, _c, frames, height, width = ref_latents.shape
                 batch_tensor_data["ref_latents"] = {
                     "latents": ref_latents,
+                    "num_frames": torch.full((bsz,), frames, dtype=torch.int32),
+                    "height": torch.full((bsz,), height, dtype=torch.int32),
+                    "width": torch.full((bsz,), width, dtype=torch.int32),
+                    "fps": torch.full((bsz,), self.target_fps, dtype=torch.float32),
+                }
+
+            ref_img_latents = batch_tensor_data.get("ref_img_latents")
+            if isinstance(ref_img_latents, torch.Tensor) and ref_img_latents.dim() == 5:
+                bsz, _c, frames, height, width = ref_img_latents.shape
+                batch_tensor_data["ref_img_latents"] = {
+                    "latents": ref_img_latents,
                     "num_frames": torch.full((bsz,), frames, dtype=torch.int32),
                     "height": torch.full((bsz,), height, dtype=torch.int32),
                     "width": torch.full((bsz,), width, dtype=torch.int32),

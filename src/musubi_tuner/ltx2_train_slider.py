@@ -187,8 +187,10 @@ def _find_text_tensor(sd: dict) -> torch.Tensor:
     raise KeyError(f"No text key found in {list(sd.keys())}")
 
 
-_LATENT_BASENAME_RE = re.compile(r"^(.+)_\d{4}x\d{4}_ltx2\.safetensors$")
+_LATENT_BASENAME_RE = re.compile(r"^(.+)_\d{5}-\d+_\d{4}x\d{4}_ltx2\.safetensors$")
 _AUDIO_BASENAME_RE = re.compile(r"^(.+)_ltx2_audio\.safetensors$")
+# Strip frame-range suffix (e.g. _00000-121) from latent stem to match te cache filenames
+_FRAME_RANGE_RE = re.compile(r"^(.+)_\d{5}-\d+$")
 
 
 def _find_length_tensor(sd: dict, prefix: str) -> Optional[torch.Tensor]:
@@ -258,10 +260,14 @@ class PairedSliderDataset(torch.utils.data.Dataset):
                 pos_virtual_path = None
                 neg_virtual_path = None
 
-            # Text cache uses stem without WxH dimensions:
-            #   latent: {stem}_{W:04d}x{H:04d}_ltx2.safetensors
-            #   text:   {stem}_ltx2_te.safetensors
-            te_basename = f"{stem}_ltx2_te.safetensors"
+            # Text cache uses base name without frame range or resolution:
+            #   latent: {base}_{frame_range}_{W:04d}x{H:04d}_ltx2.safetensors
+            #   text:   {base}_ltx2_te.safetensors
+            te_stem = stem
+            m_stem = _FRAME_RANGE_RE.match(stem)
+            if m_stem:
+                te_stem = m_stem.group(1)
+            te_basename = f"{te_stem}_ltx2_te.safetensors"
             te_path = os.path.join(self.text_cache_dir, te_basename)
             if not os.path.exists(te_path):
                 logger.warning("No text cache for %s, skipping", basename)
@@ -1114,6 +1120,14 @@ class LTX2SliderTrainer:
         if self.slider_config.mode == "reference":
             ref_dataloader = self._build_reference_dataloader(args)
 
+        # -- Resume -----------------------------------------------------------
+        initial_global_step = 0
+        if getattr(args, "resume", None):
+            logger.info(f"Resuming training from state: {args.resume}")
+            accelerator.load_state(args.resume)
+            initial_global_step = NetworkTrainer._recover_global_step(args.resume)
+            logger.info(f"Resumed at global_step={initial_global_step}")
+
         # -- Metadata ----------------------------------------------------------
         metadata = {
             "ss_session_id": session_id,
@@ -1224,7 +1238,7 @@ class LTX2SliderTrainer:
             disable=not accelerator.is_local_main_process, desc="steps",
         )
 
-        global_step = 0
+        global_step = initial_global_step
         loss_recorder = train_utils.LossRecorder()
 
         clean_memory_on_device(accelerator.device)
@@ -1232,6 +1246,8 @@ class LTX2SliderTrainer:
         optimizer.zero_grad(set_to_none=True)
 
         logger.info("Starting slider training")
+        if initial_global_step > 0:
+            logger.info("  resumed from step: %d", initial_global_step)
         logger.info("  mode: %s", self.slider_config.mode)
         logger.info("  max_train_steps: %d", args.max_train_steps)
         logger.info("  learning_rate: %s", args.learning_rate)
@@ -1241,15 +1257,30 @@ class LTX2SliderTrainer:
             logger.info("  latent_height: %d", getattr(args, "latent_height", 512))
             logger.info("  latent_width: %d", getattr(args, "latent_width", 768))
 
-        # Sample at first if requested
-        if should_sample_images(args, 0, epoch=0):
+        # Fast-forward progress bar if resuming
+        if global_step > 0:
+            progress_bar.update(global_step)
+
+        # Skip sampling at step 0 when resuming
+        if global_step == 0 and should_sample_images(args, 0, epoch=0):
             optimizer_eval_fn()
             self._sample_slider(accelerator, args, transformer, vae, accelerator.unwrap_model(network), sample_parameters, dit_dtype, 0)
             optimizer_train_fn()
 
+        steps_per_epoch = len(ref_dataloader) if ref_dataloader is not None else 1
+
         ref_iter = None
         if ref_dataloader is not None:
             ref_iter = iter(ref_dataloader)
+            # Fast-forward dataloader to correct position within epoch
+            if initial_global_step > 0 and steps_per_epoch > 0:
+                steps_into_current_epoch = initial_global_step % steps_per_epoch
+                for _ in range(steps_into_current_epoch):
+                    try:
+                        next(ref_iter)
+                    except StopIteration:
+                        ref_iter = iter(ref_dataloader)
+                        next(ref_iter)
 
         while global_step < args.max_train_steps:
             accelerator.unwrap_model(network).on_step_start()
@@ -1291,6 +1322,9 @@ class LTX2SliderTrainer:
             avr_loss = loss_recorder.moving_average
             progress_bar.set_postfix(avr_loss=f"{avr_loss:.4f}", loss=f"{loss:.4f}")
 
+            # Epoch-based saving
+            current_epoch = global_step // steps_per_epoch if steps_per_epoch > 0 else 0
+
             if len(accelerator.trackers) > 0:
                 lrs = lr_scheduler.get_last_lr()
                 logs = {
@@ -1300,6 +1334,10 @@ class LTX2SliderTrainer:
                 }
                 accelerator.log(logs, step=global_step)
 
+                # Log by epoch so TensorBoard shows epoch x-axis
+                epoch_logs = {f"epoch/{k}": v for k, v in logs.items()}
+                accelerator.log(epoch_logs, step=current_epoch)
+
             # Sampling
             should_sampling = should_sample_images(args, global_step, epoch=None)
             should_saving = (
@@ -1307,7 +1345,13 @@ class LTX2SliderTrainer:
                 and global_step % args.save_every_n_steps == 0
             )
 
-            if should_sampling or should_saving:
+            should_save_epoch = False
+            if getattr(args, "save_every_n_epochs", None) is not None and global_step > 0:
+                at_epoch_end = (global_step % steps_per_epoch == 0)
+                if at_epoch_end and current_epoch % args.save_every_n_epochs == 0:
+                    should_save_epoch = True
+
+            if should_sampling or should_saving or should_save_epoch:
                 optimizer_eval_fn()
 
                 if should_sampling:
@@ -1328,6 +1372,22 @@ class LTX2SliderTrainer:
                         remove_step_no = train_utils.get_remove_step_no(args, global_step)
                         if remove_step_no is not None:
                             remove_ckpt_name = train_utils.get_step_ckpt_name(args.output_name, remove_step_no)
+                            remove_model(remove_ckpt_name)
+
+                if should_save_epoch:
+                    accelerator.wait_for_everyone()
+                    if accelerator.is_main_process:
+                        ckpt_name = train_utils.get_epoch_ckpt_name(args.output_name, current_epoch)
+                        save_model(ckpt_name, accelerator.unwrap_model(network), global_step, current_epoch)
+
+                        if getattr(args, "save_state", False):
+                            train_utils.save_and_remove_state_on_epoch_end(
+                                args, accelerator, current_epoch, global_step=global_step
+                            )
+
+                        remove_epoch_no = train_utils.get_remove_epoch_no(args, current_epoch)
+                        if remove_epoch_no is not None:
+                            remove_ckpt_name = train_utils.get_epoch_ckpt_name(args.output_name, remove_epoch_no)
                             remove_model(remove_ckpt_name)
 
                 optimizer_train_fn()

@@ -41,6 +41,8 @@ def infer_ic_lora_strategy_from_preset(lora_target_preset: Optional[str]) -> str
     preset = str(lora_target_preset or "").lower()
     if preset == "v2v":
         return "v2v"
+    if preset == "iv2v":
+        return "iv2v"
     if preset == "audio_ref_only_ic":
         return "audio_ref_only_ic"
     if preset == "av_ic":

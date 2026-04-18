@@ -591,6 +591,24 @@ def _load_reference_frames(
     return np.stack(frames[:num_frames], axis=0)
 
 
+def _find_image_ref_file(reference_directory: str, stem: str) -> Optional[str]:
+    """Find an image reference file matching the given stem in reference_directory."""
+    for ext in IMAGE_EXTENSIONS:
+        candidate = os.path.join(reference_directory, stem + ext)
+        if os.path.exists(candidate):
+            return candidate
+    # Try case-insensitive match
+    lower_stem = stem.lower()
+    try:
+        for fname in os.listdir(reference_directory):
+            name_no_ext, ext = os.path.splitext(fname)
+            if name_no_ext.lower() == lower_stem and ext.lower() in [e.lower() for e in IMAGE_EXTENSIONS]:
+                return os.path.join(reference_directory, fname)
+    except OSError:
+        pass
+    return None
+
+
 def encode_and_save_reference_latents(
     vae,
     datasets: Sequence[BaseDataset],
@@ -645,6 +663,15 @@ def encode_and_save_reference_latents(
                 # bucket_size is (width, height, frame_count, ...); extract spatial dims
                 bucket_reso = (item_info.bucket_size[0], item_info.bucket_size[1])
 
+                # Use the target video's frame count for the reference so they match
+                target_frames = getattr(item_info, "frame_count", None) or (
+                    item_info.bucket_size[2] if len(item_info.bucket_size) > 2 else None
+                )
+                if target_frames is not None and target_frames > num_frames:
+                    ref_num_frames = target_frames
+                else:
+                    ref_num_frames = num_frames
+
                 try:
                     ref_path = _find_reference_file(ref_dir, stem)
                     if ref_path is None:
@@ -654,7 +681,7 @@ def encode_and_save_reference_latents(
                         elif missing_count == 6:
                             logger.warning("(suppressing further missing-reference warnings)")
                         continue
-                    ref_frames = _load_reference_frames(ref_path, bucket_reso, num_frames, downscale_factor)
+                    ref_frames = _load_reference_frames(ref_path, bucket_reso, ref_num_frames, downscale_factor)
 
                     contents = torch.from_numpy(ref_frames).unsqueeze(0)
                     contents = contents.permute(0, 4, 1, 2, 3).contiguous()
@@ -676,6 +703,32 @@ def encode_and_save_reference_latents(
                         latent = latent.to(device=device, dtype=vae_dtype)
 
                     ref_latent = latent[0]
+
+                    # Look for a same-stem image reference file (.png, etc.)
+                    extra_tensors = None
+                    img_ref_path = _find_image_ref_file(ref_dir, stem)
+                    if img_ref_path is not None:
+                        try:
+                            img_ref_frames = _load_reference_frames(img_ref_path, bucket_reso, num_frames=1, downscale_factor=downscale_factor)
+                            img_contents = torch.from_numpy(img_ref_frames).unsqueeze(0)
+                            img_contents = img_contents.permute(0, 4, 1, 2, 3).contiguous()
+                            img_contents = img_contents.to(device=device, dtype=vae_dtype)
+                            img_contents = img_contents / 127.5 - 1.0
+                            # Image ref: 1 frame, no temporal padding needed
+                            with _amp_context(device, vae_dtype), torch.no_grad():
+                                if tiling_config is not None and hasattr(vae, "tiled_encode"):
+                                    img_latent = vae.tiled_encode(img_contents, tiling_config)
+                                else:
+                                    img_latent = vae(img_contents)
+                                img_latent = img_latent.to(device=device, dtype=vae_dtype)
+                            img_ref_latent = img_latent[0]
+                            _, img_F, img_H, img_W = img_ref_latent.shape
+                            img_dtype_str = cache_latents.dtype_to_str(img_ref_latent.dtype) if hasattr(cache_latents, "dtype_to_str") else str(img_ref_latent.dtype).replace("torch.", "")
+                            extra_tensors = {f"img_latents_{img_F}x{img_H}x{img_W}_{img_dtype_str}": img_ref_latent}
+                            logger.info(f"  Cached image reference for '{stem}': {img_ref_path}")
+                        except Exception as e:
+                            logger.warning(f"  Failed to cache image reference for '{stem}': {e}")
+
                     ref_item_info = ItemInfo(
                         item_info.item_key,
                         item_info.caption,
@@ -684,7 +737,7 @@ def encode_and_save_reference_latents(
                     )
                     ref_item_info.latent_cache_path = ref_cache_path
                     ref_item_info.frame_count = num_frames
-                    save_latent_cache_ltx2(ref_item_info, ref_latent)
+                    save_latent_cache_ltx2(ref_item_info, ref_latent, extra_tensors=extra_tensors)
                     cached_count += 1
 
                 except Exception as e:

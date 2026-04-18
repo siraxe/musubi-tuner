@@ -130,12 +130,13 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         "--lora_target_preset",
         type=str,
         default="t2v",
-        choices=["t2v", "v2v", "video_sa", "video_sa_ff", "video_sa_ca_ff",
+        choices=["t2v", "v2v", "iv2v", "video_sa", "video_sa_ff", "video_sa_ca_ff",
                  "audio", "audio_ref_only_ic", "av_ic", "full"],
         help=(
             "LoRA target preset: "
             "'t2v' = text-to-video (all attention, official default), "
             "'v2v' = video-to-video/IC-LoRA (all attention + feed-forward), "
+            "'iv2v' = image+video-to-video IC-LoRA (same targets as v2v), "
             "'video_sa' = video self-attention only, "
             "'video_sa_ff' = video self-attention + video feed-forward, "
             "'video_sa_ca_ff' = video self-attention + cross-attention + feed-forward, "
@@ -163,6 +164,7 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
             "(uses 'v2v' when --lora_target_preset=v2v, "
             "'audio_ref_only_ic' when --lora_target_preset=audio_ref_only_ic, else 'none'). "
             "'v2v' uses reference-video conditioning. "
+            "'iv2v' uses image+video reference conditioning (image ref + video ref concatenated before target). "
             "'audio_ref_only_ic' uses reference-audio conditioning (ID-LoRA-style) in AV or audio-only mode. "
             "'av_ic' uses combined video+audio reference conditioning (requires --ltx2_mode av)."
         ),
